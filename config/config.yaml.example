@@ -1,0 +1,13 @@
+binance:
+  api_key: ""
+  api_secret: ""
+  symbol: "BTCUSDT"
+  timeframe: "1m"
+  capital: 100
+  leverage: 2
+model:
+  path: models/lstm_model.keras
+  sequence_length: 60
+logging:
+  path: "logs/trading_bot.log"
+  level: "BEUG"
