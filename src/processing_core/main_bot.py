@@ -54,7 +54,7 @@ consumer = Consumer({
 def calculate_indicators(df):
     logger.info(f"Calculating indicators for DataFrame with {len(df)} rows")
     print(f"Calculating indicators for DataFrame with {len(df)} rows")
-    if len(df) < 26:
+    if len(df) < 50:
         logger.info("Skipping indicator calculation due to insufficient data")
         print("Skipping indicator calculation due to insufficient data")
         return df
@@ -67,16 +67,17 @@ def calculate_indicators(df):
     df['ATR'] = talib.ATR(df['high'], df['low'], df['close'], timeperiod=14)
     df['EMA20'] = talib.EMA(df['close'], timeperiod=20)
     df['EMA50'] = talib.EMA(df['close'], timeperiod=50)
-    df = df.dropna()
-    logger.info(f"After dropna, DataFrame has {len(df)} rows")
-    print(f"After dropna, DataFrame has {len(df)} rows")
+    # Remplir les NaN avec la dernière valeur valide (forward fill)
+    df[['RSI', 'MACD', 'MACD_signal', 'MACD_hist', 'ADX', 'ATR', 'EMA20', 'EMA50']] = df[['RSI', 'MACD', 'MACD_signal', 'MACD_hist', 'ADX', 'ATR', 'EMA20', 'EMA50']].ffill()
+    logger.info(f"After filling NaN, DataFrame has {len(df)} rows")
+    print(f"After filling NaN, DataFrame has {len(df)} rows")
     return df
 
 async def main():
     global client
     df = pd.DataFrame()
     order_details = None
-    current_position = None  # Track current position state: None, "buy", or "sell"
+    current_position = None
     try:
         # Load historical data
         klines = client.futures_klines(symbol=SYMBOL, interval=TIMEFRAME, limit=500)
@@ -110,9 +111,10 @@ async def main():
             if not candle_df.empty:
                 logger.info(f"Received candle: {candle_df.iloc[-1]}")
                 print(f"Received candle: {candle_df.iloc[-1]}")
-                df = pd.concat([df, candle_df], ignore_index=True).tail(250)
+                # Ajouter la nouvelle bougie et limiter à 100 lignes
+                df = pd.concat([df, candle_df], ignore_index=True).tail(100)
                 df = calculate_indicators(df)
-                if len(df) >= 26:
+                if len(df) >= 60:  # Seuil pour SEQ_LEN du LSTM
                     action, new_position = check_signal(df, model, current_position)
                     logger.info(f"Action: {action}, New Position: {new_position}")
                     print(f"Action: {action}, New Position: {new_position}")
@@ -124,7 +126,7 @@ async def main():
                             insert_trade(order_details)
                             record_trade_metric(order_details)
                             send_telegram_alert(f"Trade executed: {action.upper()} {SYMBOL} at {price}")
-                            current_position = new_position  # Update position state
+                            current_position = new_position
                     elif action in ["close_buy", "close_sell"]:
                         close_side = "sell" if action == "close_buy" else "buy"
                         price = candle_df["close"].iloc[-1]
@@ -134,7 +136,7 @@ async def main():
                             insert_trade(order_details)
                             record_trade_metric(order_details)
                             send_telegram_alert(f"Position closed: {action.upper()} {SYMBOL} at {price}")
-                            current_position = None  # Reset position state
+                            current_position = None
             await asyncio.sleep(0.1)
     except Exception as e:
         logger.error(f"Main bot error: {e}")
