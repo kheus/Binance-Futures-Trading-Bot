@@ -116,6 +116,9 @@ async def main():
                 df = calculate_indicators(df)
                 if len(df) >= 60:  # Seuil pour SEQ_LEN du LSTM
                     action, new_position = check_signal(df, model, current_position)
+                   # Temporary: Force a buy trade for testing
+                    action = "sell"
+                    new_position = "sell"
                     logger.info(f"Action: {action}, New Position: {new_position}")
                     print(f"Action: {action}, New Position: {new_position}")
                     if action in ["buy", "sell"]:

@@ -45,13 +45,13 @@ def check_signal(df, model, position_type=None):
             last["EMA20"] > last["EMA50"]
             and last["MACD"] > last["MACD_signal"]
             and last["ADX"] > 20
-            and last["RSI"] > 55
+            and last["RSI"] > 60
         )
         trend_down = (
             last["EMA20"] < last["EMA50"]
             and last["MACD"] < last["MACD_signal"]
             and last["ADX"] > 20
-            and last["RSI"] < 45
+            and last["RSI"] < 40
         )
         breakout = detect_breakout(df)
         print(f"Breakout: {breakout}, Trend Up: {trend_up}, Trend Down: {trend_down}")
