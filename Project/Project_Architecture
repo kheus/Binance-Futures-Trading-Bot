@@ -1,0 +1,26 @@
++---------------------------+
+|   Binance Futures API     | <-- (Données prix + exécution des ordres)
++---------------------------+
+           |
++---------------------------+
+|     Data Ingestion        | <-- (Kafka : ingestion des prix en temps réel)
++---------------------------+
+           |
++---------------------------+
+|     Processing Core       | <-- (Python bot avec stratégie + signaux)
+| - Indicateurs TA          |
+| - Machine Learning (LSTM) |
+| - Décision Buy/Sell       |
++---------------------------+
+           |
++---------------------------+
+|     Trade Execution       | <-- (ccxt ou python-binance + retry/resilience)
++---------------------------+
+           |
++---------------------------+
+|     Database (PostgreSQL) | <-- (Historique des trades, signaux, PnL, drawdown)
++---------------------------+
+           |
++---------------------------+
+|  Monitoring & Alerting    | <-- (Prometheus + Grafana + Telegram)
++---------------------------+
