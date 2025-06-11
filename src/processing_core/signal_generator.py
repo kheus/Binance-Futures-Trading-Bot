@@ -74,8 +74,9 @@ def check_signal(df, model, current_position, last_order_details):
     rsi_strong = (rsi > 50 and trend_up) or (rsi < 50 and trend_down) or (rsi > 55 or rsi < 40)
     breakout_up = close > df['high'].rolling(window=20).max().iloc[-1] if len(df) >= 20 else False
     breakout_down = close < df['low'].rolling(window=20).min().iloc[-1] if len(df) >= 20 else False
-    logger.info(f"[Indicators] RSI: {rsi}, MACD: {macd}, Signal: {signal}, ADX: {adx}, EMA20: {ema20}, EMA50: {ema50}, ATR: {atr}")
-    logger.info(f"[Conditions] MACD Bullish: {macd_bullish}, RSI Strong: {rsi_strong}, ADX Strong: {adx > 25}")
+    logger.info(f"[Debug] RSI Strong calculation: trend_up={trend_up}, trend_down={trend_down}, rsi={rsi}")
+    logger.info(f"[Indicators]  MACD: {macd}, Signal: {signal}, ADX: {adx}, EMA20: {ema20}, EMA50: {ema50}, ATR: {atr}")
+    logger.info(f"[Conditions] MACD Bullish: {macd_bullish}, ADX Strong: {adx > 25}")
     logger.info(f"[Debug] Breakout Up Check: close={close}, max_20={df['high'].rolling(window=20).max().iloc[-1]}")
     logger.info(f"[Trend Up] {trend_up}, Breakout: {breakout_up}")
     logger.info(f"[Trend Down] {trend_down}, Breakout: {breakout_down}")

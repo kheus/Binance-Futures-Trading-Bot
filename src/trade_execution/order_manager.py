@@ -18,7 +18,7 @@ def place_order(signal, price, atr, client, symbol, capital, leverage):
             logger.error(f"[Order Error] Invalid parameters: capital={capital}, price={price}, leverage={leverage}")
             return None
         base_qty = (capital / price) * leverage
-        qty = max(round(base_qty / 0.001) * 0.001, 0.001)
+        qty = max(round(base_qty / 0.001) * 0.001, 0.001)  
         logger.info(f"[Debug] Calculated Qty: base={base_qty}, adjusted={qty}")
 
         sl = round(price - atr * 1.5 if signal == "buy" else price + atr * 1.5, 2)

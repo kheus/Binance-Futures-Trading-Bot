@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 from tensorflow.keras.models import Sequential, load_model
 from tensorflow.keras.layers import LSTM, Dense, Input
+from tensorflow.keras.callbacks import EarlyStopping
 from sklearn.preprocessing import MinMaxScaler
 import logging
 import time
@@ -49,7 +50,7 @@ def train_or_load_model(df):
     try:
         model = load_model(MODEL_PATH)
         logger.info(f"[Model] Loaded existing model from {MODEL_PATH}")
-        model.last_train_time = time.time()  # Ajout d'un attribut pour suivi
+        model.last_train_time = time.time()  # Attribut pour suivi
         return model
     except Exception as e:
         logger.warning(f"[Model] Failed to load model: {e}, training new model")
@@ -61,11 +62,15 @@ def train_or_load_model(df):
             return None
         model = build_lstm_model()
         logger.info(f"[Model] Training with X shape {X.shape}, y shape {y.shape}")
-        model.fit(X, y, epochs=10, batch_size=32, validation_split=0.2, verbose=1)
+        
+        # Ajout d'EarlyStopping pour éviter l'overfitting
+        early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+        model.fit(X, y, epochs=100, batch_size=32, validation_split=0.1, verbose=1, callbacks=[early_stopping])
+        
         model.save(MODEL_PATH)
         model.last_train_time = time.time()
-        logger.info(f"[Model] Trained and saved model at {MODEL_PATH}")
+        logger.info(f"[Model] Trained successfully, last_train_time={time.time()}")
         return model
     except Exception as e:
-        logger.error(f"[Model] Training failed: {e}")
+        logger.error(f"[Model] Training failed: {e}, returning None")
         return None
