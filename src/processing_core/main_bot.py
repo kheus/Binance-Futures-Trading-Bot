@@ -8,7 +8,7 @@ from confluent_kafka import Consumer
 from binance.um_futures import UMFutures
 from src.data_ingestion.data_formatter import format_candle
 from src.processing_core.lstm_model import train_or_load_model
-from src.processing_core.signal_generator import check_signal
+from src.processing_core.signal_generator import check_signal, prepare_lstm_input
 from src.trade_execution.order_manager import place_order
 from src.database.db_handler import insert_trade
 from src.monitoring.metrics import record_trade_metric
@@ -53,7 +53,7 @@ CAPITAL = config["binance"]["capital"]
 LEVERAGE = config["binance"]["leverage"]
 KAFKA_TOPIC = kafka_config["kafka"]["topic"]
 KAFKA_BOOTSTRAP = kafka_config["kafka"]["bootstrap_servers"]
-MODEL_UPDATE_INTERVAL = 300  # Ré-entraînement toutes les 1 minutes (en secondes)
+MODEL_UPDATE_INTERVAL = 300  # Ré-entraînement toutes les 5 minute (en secondes)
 
 # Initialize Binance client
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -118,15 +118,26 @@ async def main():
             logger.error(f"[API Connectivity] Failed: {e}")
             raise Exception("API connectivity test failed")
 
-        # Load historical data
+        # Load historical data with pagination
         logger.info(f"[Main] Fetching historical data for {SYMBOL} with timeframe {TIMEFRAME}")
-        try:
-            klines = client.klines(symbol=SYMBOL, interval=TIMEFRAME, limit=1500)
-        except AttributeError:
-            logger.warning("[Data Fetch] Falling back to alternative method")
-            klines = client.get_klines(symbol=SYMBOL.upper(), interval=TIMEFRAME, startTime=None, endTime=None, limit=1500)
+        klines = []
+        limit = 1500
+        start_time = None
+        while len(klines) < 2000:  # Cible 2000 klines via pagination
+            try:
+                new_klines = client.klines(symbol=SYMBOL, interval=TIMEFRAME, limit=limit, startTime=start_time)
+                if not new_klines or len(new_klines) == 0:
+                    break
+                klines.extend(new_klines)
+                start_time = int(new_klines[-1][0]) + 1  # Prochain timestamp
+                logger.info(f"Fetched {len(new_klines)} klines, total: {len(klines)}")
+            except Exception as e:
+                logger.error(f"[Data Fetch] Failed with limit={limit}: {e}")
+                limit = 1000  # Réduire limit en cas d'échec
+                if limit < 500:
+                    raise ValueError("Unable to fetch sufficient historical data")
         logger.info(f"Fetched {len(klines)} klines, sample: {klines[0] if klines else 'None'}")
-        if not klines or len(klines) < 51:
+        if len(klines) < 101:
             logger.error(f"Insufficient historical data fetched: {len(klines)} rows")
             raise ValueError("Insufficient historical data")
         data_hist = pd.DataFrame(klines, columns=["open_time", "open", "high", "low", "close", "volume",
@@ -136,7 +147,7 @@ async def main():
         df = data_hist.rename(columns={"open_time": "timestamp"})
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
         logger.info(f"Loaded {len(df)} historical candles")
-        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+        df = df.tail(200)  # Conserver 200 lignes initiales
         logger.info(f"[Data] Latest timestamp in df: {df['timestamp'].iloc[-1]}")
 
         # Compute indicators for historical data
@@ -148,10 +159,9 @@ async def main():
         model = train_or_load_model(df)
         if model is None:
             logger.warning("Using mock model due to failure")
-            import numpy as np
             class MockModel:
                 def predict(self, x, verbose=0):
-                    return np.array([[0.6]])  # Example prediction
+                    return np.array([[0.5]])
             model = MockModel()
         logger.info("Model loaded successfully")
 
@@ -162,23 +172,20 @@ async def main():
             msg = consumer.poll(1.0)
             current_time = time.time()
 
-            # Gestion explicite de msg None
             if msg is None:
                 if current_time - last_log_time >= 5:
                     logger.info("[Main Loop] Running, awaiting data")
                     last_log_time = current_time
-                # Vérifier la mise à jour du modèle
-                if current_time - last_model_update >= MODEL_UPDATE_INTERVAL and len(df) >= 60:
+                if current_time - last_model_update >= MODEL_UPDATE_INTERVAL and len(df) >= 101:
                     logger.info("[Main] Updating LSTM model with new data")
                     model = train_or_load_model(df)
                     if model is None:
-                        logger.warning("Model update failed, using existing model")
+                        logger.error("[Model] No valid model available, using mock prediction")
+                        class MockModel:
+                            def predict(self, x, verbose=0):
+                                return np.array([[0.5]])
+                        model = MockModel()
                     else:
-                        last_model_update = current_time
-                        logger.info("Model updated successfully")
-                        send_telegram_alert("🔄 Model updated successfully.")
-
-                        from src.processing_core.signal_generator import prepare_lstm_input
                         lstm_input = prepare_lstm_input(df)
                         try:
                             pred = model.predict(lstm_input, verbose=0)[0][0]
@@ -186,23 +193,23 @@ async def main():
                             send_telegram_alert(f"[Debug] Prediction after update: {pred}")
                         except Exception as e:
                             logger.error(f"[Debug] Prediction failed: {e}")
+                    last_model_update = current_time
+                    send_telegram_alert("🔄 Model updated successfully.")
                 continue
 
-            # Vérifier les erreurs uniquement si msg est un objet valide
             if hasattr(msg, 'error') and msg.error():
                 logger.error(f"Kafka consumer error: {msg.error()}")
                 print(f"Kafka consumer error: {msg.error()}")
                 continue
 
-            # Traitement du message si valide
             if hasattr(msg, 'value') and not msg.error():
                 candle_df = format_candle(msg.value().decode("utf-8"))
                 if not candle_df.empty:
                     logger.info(f"Received candle: {candle_df.iloc[-1]}")
                     print(f"Received candle: {candle_df.iloc[-1]}")
-                    df = pd.concat([df, candle_df], ignore_index=True).tail(100)
+                    df = pd.concat([df, candle_df], ignore_index=True)
                     df = calculate_indicators(df)
-                    if len(df) >= 60:
+                    if len(df) >= 101:
                         action, new_position = check_signal(df, model, current_position, last_order_details)
                         logger.info(f"Action: {action}, New Position: {new_position}")
                         print(f"Action: {action}, New Position: {new_position}")
@@ -233,6 +240,7 @@ async def main():
                                 last_order_details = None
                                 current_position = None
                         print(f"Current position after update: {current_position}")
+                    df = df.tail(200)  # Maintenir 200 lignes
             await asyncio.sleep(0.1)
 
     except Exception as e:

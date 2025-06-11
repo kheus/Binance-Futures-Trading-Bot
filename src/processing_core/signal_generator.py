@@ -10,6 +10,7 @@ def prepare_lstm_input(df):
     required_cols = ['close', 'volume', 'RSI', 'MACD', 'ADX']
     data = df[required_cols].values[-100:].astype(float)  # Aligné sur SEQ_LEN = 100
     logger.info(f"[Debug] LSTM input shape: {data.shape}, contains nan: {np.isnan(data).any()}")
+    logger.info(f"[Debug] LSTM Input last row: {df[required_cols].iloc[-1].to_dict()}")
     return data.reshape(1, 100, len(required_cols))
 
 def calculate_dynamic_thresholds(adx, strategy="trend"):
@@ -94,7 +95,7 @@ def check_signal(df, model, current_position, last_order_details):
             action = "sell"
             new_position = "short"
     elif strategy_mode == "trend":
-        if trend_up and macd_bullish and rsi_strong and prediction > dynamic_up and (breakout_up or True):  # Breakout optionnel
+        if trend_up and macd_bullish and rsi_strong and prediction > dynamic_up and (breakout_up ):  # Breakout optionnel
             action = "buy"
             new_position = "long"
         elif trend_down and not macd_bullish and rsi_strong and prediction < dynamic_down and breakout_down:

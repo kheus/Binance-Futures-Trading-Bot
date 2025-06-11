@@ -30,7 +30,7 @@ def prepare_lstm_data(df):
         logger.error(f"[Model] Missing columns: {required_cols}")
         return None, None, None
     df = df[required_cols].dropna()
-    if len(df) < SEQ_LEN + 1:
+    if len(df) <= SEQ_LEN:
         logger.error(f"[Model] Insufficient data: {len(df)} rows, need {SEQ_LEN + 1}")
         return None, None, None
     scaler = MinMaxScaler()
@@ -38,8 +38,12 @@ def prepare_lstm_data(df):
     X, y = [], []
     for i in range(SEQ_LEN, len(scaled_data)):
         X.append(scaled_data[i-SEQ_LEN:i])
-        y.append(1 if scaled_data[i, 0] > scaled_data[i-1, 0] else 0)  # Hausse basée sur close
+        y.append(1 if scaled_data[i, 0] > scaled_data[i-1, 0] else 0)
     X, y = np.array(X), np.array(y)
+    if len(X) == 0:
+        logger.warning("[Model] No sequences generated, using last sequence")
+        X = [scaled_data[-100:]]
+        y = [0]  # Étiquette par défaut
     logger.info(f"[Model] Prepared X shape: {X.shape}, y shape: {y.shape}")
     return X, y, scaler
 
@@ -50,8 +54,13 @@ def train_or_load_model(df):
     try:
         model = load_model(MODEL_PATH)
         logger.info(f"[Model] Loaded existing model from {MODEL_PATH}")
-        model.last_train_time = time.time()  # Attribut pour suivi
-        return model
+        # Vérifier si les données ont changé (ex. dernière close)
+        last_close = df['close'].iloc[-1]
+        if hasattr(model, 'last_train_close') and abs(last_close - model.last_train_close) < 1.0:  # Seuil ajustable
+            logger.info(f"[Model] Data unchanged, reusing model")
+            model.last_train_time = time.time()
+            return model
+        logger.info(f"[Model] Data changed, retraining model")
     except Exception as e:
         logger.warning(f"[Model] Failed to load model: {e}, training new model")
 
@@ -62,13 +71,11 @@ def train_or_load_model(df):
             return None
         model = build_lstm_model()
         logger.info(f"[Model] Training with X shape {X.shape}, y shape {y.shape}")
-        
-        # Ajout d'EarlyStopping pour éviter l'overfitting
         early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
         model.fit(X, y, epochs=100, batch_size=32, validation_split=0.1, verbose=1, callbacks=[early_stopping])
-        
         model.save(MODEL_PATH)
         model.last_train_time = time.time()
+        model.last_train_close = df['close'].iloc[-1]  # Stocker la dernière close
         logger.info(f"[Model] Trained successfully, last_train_time={time.time()}")
         return model
     except Exception as e:
