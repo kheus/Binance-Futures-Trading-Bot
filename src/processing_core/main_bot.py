@@ -53,7 +53,7 @@ CAPITAL = config["binance"]["capital"]
 LEVERAGE = config["binance"]["leverage"]
 KAFKA_TOPIC = kafka_config["kafka"]["topic"]
 KAFKA_BOOTSTRAP = kafka_config["kafka"]["bootstrap_servers"]
-MODEL_UPDATE_INTERVAL = 60  # Ré-entraînement toutes les 1 minutes (en secondes)
+MODEL_UPDATE_INTERVAL = 300  # Ré-entraînement toutes les 1 minutes (en secondes)
 
 # Initialize Binance client
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
