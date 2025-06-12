@@ -1,14 +1,20 @@
+# Signal Generator Module
 import logging
 import numpy as np
 import pandas as pd
 import talib
+import time
+from src.database.db_handler import insert_signal
 from src.monitoring.alerting import send_telegram_alert
 
 logger = logging.getLogger(__name__)
 
 def prepare_lstm_input(df):
     required_cols = ['close', 'volume', 'RSI', 'MACD', 'ADX']
-    data = df[required_cols].values[-100:].astype(float)  # Aligné sur SEQ_LEN = 100
+    data = df[required_cols].values[-100:].astype(float)  # Aligne sur SEQ_LEN = 100
+    if np.isnan(data).any():
+        logger.warning("[Debug] NaN values detected in LSTM input, filling with 0")
+        data = np.nan_to_num(data, nan=0.0)
     logger.info(f"[Debug] LSTM input shape: {data.shape}, contains nan: {np.isnan(data).any()}")
     logger.info(f"[Debug] LSTM Input last row: {df[required_cols].iloc[-1].to_dict()}")
     return data.reshape(1, 100, len(required_cols))
@@ -30,14 +36,14 @@ def calculate_dynamic_thresholds(adx, strategy="trend"):
 def select_strategy_mode(adx, rsi, atr):
     if adx > 30:  # Forte tendance
         return "trend"
-    elif adx < 15 and rsi > 40 and rsi < 60 and atr < 30:  # Marché plat avec faible volatilité
+    elif adx < 15 and 40 < rsi < 60 and atr < 30:  # Marche plat avec faible volatilite
         return "range"
-    else:  # Volatilité modérée ou conditions mixtes
+    else:  # Volatilite moderee ou conditions mixtes
         return "scalp"
 
 def check_signal(df, model, current_position, last_order_details):
     logger.info(f"[Debug] Using model with last_train_time: {getattr(model, 'last_train_time', 'N/A')}")
-    if len(df) < 100:  # Aligné sur SEQ_LEN
+    if len(df) < 100:  # Aligne sur SEQ_LEN
         return "None", None
 
     # Calculer les indicateurs
@@ -76,7 +82,7 @@ def check_signal(df, model, current_position, last_order_details):
     breakout_up = close > df['high'].rolling(window=20).max().iloc[-1] if len(df) >= 20 else False
     breakout_down = close < df['low'].rolling(window=20).min().iloc[-1] if len(df) >= 20 else False
     logger.info(f"[Debug] RSI Strong calculation: trend_up={trend_up}, trend_down={trend_down}, rsi={rsi}")
-    logger.info(f"[Indicators]  MACD: {macd}, Signal: {signal}, ADX: {adx}, EMA20: {ema20}, EMA50: {ema50}, ATR: {atr}")
+    logger.info(f"[Indicators] MACD: {macd}, Signal: {signal}, ADX: {adx}, EMA20: {ema20}, EMA50: {ema50}, ATR: {atr}")
     logger.info(f"[Conditions] MACD Bullish: {macd_bullish}, ADX Strong: {adx > 25}")
     logger.info(f"[Debug] Breakout Up Check: close={close}, max_20={df['high'].rolling(window=20).max().iloc[-1]}")
     logger.info(f"[Trend Up] {trend_up}, Breakout: {breakout_up}")
@@ -95,7 +101,7 @@ def check_signal(df, model, current_position, last_order_details):
             action = "sell"
             new_position = "short"
     elif strategy_mode == "trend":
-        if trend_up and macd_bullish and rsi_strong and prediction > dynamic_up and (breakout_up ):  # Breakout optionnel
+        if trend_up and macd_bullish and rsi_strong and prediction > dynamic_up and breakout_up:
             action = "buy"
             new_position = "long"
         elif trend_down and not macd_bullish and rsi_strong and prediction < dynamic_down and breakout_down:
@@ -118,6 +124,21 @@ def check_signal(df, model, current_position, last_order_details):
     elif current_position == "short" and (trend_up or macd_bullish):
         action = "close_sell"
         new_position = None
+
+    # Stockage du signal
+    signal_details = {
+        "symbol": "BTCUSDT",  # Utilise SYMBOL au lieu de df.index[-1]["symbol"]
+        "signal_type": action,
+        "price": float(close),
+        "timestamp": int(time.time() * 1000),
+        "quantity": 0.0  # À définir si pertinent
+    }
+    if action != "None":
+       logger.debug(f"Inserting signal: {signal_details}")
+       insert_signal(signal_details)
+       logger.info(f"[Signal Stored] {signal_details}")
+    else:
+       logger.info("[No DB Insert] Action is 'None', skipping database insert")
 
     logger.info(f"[Decision] Trend Up: {trend_up}, MACD Bullish: {macd_bullish}, RSI Strong: {rsi_strong}, Pred > Dynamic Up: {prediction > dynamic_up}, Breakout: {breakout_up}")
     if action == "None":

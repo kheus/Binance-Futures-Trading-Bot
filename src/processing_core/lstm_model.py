@@ -43,7 +43,7 @@ def prepare_lstm_data(df):
     if len(X) == 0:
         logger.warning("[Model] No sequences generated, using last sequence")
         X = [scaled_data[-100:]]
-        y = [0]  # Étiquette par défaut
+        y = [0]  # etiquette par defaut
     logger.info(f"[Model] Prepared X shape: {X.shape}, y shape: {y.shape}")
     return X, y, scaler
 
@@ -54,7 +54,7 @@ def train_or_load_model(df):
     try:
         model = load_model(MODEL_PATH)
         logger.info(f"[Model] Loaded existing model from {MODEL_PATH}")
-        # Vérifier si les données ont changé (ex. dernière close)
+        # Verifier si les donnees ont change (ex. derniere close)
         last_close = df['close'].iloc[-1]
         if hasattr(model, 'last_train_close') and abs(last_close - model.last_train_close) < 1.0:  # Seuil ajustable
             logger.info(f"[Model] Data unchanged, reusing model")
@@ -75,7 +75,7 @@ def train_or_load_model(df):
         model.fit(X, y, epochs=100, batch_size=32, validation_split=0.1, verbose=1, callbacks=[early_stopping])
         model.save(MODEL_PATH)
         model.last_train_time = time.time()
-        model.last_train_close = df['close'].iloc[-1]  # Stocker la dernière close
+        model.last_train_close = df['close'].iloc[-1]  # Stocker la derniere close
         logger.info(f"[Model] Trained successfully, last_train_time={time.time()}")
         return model
     except Exception as e:

@@ -13,7 +13,7 @@ def init_binance_client(mode="testnet"):
         mode (str): "testnet" ou "live"
 
     Returns:
-        UMFutures: client Binance UM Futures configuré
+        UMFutures: client Binance UM Futures configure
     """
     try:
         with open("config/config.yaml", "r") as f:
@@ -40,7 +40,7 @@ def init_binance_client(mode="testnet"):
             logger.error(f"[Binance Client] Connectivity test failed: {e}")
             return None
         
-        logger.info(f"[Binance Client] Initialisé en mode {mode} avec {base_url}")
+        logger.info(f"[Binance Client] Initialise en mode {mode} avec {base_url}")
         return client
 
     except Exception as e:

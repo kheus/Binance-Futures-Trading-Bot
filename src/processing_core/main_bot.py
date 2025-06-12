@@ -10,7 +10,9 @@ from src.data_ingestion.data_formatter import format_candle
 from src.processing_core.lstm_model import train_or_load_model
 from src.processing_core.signal_generator import check_signal, prepare_lstm_input
 from src.trade_execution.order_manager import place_order
-from src.database.db_handler import insert_trade
+from src.database.db_handler import insert_trade, insert_signal, insert_metrics
+from src.database.db_handler import create_tables
+import asyncio
 from src.monitoring.metrics import record_trade_metric
 from src.monitoring.alerting import send_telegram_alert
 import platform
@@ -53,7 +55,7 @@ CAPITAL = config["binance"]["capital"]
 LEVERAGE = config["binance"]["leverage"]
 KAFKA_TOPIC = kafka_config["kafka"]["topic"]
 KAFKA_BOOTSTRAP = kafka_config["kafka"]["bootstrap_servers"]
-MODEL_UPDATE_INTERVAL = 300  # Ré-entraînement toutes les 5 minute (en secondes)
+MODEL_UPDATE_INTERVAL = 300  # Ré-entraînement toutes les 5 minutes (en secondes)
 
 # Initialize Binance client
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -84,7 +86,6 @@ def calculate_indicators(df):
         logger.info("Skipping indicator calculation due to insufficient data")
         print("Skipping indicator calculation due to insufficient data")
         return df
-    # Calcul des indicateurs
     df['RSI'] = talib.RSI(df['close'], timeperiod=14)
     df['MACD'], df['MACD_signal'], df['MACD_hist'] = talib.MACD(df['close'], fastperiod=12, slowperiod=26, signalperiod=9)
     df['ADX'] = talib.ADX(df['high'], df['low'], df['close'], timeperiod=14)
@@ -92,11 +93,26 @@ def calculate_indicators(df):
     df['EMA50'] = df['close'].ewm(span=50, adjust=False).mean()
     df['ATR'] = talib.ATR(df['high'], df['low'], df['close'], timeperiod=14)
     required_cols = ['RSI', 'MACD', 'MACD_signal', 'MACD_hist', 'ADX', 'EMA20', 'EMA50', 'ATR']
-    # Remplissage robuste sur toutes les colonnes
     df[required_cols] = df[required_cols].ffill().bfill().fillna(0)
     logger.info(f"[Debug] Indicators after update: {df[required_cols].iloc[-1].to_dict()}")
     logger.info(f"After filling NaN, DataFrame has {len(df)} rows")
     print(f"After filling NaN, DataFrame has {len(df)} rows")
+
+    # Stockage des métriques
+    latest_timestamp = df.index[-1]
+    logger.debug(f"Latest timestamp type: {type(latest_timestamp)}, value: {latest_timestamp}")
+    metrics = {
+        "symbol": SYMBOL,
+        "timestamp": int(df.index[-1].timestamp() * 1000),
+        "rsi": float(df['RSI'].iloc[-1]),
+        "macd": float(df['MACD'].iloc[-1]),
+        "adx": float(df['ADX'].iloc[-1]),
+        "ema20": float(df['EMA20'].iloc[-1]),
+        "ema50": float(df['EMA50'].iloc[-1]),
+        "atr": float(df['ATR'].iloc[-1])
+    }
+    insert_metrics(metrics)
+
     return df
 
 async def main():
@@ -111,6 +127,8 @@ async def main():
     try:
         # Test client connectivity
         logger.info("[Main] Testing API connectivity")
+        logger.info("[Main] Creating database tables")
+        create_tables()
         try:
             client.time()
             logger.info("[Binance Client] API connectivity confirmed")
@@ -123,17 +141,17 @@ async def main():
         klines = []
         limit = 1500
         start_time = None
-        while len(klines) < 2000:  # Cible 2000 klines via pagination
+        while len(klines) < 2000:
             try:
                 new_klines = client.klines(symbol=SYMBOL, interval=TIMEFRAME, limit=limit, startTime=start_time)
                 if not new_klines or len(new_klines) == 0:
                     break
                 klines.extend(new_klines)
-                start_time = int(new_klines[-1][0]) + 1  # Prochain timestamp
+                start_time = int(new_klines[-1][0]) + 1
                 logger.info(f"Fetched {len(new_klines)} klines, total: {len(klines)}")
             except Exception as e:
                 logger.error(f"[Data Fetch] Failed with limit={limit}: {e}")
-                limit = 1000  # Réduire limit en cas d'échec
+                limit = 1000
                 if limit < 500:
                     raise ValueError("Unable to fetch sufficient historical data")
         logger.info(f"Fetched {len(klines)} klines, sample: {klines[0] if klines else 'None'}")
@@ -146,9 +164,10 @@ async def main():
         data_hist = data_hist[["open_time", "open", "high", "low", "close", "volume"]].astype(float)
         df = data_hist.rename(columns={"open_time": "timestamp"})
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+        df.set_index("timestamp", inplace=True)  # Définir timestamp comme index
         logger.info(f"Loaded {len(df)} historical candles")
         df = df.tail(200)  # Conserver 200 lignes initiales
-        logger.info(f"[Data] Latest timestamp in df: {df['timestamp'].iloc[-1]}")
+        logger.info(f"[Data] Latest timestamp in df: {df.index[-1]}")
 
         # Compute indicators for historical data
         df = calculate_indicators(df)
@@ -207,10 +226,21 @@ async def main():
                 if not candle_df.empty:
                     logger.info(f"Received candle: {candle_df.iloc[-1]}")
                     print(f"Received candle: {candle_df.iloc[-1]}")
-                    df = pd.concat([df, candle_df], ignore_index=True)
+                    candle_df["timestamp"] = pd.to_datetime(candle_df["timestamp"], unit="ms")
+                    candle_df.set_index("timestamp", inplace=True)
+                    df = pd.concat([df, candle_df], ignore_index=False)
                     df = calculate_indicators(df)
                     if len(df) >= 101:
                         action, new_position = check_signal(df, model, current_position, last_order_details)
+                        # Stockage du signal
+                        signal_details = {
+                            "symbol": SYMBOL,
+                            "signal_type": action if action in ["buy", "sell", "close_buy", "close_sell"] else "none",
+                            "price": float(candle_df["close"].iloc[-1]),
+                            "timestamp": int(candle_df.index[-1].timestamp() * 1000)
+                        }
+                        insert_signal(signal_details)
+
                         logger.info(f"Action: {action}, New Position: {new_position}")
                         print(f"Action: {action}, New Position: {new_position}")
                         print(f"Current position before update: {current_position}")
