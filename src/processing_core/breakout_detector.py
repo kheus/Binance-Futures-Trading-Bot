@@ -2,7 +2,7 @@ import pandas as pd
 
 def detect_breakout(df):
     """
-    Détecte un breakout à la hausse ou à la baisse sur les 20 dernières bougies.
+    Detecte un breakout à la hausse ou à la baisse sur les 20 dernieres bougies.
     Retourne "breakout_up", "breakout_down" ou None.
     """
     try:

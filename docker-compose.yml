@@ -3,7 +3,7 @@ services:
     image: postgres:16
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: Cheikh12
+      POSTGRES_PASSWORD: postgres1
       POSTGRES_DB: trading_bot
       LANG: en_US.UTF-8
       LC_ALL: en_US.UTF-8

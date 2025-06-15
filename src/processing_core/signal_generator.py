@@ -1,5 +1,6 @@
 # Signal Generator Module
 import logging
+from logging import config
 import numpy as np
 import pandas as pd
 import talib
@@ -36,17 +37,17 @@ def calculate_dynamic_thresholds(adx, strategy="trend"):
 def select_strategy_mode(adx, rsi, atr):
     if adx > 30:  # Forte tendance
         return "trend"
-    elif adx < 15 and 40 < rsi < 60 and atr < 30:  # Marche plat avec faible volatilite
+    elif adx < 15 and 40 < rsi < 60 and atr < 30:  # Marche plat avec faible volatilité
         return "range"
-    else:  # Volatilite moderee ou conditions mixtes
+    else:  # Volatilité modérée ou conditions mixtes
         return "scalp"
 
-def check_signal(df, model, current_position, last_order_details):
-    logger.info(f"[Debug] Using model with last_train_time: {getattr(model, 'last_train_time', 'N/A')}")
-    if len(df) < 100:  # Aligne sur SEQ_LEN
+def check_signal(df, model, current_position, last_order_details, symbol, last_action_sent=None):
+    logger.info(f"[Debug] Using model with last_train_time: {getattr(model, 'last_train_time', 'N/A')} for {symbol}")
+    if len(df) < 100:
         return "None", None
 
-    # Calculer les indicateurs
+    # Indicateurs
     rsi = df['RSI'].iloc[-1]
     macd = df['MACD'].iloc[-1]
     signal = df['MACD_signal'].iloc[-1]
@@ -56,44 +57,34 @@ def check_signal(df, model, current_position, last_order_details):
     atr = df['ATR'].iloc[-1]
     close = df['close'].iloc[-1]
 
-    # Déterminer la stratégie automatiquement
     strategy_mode = select_strategy_mode(adx, rsi, atr)
-    logger.info(f"[Strategy] Switched to {strategy_mode}, ADX: {adx:.2f}, RSI: {rsi:.2f}, ATR: {atr:.2f}")
+    logger.info(f"[Strategy] Switched to {strategy_mode}, ADX: {adx:.2f}, RSI: {rsi:.2f}, ATR: {atr:.2f} for {symbol}")
 
-    # Préparer l'entrée LSTM
     lstm_input = prepare_lstm_input(df)
     try:
         prediction = model.predict(lstm_input, verbose=0)[0][0]
-        logger.info(f"[Prediction Output] {prediction}")
+        logger.info(f"[Prediction Output] {prediction} for {symbol}")
     except Exception as e:
-        logger.error(f"[Prediction Error] {e}")
-        prediction = 0.5  # Valeur par défaut
+        logger.error(f"[Prediction Error] {e} for {symbol}")
+        prediction = 0.5
 
-    # Calculer les seuils dynamiques
     dynamic_up, dynamic_down = calculate_dynamic_thresholds(adx, strategy_mode)
-    logger.info(f"[Dynamic Thresholds] ADX: {adx:.2f}, Up: {dynamic_up:.3f}, Down: {dynamic_down:.3f}")
-
-    # Calculs de base
     trend_up = ema20 > ema50
     trend_down = ema20 < ema50
     macd_bullish = macd > signal
-    # Ajustement contextuel du RSI
     rsi_strong = (rsi > 50 and trend_up) or (rsi < 50 and trend_down) or (rsi > 55 or rsi < 40)
     breakout_up = close > df['high'].rolling(window=20).max().iloc[-1] if len(df) >= 20 else False
     breakout_down = close < df['low'].rolling(window=20).min().iloc[-1] if len(df) >= 20 else False
-    logger.info(f"[Debug] RSI Strong calculation: trend_up={trend_up}, trend_down={trend_down}, rsi={rsi}")
-    logger.info(f"[Indicators] MACD: {macd}, Signal: {signal}, ADX: {adx}, EMA20: {ema20}, EMA50: {ema50}, ATR: {atr}")
-    logger.info(f"[Conditions] MACD Bullish: {macd_bullish}, ADX Strong: {adx > 25}")
-    logger.info(f"[Debug] Breakout Up Check: close={close}, max_20={df['high'].rolling(window=20).max().iloc[-1]}")
-    logger.info(f"[Trend Up] {trend_up}, Breakout: {breakout_up}")
-    logger.info(f"[Trend Down] {trend_down}, Breakout: {breakout_down}")
 
     action = "None"
     new_position = None
-    if atr < 20:
-        logger.warning(f"[Volatility] ATR too low: {atr} < 20, No trade")
-    elif strategy_mode == "scalp":
-        logger.info(f"[Debug] Scalp Decision: rsi_strong={rsi_strong}, pred={prediction}, dynamic_up={dynamic_up}, dynamic_down={dynamic_down}")
+    # Remove ATR check for ETHUSDT, SOLUSDT, XRPUSDT
+    if symbol not in ["ETHUSDT", "SOLUSDT", "XRPUSDT"]:
+        if atr < 20:
+            logger.warning(f"[Volatility] ATR too low: {atr} < 20, No trade for {symbol}")
+            return "None", current_position
+
+    if strategy_mode == "scalp":
         if rsi_strong and prediction > dynamic_up:
             action = "buy"
             new_position = "long"
@@ -109,7 +100,7 @@ def check_signal(df, model, current_position, last_order_details):
             new_position = "short"
     elif strategy_mode == "range":
         range_high = df['high'].rolling(20).max().iloc[-1]
-        range_low = df['low'].rolling(window=20).min().iloc[-1]
+        range_low = df['low'].rolling(20).min().iloc[-1]
         if close <= range_low and prediction > dynamic_up:
             action = "buy"
             new_position = "long"
@@ -117,7 +108,7 @@ def check_signal(df, model, current_position, last_order_details):
             action = "sell"
             new_position = "short"
 
-    # Gestion des fermetures
+    # Clôtures intelligentes
     if current_position == "long" and (trend_down or not macd_bullish):
         action = "close_buy"
         new_position = None
@@ -125,22 +116,23 @@ def check_signal(df, model, current_position, last_order_details):
         action = "close_sell"
         new_position = None
 
-    # Stockage du signal
-    signal_details = {
-        "symbol": "BTCUSDT",  # Utilise SYMBOL au lieu de df.index[-1]["symbol"]
-        "signal_type": action,
-        "price": float(close),
-        "timestamp": int(time.time() * 1000),
-        "quantity": 0.0  # À définir si pertinent
-    }
-    if action != "None":
-       logger.debug(f"Inserting signal: {signal_details}")
-       insert_signal(signal_details)
-       logger.info(f"[Signal Stored] {signal_details}")
-    else:
-       logger.info("[No DB Insert] Action is 'None', skipping database insert")
+    # 🔁 Filtrage anti-redondance
+    if action == last_action_sent:
+        logger.info(f"[Anti-Repeat] Signal {action} ignored for {symbol} as it was sent previously.")
+        return "None", current_position
 
-    logger.info(f"[Decision] Trend Up: {trend_up}, MACD Bullish: {macd_bullish}, RSI Strong: {rsi_strong}, Pred > Dynamic Up: {prediction > dynamic_up}, Breakout: {breakout_up}")
-    if action == "None":
-        logger.info("[No Entry] No condition met for new position")
+    # Stockage du signal si nouveau
+    if action != "None":
+        signal_details = {
+            "symbol": symbol,
+            "signal_type": action,
+            "price": float(close),
+            "timestamp": int(time.time() * 1000),
+            "quantity": 0.0
+        }
+        insert_signal(signal_details)
+        logger.info(f"[Signal Stored] {signal_details} for {symbol}")
+    else:
+        logger.info(f"[No DB Insert] Action is 'None' for {symbol}, skipping database insert")
+
     return action, new_position

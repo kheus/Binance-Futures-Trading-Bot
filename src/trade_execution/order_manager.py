@@ -1,9 +1,6 @@
-# Order Manager for Binance Futures Trading
-
 try:
     from binance.enums import SIDE_BUY, SIDE_SELL, ORDER_TYPE_MARKET
 except ImportError:
-    # Fallback definitions if binance.enums is not available
     SIDE_BUY = 'BUY'
     SIDE_SELL = 'SELL'
     ORDER_TYPE_MARKET = 'MARKET'
@@ -15,12 +12,12 @@ from src.database.db_handler import insert_trade
 
 logger = logging.getLogger(__name__)
 
-def place_order(signal, price, atr, client, symbol, capital, leverage):
-    """
-    Place a market order with SL and TP on Binance Futures, and return the order details.
-    """
+TICK_SIZE = 0.1  # ⚠️ À adapter selon le symbole réel (via exchangeInfo)
 
-    # === 1. VALIDATION DES PARAMÈTRES ENTRANTS ===
+def round_to_tick(price, tick_size=TICK_SIZE):
+    return round(round(price / tick_size) * tick_size, 2)
+
+def place_order(signal, price, atr, client, symbol, capital, leverage):
     if signal not in ["buy", "sell"]:
         logger.error(f"[Order Error] Invalid signal: {signal}")
         return None
@@ -30,28 +27,29 @@ def place_order(signal, price, atr, client, symbol, capital, leverage):
         return None
 
     try:
-        # === 2. CALCUL DE LA QUANTITÉ ADAPTÉE AU TICK SIZE ===
         base_qty = (capital / price) * leverage
         qty = max(round(base_qty / 0.001) * 0.001, 0.001)
         logger.info(f"[Debug] Calculated Qty: base={base_qty}, adjusted={qty}")
 
-        # === 3. CALCUL DU SL ET TP ===
-        sl = round(price - atr * 3, 2) if signal == "buy" else round(price + atr * 3, 2)
-        tp = round(price + atr * 6, 2) if signal == "buy" else round(price - atr * 6, 2)
+        # SL/TP initiaux
+        sl = price + atr * 2 if signal == "sell" else price - atr * 2
+        tp = price - atr * 5 if signal == "sell" else price + atr * 5
 
-        # Protection : distance min de 0.2 %
-        min_pct = 0.002
-        min_sl_dist = price * min_pct
+        # Distance minimale (protection)
+        min_gap = price * 0.0025  # 0.25%
+        if signal == "buy":
+            sl = min(sl, price - min_gap)
+            tp = max(tp, price + min_gap)
+        else:
+            sl = max(sl, price + min_gap)
+            tp = min(tp, price - min_gap)
 
-        if abs(price - sl) < min_sl_dist:
-            sl = round(price * (1 - min_pct), 2) if signal == "buy" else round(price * (1 + min_pct), 2)
-
-        if abs(tp - price) < min_sl_dist:
-            tp = round(price * (1 + 2 * min_pct), 2) if signal == "buy" else round(price * (1 - 2 * min_pct), 2)
+        # Arrondi au tick size
+        sl = round_to_tick(sl)
+        tp = round_to_tick(tp)
 
         logger.info(f"[SL/TP Adjusted] Price: {price}, SL: {sl}, TP: {tp}")
 
-        # === 4. MISE EN PLACE DU LEVIER ===
         try:
             client.change_leverage(symbol=symbol, leverage=leverage)
             logger.info(f"[Leverage] Set to {leverage}x for {symbol}")
@@ -63,7 +61,6 @@ def place_order(signal, price, atr, client, symbol, capital, leverage):
                 logger.error(f"[Fallback Leverage Error] {e2}")
                 return None
 
-        # === 5. PLACEMENT DE L'ORDRE PRINCIPAL (MARKET) ===
         order_side = SIDE_BUY if signal == "buy" else SIDE_SELL
         try:
             order = client.new_order(
@@ -72,44 +69,46 @@ def place_order(signal, price, atr, client, symbol, capital, leverage):
                 type=ORDER_TYPE_MARKET,
                 quantity=qty
             )
+            logger.info(f"[LIVE ORDER] {signal.upper()} {qty} {symbol} at {price}")
+            time.sleep(0.4)
         except Exception as e:
             logger.error(f"[Order Error] Failed to place market order: {e}")
             return None
 
-        logger.info(f"[LIVE ORDER] {signal.upper()} {qty} {symbol} at {price}")
-
-        # === 6. PLACEMENT DES ORDRES SL ET TP (STOP_MARKET & TAKE_PROFIT_MARKET) ===
         try:
-            opposite_side = SIDE_SELL if signal == "buy" else SIDE_BUY
+            position_info = client.get_position_risk(symbol=symbol)
+            position_amt = float([p for p in position_info if p["symbol"] == symbol][0]["positionAmt"])
 
-            # Stop Loss
-            client.new_order(
-                symbol=symbol,
-                side=opposite_side,
-                type="STOP_MARKET",
-                stopPrice=sl,
-                closePosition=True,
-                priceProtect=True,
-                workingType="MARK_PRICE"
-            )
+            if abs(position_amt) > 0:
+                opposite_side = SIDE_SELL if signal == "buy" else SIDE_BUY
 
-            # Take Profit
-            client.new_order(
-                symbol=symbol,
-                side=opposite_side,
-                type="TAKE_PROFIT_MARKET",
-                stopPrice=tp,
-                closePosition=True,
-                priceProtect=True,
-                workingType="MARK_PRICE"
-            )
+                client.new_order(
+                    symbol=symbol,
+                    side=opposite_side,
+                    type="STOP_MARKET",
+                    stopPrice=sl,
+                    closePosition=True,
+                    priceProtect=True,
+                    workingType="MARK_PRICE"
+                )
 
-            logger.info(f"[SL/TP] Orders placed: SL={sl}, TP={tp}")
+                client.new_order(
+                    symbol=symbol,
+                    side=opposite_side,
+                    type="TAKE_PROFIT_MARKET",
+                    stopPrice=tp,
+                    closePosition=True,
+                    priceProtect=True,
+                    workingType="MARK_PRICE"
+                )
+
+                logger.info(f"[SL/TP] Orders placed: SL={sl}, TP={tp}")
+            else:
+                logger.warning("No position detected, skipping SL/TP orders.")
 
         except Exception as e:
             logger.warning(f"[SL/TP Error] {e} | SL={sl}, TP={tp} | Continuing with market order only")
 
-        # === 7. CONSTRUCTION DES DÉTAILS D’ORDRE POUR ENREGISTREMENT ===
         order_details = {
             "order_id": str(order["orderId"]),
             "symbol": symbol,
@@ -119,14 +118,55 @@ def place_order(signal, price, atr, client, symbol, capital, leverage):
             "stop_loss": sl,
             "take_profit": tp,
             "timestamp": int(time.time() * 1000),
-            "pnl": 0.0  # à mettre à jour à la clôture
+            "pnl": 0.0
         }
 
-        # === 8. ENREGISTREMENT EN BASE DE DONNÉES ===
         insert_trade(order_details)
-
         return order_details
 
     except Exception as e:
         logger.error(f"[Fatal Order Error] {e}")
         return None
+
+def update_trailing_stop(client, symbol, signal, current_price, atr, base_qty, existing_sl_order_id):
+    """
+    Place or update a dynamic trailing stop-loss.
+    """
+    # Calculate trailing delta (capped at 5000 points, minimum 10 points)
+    trailing_delta = max(10, min(5000, int(round(2 * atr / TICK_SIZE) * TICK_SIZE)))
+    sl_price = round(current_price - (2 * atr), 2) if signal == "buy" else round(current_price + (2 * atr), 2)
+    side = SIDE_SELL if signal == "buy" else SIDE_BUY
+
+    try:
+        if existing_sl_order_id is None:
+            # Place initial trailing stop order
+            order = client.new_order(
+                symbol=symbol,
+                side=side,
+                type="TRAILING_STOP_MARKET",
+                quantity=base_qty,
+                trailingDelta=trailing_delta,  # Trailing distance in points
+                timeInForce="GTC",
+                # activationPrice=sl_price  # Optional, remove if causing issues
+            )
+            logger.info(f"[Trailing Stop] Initialized for {symbol}, new SL order ID: {order['orderId']}, Delta: {trailing_delta}")
+            return order["orderId"]
+        else:
+            # Update existing trailing stop
+            client.cancel_order(symbol=symbol, orderId=existing_sl_order_id)
+            order = client.new_order(
+                symbol=symbol,
+                side=side,
+                type="TRAILING_STOP_MARKET",
+                quantity=base_qty,
+                trailingDelta=trailing_delta,
+                timeInForce="GTC"
+            )
+            logger.info(f"[Trailing Stop] Updated for {symbol}, new SL order ID: {order['orderId']}, Delta: {trailing_delta}")
+            return order["orderId"]
+    except Exception as e:
+        logger.error(f"[Trailing SL Error] Failed to place/update trailing SL for {symbol}: {e}, Params: trailingDelta={trailing_delta}, sl_price={sl_price}")
+        if existing_sl_order_id is not None:
+            return existing_sl_order_id
+        else:
+            return None

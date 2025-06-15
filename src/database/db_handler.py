@@ -1,4 +1,3 @@
-# db_handler.py
 import yaml
 import logging
 import sys
@@ -140,7 +139,7 @@ def insert_signal(signal_details):
     signal_type = signal_details.get("signal_type")
 
     if signal_type not in valid_signals:
-        logger.error(f"signal_type invalide: {signal_type}")
+        logger.error(f"signal_type invalide: {signal_type} - skipping insertion")
         return
 
     with get_db_connection() as conn:
@@ -165,7 +164,6 @@ def insert_signal(signal_details):
         finally:
             cur.close()
 
-
 # Insertion des métriques
 def insert_metrics(metric_details):
     required = ["symbol", "timestamp"]
@@ -173,9 +171,20 @@ def insert_metrics(metric_details):
         logger.error(f"Données manquantes dans metric_details: {metric_details}")
         return
 
+    # Validation RSI
+    if not (0 <= metric_details.get("rsi", 0) <= 100):
+        logger.error(f"Invalid RSI: {metric_details['rsi']}")
+        return
+
     with get_db_connection() as conn:
         cur = conn.cursor()
         try:
+            # Prevent duplicate metrics for the same symbol and timestamp
+            cur.execute("SELECT 1 FROM metrics WHERE symbol = ? AND timestamp = ?", 
+                        (metric_details["symbol"], metric_details["timestamp"]))
+            if cur.fetchone():
+                return
+
             logger.debug(f"Tentative d'insertion métriques: {metric_details}")
             cur.execute("""
                 INSERT INTO metrics (symbol, timestamp, rsi, macd, adx, ema20, ema50, atr)
