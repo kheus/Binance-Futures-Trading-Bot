@@ -132,9 +132,8 @@ def update_trailing_stop(client, symbol, signal, current_price, atr, base_qty, e
     """
     Place or update a dynamic trailing stop-loss.
     """
-    # Calculate trailing delta (capped at 5000 points, minimum 10 points)
-    trailing_delta = max(10, min(5000, int(round(2 * atr / TICK_SIZE) * TICK_SIZE)))
-    sl_price = round(current_price - (2 * atr), 2) if signal == "buy" else round(current_price + (2 * atr), 2)
+    # Calculate callback rate as a percentage of price (e.g., 2x ATR as % of price, capped at 5%)
+    callback_rate = max(0.1, min(5.0, round(2 * atr / current_price * 100, 1)))
     side = SIDE_SELL if signal == "buy" else SIDE_BUY
 
     try:
@@ -145,11 +144,10 @@ def update_trailing_stop(client, symbol, signal, current_price, atr, base_qty, e
                 side=side,
                 type="TRAILING_STOP_MARKET",
                 quantity=base_qty,
-                trailingDelta=trailing_delta,  # Trailing distance in points
-                timeInForce="GTC",
-                # activationPrice=sl_price  # Optional, remove if causing issues
+                callbackRate=callback_rate,  # Percentage (0.1% to 5%)
+                timeInForce="GTC"
             )
-            logger.info(f"[Trailing Stop] Initialized for {symbol}, new SL order ID: {order['orderId']}, Delta: {trailing_delta}")
+            logger.info(f"[Trailing Stop] Initialized for {symbol}, new SL order ID: {order['orderId']}, Callback Rate: {callback_rate}%")
             return order["orderId"]
         else:
             # Update existing trailing stop
@@ -159,13 +157,13 @@ def update_trailing_stop(client, symbol, signal, current_price, atr, base_qty, e
                 side=side,
                 type="TRAILING_STOP_MARKET",
                 quantity=base_qty,
-                trailingDelta=trailing_delta,
+                callbackRate=callback_rate,
                 timeInForce="GTC"
             )
-            logger.info(f"[Trailing Stop] Updated for {symbol}, new SL order ID: {order['orderId']}, Delta: {trailing_delta}")
+            logger.info(f"[Trailing Stop] Updated for {symbol}, new SL order ID: {order['orderId']}, Callback Rate: {callback_rate}%")
             return order["orderId"]
     except Exception as e:
-        logger.error(f"[Trailing SL Error] Failed to place/update trailing SL for {symbol}: {e}, Params: trailingDelta={trailing_delta}, sl_price={sl_price}")
+        logger.error(f"[Trailing SL Error] Failed to place/update trailing SL for {symbol}: {e}, Params: callbackRate={callback_rate}")
         if existing_sl_order_id is not None:
             return existing_sl_order_id
         else:
