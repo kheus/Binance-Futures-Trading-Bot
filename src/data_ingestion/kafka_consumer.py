@@ -1,82 +1,130 @@
-
 import json
 import yaml
-import websocket  # Use the default import from websocket-client
-from confluent_kafka import Producer
+import websocket
+from confluent_kafka import Producer, admin
 from datetime import datetime
 import time
+import threading
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 # Load configuration
-with open("config/config.yaml", "r") as f:
+with open("config/config.yaml", "r", encoding='utf-8') as f:
     config = yaml.safe_load(f)
-with open("config/kafka_config_local.yaml", "r") as f:
+with open("config/kafka_config_local.yaml", "r", encoding='utf-8') as f:
     kafka_config = yaml.safe_load(f)
 
-SYMBOL = config["binance"]["symbol"]
+SYMBOLS = config["binance"]["symbols"]
 TIMEFRAME = config["binance"]["timeframe"]
-KAFKA_TOPIC = kafka_config["kafka"]["topic"]
 KAFKA_BOOTSTRAP = kafka_config["kafka"]["bootstrap_servers"]
 
 # Kafka producer
 def create_kafka_producer():
     try:
-        return Producer({
+        producer = Producer({
             "bootstrap.servers": KAFKA_BOOTSTRAP,
-            "security.protocol": "PLAINTEXT",  # Explicitly set to PLAINTEXT
-            "api.version.request": True,       # Enable ApiVersion requests
-            "broker.version.fallback": "0.10.0"  # Fallback for older brokers if needed
+            "security.protocol": "PLAINTEXT",
+            "api.version.request": True,
+            "broker.version.fallback": "0.10.0"
         })
+        logger.info(f"[Kafka] Producer initialized with bootstrap servers: {KAFKA_BOOTSTRAP}")
+        return producer
     except Exception as e:
-        print(f"Kafka producer initialization error: {e}")
+        logger.error(f"[Kafka] Producer initialization error: {e}")
         return None
 
 producer = create_kafka_producer()
 
-def on_message(ws, message):
+# Create topics if they don't exist
+def create_topics():
+    if not producer:
+        logger.error("[Kafka] Cannot create topics, producer not initialized")
+        return
+    try:
+        admin_client = admin.AdminClient({"bootstrap.servers": KAFKA_BOOTSTRAP})
+        topics = [f"{symbol}_candle" for symbol in SYMBOLS]
+        existing_topics = admin_client.list_topics().topics.keys()
+        new_topics = [t for t in topics if t not in existing_topics]
+        if new_topics:
+            admin_client.create_topics([admin.NewTopic(t, num_partitions=1, replication_factor=1) for t in new_topics])
+            logger.info(f"[Kafka] Created topics: {new_topics}")
+        else:
+            logger.info("[Kafka] All required topics already exist")
+    except Exception as e:
+        logger.error(f"[Kafka] Failed to create topics: {e}")
+
+create_topics()
+
+def on_message(ws, message, symbol):
     try:
         data = json.loads(message)["k"]
         if data["x"]:  # Candle closed
+            timestamp_ms = data.get("T") or data.get("t")  # Use 'T' (close time) or 't' (open time) if available
             candle = {
-                "timestamp": data["t"],
+                "timestamp": timestamp_ms,
                 "open": float(data["o"]),
                 "high": float(data["h"]),
                 "low": float(data["l"]),
                 "close": float(data["c"]),
                 "volume": float(data["v"]),
             }
+            topic = f"{symbol}_candle"
             if producer:
-                producer.produce(KAFKA_TOPIC, value=json.dumps(candle))
+                producer.produce(topic, value=json.dumps(candle))
                 producer.flush()
-                print(f"Published candle to Kafka: {candle['timestamp']}")
+                logger.info(f"[Kafka] Published candle to topic {topic} for {symbol}: {candle}")
+            else:
+                logger.warning(f"[Kafka] No producer available for {symbol}")
     except Exception as e:
-        print(f"Kafka publish error: {e}")
+        logger.error(f"[Kafka] Publish error for {symbol}: {e}")
 
-def on_error(ws, error):
-    print(f"WebSocket error: {error}")
+def on_error(ws, error, symbol):
+    logger.error(f"[WebSocket] Error for {symbol}: {error}")
 
-def on_close(ws, close_status_code, close_msg):
-    print(f"WebSocket closed: {close_status_code}, {close_msg}")
+def on_close(ws, close_status_code, close_msg, symbol):
+    logger.warning(f"[WebSocket] Closed for {symbol}: {close_status_code}, {close_msg}")
 
-def on_open(ws):
-    print("WebSocket started")
+def on_open(ws, symbol):
+    logger.info(f"[WebSocket] Started for {symbol}")
 
-def start_kafka_consumer():
-    socket = f"wss://fstream.binance.com/ws/{SYMBOL.lower()}@kline_{TIMEFRAME}"
+def start_websocket_for_symbol(symbol):
+    socket = f"wss://fstream.binance.com/ws/{symbol.lower()}@kline_{TIMEFRAME}"
+    logger.info(f"[WebSocket] Connecting to {socket}")
     while True:
         try:
-            ws = websocket.WebSocketApp(socket,
-                                       on_message=on_message,
-                                       on_error=on_error,
-                                       on_close=on_close,
-                                       on_open=on_open)
+            ws = websocket.WebSocketApp(
+                socket,
+                on_message=lambda ws, msg: on_message(ws, msg, symbol),
+                on_error=lambda ws, error: on_error(ws, error, symbol),
+                on_close=lambda ws, csc, cm: on_close(ws, csc, cm, symbol),
+                on_open=lambda ws: on_open(ws, symbol)
+            )
             ws.run_forever(ping_interval=30, ping_timeout=10)
         except Exception as e:
-            print(f"WebSocket connection failed: {e}")
-            time.sleep(5)  # Wait before reconnecting
+            logger.error(f"[WebSocket] Connection failed for {symbol}: {e}")
+            time.sleep(5)
             continue
 
 if __name__ == "__main__":
     if not producer:
-        print("Failed to initialize Kafka producer. Exiting...")
+        logger.error("[Main] Failed to initialize Kafka producer. Exiting...")
         exit(1)
-    start_kafka_consumer()
+
+    # Start a WebSocket connection for each symbol in separate threads
+    threads = []
+    for symbol in SYMBOLS:
+        thread = threading.Thread(target=start_websocket_for_symbol, args=(symbol,))
+        threads.append(thread)
+        thread.start()
+
+    # Allow threads to run independently (don't join to keep main thread alive)
+    try:
+        while True:
+            time.sleep(60)  # Keep main thread alive, check status if needed
+    except KeyboardInterrupt:
+        logger.info("[Main] Script terminated by user")
+        for thread in threads:
+            thread.join()
