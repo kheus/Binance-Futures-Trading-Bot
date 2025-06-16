@@ -3,6 +3,9 @@ import logging
 import sys
 import sqlite3
 from contextlib import contextmanager
+import json
+import pandas as pd
+import time
 
 # Configuration du logging
 logger = logging.getLogger(__name__)
@@ -81,9 +84,26 @@ def create_tables():
         atr REAL
     );
 
+    CREATE TABLE IF NOT EXISTS training_data (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT NOT NULL,
+        timestamp INTEGER NOT NULL,
+        prediction REAL,
+        action TEXT,
+        price REAL,
+        indicators TEXT,
+        market_context TEXT,
+        market_direction INTEGER,
+        price_change_pct REAL,
+        prediction_correct INTEGER,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
     CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp);
     CREATE INDEX IF NOT EXISTS idx_signals_timestamp ON signals(timestamp);
     CREATE INDEX IF NOT EXISTS idx_metrics_timestamp ON metrics(timestamp);
+    CREATE INDEX IF NOT EXISTS idx_training_timestamp ON training_data(timestamp);
     """
     try:
         with get_db_connection() as conn:
@@ -207,6 +227,46 @@ def insert_metrics(metric_details):
         finally:
             cur.close()
 
+# Insertion des données d'entraînement
+def insert_training_data(record):
+    """Store prediction and market context for future analysis"""
+    query = """
+    INSERT INTO training_data (
+        symbol, timestamp, prediction, action, price, indicators, market_context
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    """
+    params = (
+        record['symbol'],
+        record['timestamp'],
+        record['prediction'],
+        record['action'],
+        record['price'],
+        json.dumps(record['indicators']),
+        json.dumps(record['market_context'])
+    )
+    execute_query(query, params)
+
+def execute_query(query, params=None):
+    """Executes a query with optional parameters and returns the result if any."""
+    with get_db_connection() as conn:
+        cur = conn.cursor()
+        try:
+            if params is not None:
+                cur.execute(query, params)
+            else:
+                cur.execute(query)
+            if query.strip().upper().startswith("SELECT"):
+                result = cur.fetchall()
+            else:
+                conn.commit()
+                result = cur.lastrowid
+            return result
+        except Exception as e:
+            logger.error(f"Erreur lors de l'exécution de la requête: {e}")
+            raise
+        finally:
+            cur.close()
+
 # Récupération des données
 def get_trades():
     with get_db_connection() as conn:
@@ -243,6 +303,56 @@ def get_metrics():
             return []
         finally:
             cur.close()
+
+def get_future_prices(symbol, signal_timestamp, candle_count=5):
+    """Retrieve prices after a signal timestamp"""
+    query = """
+    SELECT timestamp, open, high, low, close, volume
+    FROM price_data
+    WHERE symbol = ? AND timestamp > ?
+    ORDER BY timestamp ASC
+    LIMIT ?
+    """
+    with get_db_connection() as conn:
+        return pd.read_sql(query, conn, params=(symbol, signal_timestamp, candle_count))
+
+def get_pending_training_data():
+    """Get records needing outcome calculation"""
+    query = """
+    SELECT * FROM training_data
+    WHERE market_direction IS NULL
+    AND timestamp < ?
+    """
+    five_min_ago = int(time.time() * 1000) - 300000
+    return execute_query(query, (five_min_ago,))
+
+def update_training_outcome(record_id, market_direction, price_change_pct, prediction_correct):
+    """Update record with actual market outcome"""
+    query = """
+    UPDATE training_data
+    SET market_direction = ?,
+        price_change_pct = ?,
+        prediction_correct = ?,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = ?
+    """
+    params = (market_direction, price_change_pct, prediction_correct, record_id)
+    execute_query(query, params)
+
+def get_last_train_timestamp():
+    """Retrieve the last training timestamp, or 0 if none exists."""
+    query = "SELECT MAX(timestamp) FROM training_data"
+    result = execute_query(query)
+    return result[0][0] if result and result[0][0] is not None else 0
+
+def get_training_data_count(since_last_train=False):
+    """Count available training data points"""
+    query = "SELECT COUNT(*) FROM training_data"
+    if since_last_train:
+        last_train = get_last_train_timestamp()
+        query += " WHERE timestamp > ?"
+        return execute_query(query, (last_train,))[0][0]
+    return execute_query(query)[0][0]
 
 # Point d'entrée pour tests
 if __name__ == "__main__":

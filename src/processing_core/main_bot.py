@@ -18,6 +18,8 @@ import sys
 import os
 import time
 import numpy as np
+import threading
+from src.performance.tracker import performance_tracker_loop
 
 # Force UTF-8 encoding for the console
 sys.stdout.reconfigure(encoding='utf-8')
@@ -206,7 +208,7 @@ async def main():
                                     return np.array([[0.5]])
                             models[symbol] = MockModel()
                         last_model_updates[symbol] = current_time
-                        send_telegram_alert(f"🔄 Model updated successfully for {symbol}.")
+                        send_telegram_alert(f"Bingo ! Model updated successfully for {symbol}.")
                         lstm_input = prepare_lstm_input(dataframes[symbol])
                         pred = models[symbol].predict(lstm_input, verbose=0)[0][0]
                         logger.info(f"[Debug] Prediction after update: {pred}")
@@ -268,7 +270,7 @@ async def main():
                                         insert_trade(order_details[symbol])
                                         last_order_details[symbol] = order_details[symbol]
                                         record_trade_metric(order_details[symbol])
-                                        send_telegram_alert(f"Trade executed: {action.upper()} {symbol} at {price}")
+                                        send_telegram_alert(f"Trade executed: {action.upper()} {symbol} at {price} with TS {update_trailing_stop} ")
                                         logger.info(f"[Order] Successfully placed {action} order for {symbol}")
                                         current_positions[symbol] = new_position
                                         # Initialize trailing stop with trade order ID if available
@@ -343,6 +345,8 @@ if platform.system() == "Emscripten":
     asyncio.ensure_future(main())
 else:
     if __name__ == "__main__":
+        tracker_thread = threading.Thread(target=performance_tracker_loop, daemon=True)
+        tracker_thread.start()
         try:
             asyncio.run(main())
         except KeyboardInterrupt:
