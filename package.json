@@ -1,0 +1,13 @@
+{
+  "name": "binance-trading-bot",
+  "version": "1.0.0",
+  "scripts": {
+    "build": "tailwindcss -i ./static/css/styles.css -o ./static/css/tailwind.css",
+    "watch": "tailwindcss -i ./static/css/styles.css -o ./static/css/tailwind.css --watch"
+  },
+  "devDependencies": {
+    "autoprefixer": "10.4.16",
+    "postcss": "8.4.31", 
+    "tailwindcss": "3.3.3"
+    }
+  }

@@ -1,4 +1,4 @@
-try:
+﻿try:
     from binance.enums import SIDE_BUY, SIDE_SELL, ORDER_TYPE_MARKET
 except ImportError:
     SIDE_BUY = 'BUY'
@@ -9,13 +9,23 @@ import time
 import logging
 import numpy as np
 from src.database.db_handler import insert_trade
+from binance.client import Client
+import json
+from tabulate import tabulate
 
 logger = logging.getLogger(__name__)
 
-TICK_SIZE = 0.1  # ⚠️ À adapter selon le symbole réel (via exchangeInfo)
+def get_tick_info(client, symbol):
+    exchange_info = client.exchange_info()
+    symbol_info = next((s for s in exchange_info["symbols"] if s["symbol"] == symbol), None)
+    if not symbol_info:
+        raise ValueError(f"Symbol {symbol} not found in exchange info.")
 
-def round_to_tick(price, tick_size=TICK_SIZE):
-    return round(round(price / tick_size) * tick_size, 2)
+    price_filter = next(f for f in symbol_info['filters'] if f['filterType'] == 'PRICE_FILTER')
+    return float(price_filter['tickSize']), int(symbol_info['quantityPrecision'])
+
+def round_to_tick(value, tick_size):
+    return round(round(value / tick_size) * tick_size, 8)
 
 def place_order(signal, price, atr, client, symbol, capital, leverage):
     if signal not in ["buy", "sell"]:
@@ -27,16 +37,16 @@ def place_order(signal, price, atr, client, symbol, capital, leverage):
         return None
 
     try:
-        base_qty = (capital / price) * leverage
-        qty = max(round(base_qty / 0.001) * 0.001, 0.001)
-        logger.info(f"[Debug] Calculated Qty: base={base_qty}, adjusted={qty}")
+        tick_size, quantity_precision = get_tick_info(client, symbol)
+        base_qty = capital / price
+        qty = round(base_qty * leverage, quantity_precision)
 
-        # SL/TP initiaux
+        logger.info(f"[Qty] base={base_qty}, adjusted={qty} ({symbol})")
+
         sl = price + atr * 2 if signal == "sell" else price - atr * 2
         tp = price - atr * 5 if signal == "sell" else price + atr * 5
 
-        # Distance minimale (protection)
-        min_gap = price * 0.0025  # 0.25%
+        min_gap = price * 0.0025
         if signal == "buy":
             sl = min(sl, price - min_gap)
             tp = max(tp, price + min_gap)
@@ -44,70 +54,66 @@ def place_order(signal, price, atr, client, symbol, capital, leverage):
             sl = max(sl, price + min_gap)
             tp = min(tp, price - min_gap)
 
-        # Arrondi au tick size
-        sl = round_to_tick(sl)
-        tp = round_to_tick(tp)
-
-        logger.info(f"[SL/TP Adjusted] Price: {price}, SL: {sl}, TP: {tp}")
+        sl = round_to_tick(sl, tick_size)
+        tp = round_to_tick(tp, tick_size)
 
         try:
             client.change_leverage(symbol=symbol, leverage=leverage)
-            logger.info(f"[Leverage] Set to {leverage}x for {symbol}")
+            logger.info(f"[Leverage] {leverage}x for {symbol}")
         except Exception as e:
-            logger.error(f"[Leverage Error] {e}, falling back to 1x")
+            logger.error(f"[Leverage Error] {e}, fallback to 1x")
             try:
                 client.change_leverage(symbol=symbol, leverage=1)
             except Exception as e2:
                 logger.error(f"[Fallback Leverage Error] {e2}")
                 return None
 
-        order_side = SIDE_BUY if signal == "buy" else SIDE_SELL
+        side = SIDE_BUY if signal == "buy" else SIDE_SELL
+
         try:
             order = client.new_order(
                 symbol=symbol,
-                side=order_side,
+                side=side,
                 type=ORDER_TYPE_MARKET,
                 quantity=qty
             )
-            logger.info(f"[LIVE ORDER] {signal.upper()} {qty} {symbol} at {price}")
-            time.sleep(0.4)
+            logger.info(f"[ORDER] {signal.upper()} {qty} {symbol} @ {price}")
+            time.sleep(0.5)
         except Exception as e:
-            logger.error(f"[Order Error] Failed to place market order: {e}")
+            logger.error(f"[Order Failed] {e}")
             return None
 
         try:
-            position_info = client.get_position_risk(symbol=symbol)
-            position_amt = float([p for p in position_info if p["symbol"] == symbol][0]["positionAmt"])
+            positions = client.get_position_risk(symbol=symbol)
+            position_amt = float([p for p in positions if p["symbol"] == symbol][0]["positionAmt"])
 
             if abs(position_amt) > 0:
-                opposite_side = SIDE_SELL if signal == "buy" else SIDE_BUY
+                opposite = SIDE_SELL if signal == "buy" else SIDE_BUY
 
                 client.new_order(
                     symbol=symbol,
-                    side=opposite_side,
+                    side=opposite,
                     type="STOP_MARKET",
-                    stopPrice=sl,
+                    stopPrice=str(sl),
                     closePosition=True,
                     priceProtect=True,
                     workingType="MARK_PRICE"
                 )
-
                 client.new_order(
                     symbol=symbol,
-                    side=opposite_side,
+                    side=opposite,
                     type="TAKE_PROFIT_MARKET",
-                    stopPrice=tp,
+                    stopPrice=str(tp),
                     closePosition=True,
                     priceProtect=True,
                     workingType="MARK_PRICE"
                 )
-
-                logger.info(f"[SL/TP] Orders placed: SL={sl}, TP={tp}")
+                logger.info(f"[SL/TP] Set for {symbol} | SL={sl}, TP={tp}")
             else:
-                logger.warning("No position detected, skipping SL/TP orders.")
+                logger.warning("No open position â†’ SL/TP skipped")
 
         except Exception as e:
-            logger.warning(f"[SL/TP Error] {e} | SL={sl}, TP={tp} | Continuing with market order only")
+            logger.warning(f"[SL/TP Error] {e} â†’ Continuing without SL/TP")
 
         order_details = {
             "order_id": str(order["orderId"]),
@@ -121,36 +127,43 @@ def place_order(signal, price, atr, client, symbol, capital, leverage):
             "pnl": 0.0
         }
 
+        # Calculate callback_rate for logging purposes
+        callback_rate = max(0.1, min(5.0, round(2 * atr / price * 100, 1)))
+
+        log_data = [
+            ["Price", price],
+            ["Qty", qty],
+            ["SL", sl],
+            ["TP", tp],
+            ["ATR", atr],
+            ["Callback%", callback_rate]
+        ]
+        logger.info("\n" + tabulate(log_data, headers=["Param", "Value"], tablefmt="fancy_grid"))
+
         insert_trade(order_details)
         return order_details
 
     except Exception as e:
-        logger.error(f"[Fatal Order Error] {e}")
+        logger.error(f"[Fatal Error] {e}")
         return None
 
 def update_trailing_stop(client, symbol, signal, current_price, atr, base_qty, existing_sl_order_id):
-    """
-    Place or update a dynamic trailing stop-loss.
-    """
-    # Calculate callback rate as a percentage of price (e.g., 2x ATR as % of price, capped at 5%)
     callback_rate = max(0.1, min(5.0, round(2 * atr / current_price * 100, 1)))
     side = SIDE_SELL if signal == "buy" else SIDE_BUY
 
     try:
         if existing_sl_order_id is None:
-            # Place initial trailing stop order
             order = client.new_order(
                 symbol=symbol,
                 side=side,
                 type="TRAILING_STOP_MARKET",
                 quantity=base_qty,
-                callbackRate=callback_rate,  # Percentage (0.1% to 5%)
+                callbackRate=callback_rate,
                 timeInForce="GTC"
             )
             logger.info(f"[Trailing Stop] Initialized for {symbol}, new SL order ID: {order['orderId']}, Callback Rate: {callback_rate}%")
             return order["orderId"]
         else:
-            # Update existing trailing stop
             client.cancel_order(symbol=symbol, orderId=existing_sl_order_id)
             order = client.new_order(
                 symbol=symbol,
@@ -168,3 +181,23 @@ def update_trailing_stop(client, symbol, signal, current_price, atr, base_qty, e
             return existing_sl_order_id
         else:
             return None
+
+def handle_message(message, symbol, client, signal, atr, base_qty, last_sl_order_id, last_update_price):
+    if message.get('e') == 'markPriceUpdate':
+        current_price = float(message.get('p', 0))
+        if last_update_price is None or abs(current_price - last_update_price) > 0.2 * atr:
+            update_trailing_stop(
+                client=client,
+                symbol=symbol,
+                signal=signal,
+                current_price=current_price,
+                atr=atr,
+                base_qty=base_qty,
+                existing_sl_order_id=last_sl_order_id
+            )
+            last_update_price = current_price
+        else:
+            logger.info(f"[Price Update] No significant price change for {symbol} â†’ Skipping trailing stop update")
+    else:
+        logger.warning(f"[Trailing Skip] No open position for {symbol} â†’ Skipping trailing stop update")
+

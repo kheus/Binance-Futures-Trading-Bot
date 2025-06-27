@@ -1,4 +1,4 @@
-import yaml
+﻿import yaml
 import logging
 import requests
 from binance.um_futures import UMFutures
@@ -16,7 +16,7 @@ def init_binance_client(mode="testnet"):
         UMFutures: client Binance UM Futures configure
     """
     try:
-        with open("config/config.yaml", "r") as f:
+        with open("config/config.yaml", "r" , encoding="utf-8-sig") as f:
             config = yaml.safe_load(f)
         
         key = config["binance"]["api_key"]
