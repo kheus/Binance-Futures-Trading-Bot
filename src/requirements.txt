@@ -17,6 +17,7 @@ confluent-kafka==2.10.0
 Cython==3.1.1
 dateparser==1.2.1
 dnspython==2.7.0
+ta-lib==0.4.19
 eventlet==0.40.1
 Flask==3.1.1
 Flask-SocketIO==5.5.1
