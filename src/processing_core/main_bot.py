@@ -14,7 +14,7 @@ from src.processing_core.signal_generator import check_signal, prepare_lstm_inpu
 from src.trade_execution.order_manager import place_order, update_trailing_stop, init_trailing_stop_manager
 from src.database.db_handler import insert_trade, insert_signal, insert_metrics, create_tables, execute_query
 from src.monitoring.metrics import record_trade_metric
-from src.monitoring.alerting import send_telegram_alert
+from monitoring.alerting import send_telegram_alert
 import platform
 import sys
 import os
@@ -384,6 +384,16 @@ async def main():
                             logger.info(f"[Order] Attempting {close_side} to close for {symbol}, Price: {price}, ATR: {atr}")
                             order_details[symbol] = place_order(close_side, price, atr, client, symbol, CAPITAL, LEVERAGE)
                             if order_details[symbol]:
+                                # Calcul du PNL
+                                if last_order_details[symbol] and last_order_details[symbol].get("price"):
+                                    open_price = float(last_order_details[symbol]["price"])
+                                    close_price = float(order_details[symbol]["price"])
+                                    side = last_order_details[symbol]["side"]
+                                    qty = float(last_order_details[symbol]["quantity"])
+                                    pnl = (close_price - open_price) * qty if side == "buy" else (open_price - close_price) * qty
+                                else:
+                                    pnl = 0.0
+                                order_details[symbol]["pnl"] = pnl  # <-- AJOUT ICI
                                 insert_trade(order_details[symbol])
                                 record_trade_metric(order_details[symbol])
                                 if last_order_details[symbol] and last_order_details[symbol].get("price"):
