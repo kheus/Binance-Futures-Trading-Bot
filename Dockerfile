@@ -1,15 +1,19 @@
-FROM python:3.11-slim
+﻿FROM python:3.11-slim-bullseye
+
+# Update base image to latest patch version and ensure security updates
+RUN apt-get update && apt-get upgrade -y && apt-get dist-upgrade -y && apt-get clean
 
 WORKDIR /app
 
 # Install build dependencies for TA-Lib
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get upgrade -y && apt-get install -y \
     build-essential \
     wget \
     gcc \
     g++ \
     make \
     libc-dev \
+    && apt-get upgrade -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Install TA-Lib system library
@@ -44,3 +48,4 @@ RUN touch src/__init__.py src/data_ingestion/__init__.py src/processing_core/__i
 ENV PYTHONPATH=/app
 
 RUN chmod +x scripts/start_kafka_consumer.sh scripts/start_bot.sh
+
