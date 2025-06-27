@@ -1,4 +1,4 @@
-import json
+﻿import json
 import yaml
 import websocket
 from confluent_kafka import Producer, admin
@@ -12,9 +12,9 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # Load configuration
-with open("config/config.yaml", "r", encoding='utf-8') as f:
+with open("config/config.yaml", "r", encoding="utf-8-sig") as f:
     config = yaml.safe_load(f)
-with open("config/kafka_config_local.yaml", "r", encoding='utf-8') as f:
+with open("config/kafka_config_local.yaml", "r", encoding="utf-8-sig") as f:
     kafka_config = yaml.safe_load(f)
 
 SYMBOLS = config["binance"]["symbols"]
@@ -62,7 +62,7 @@ def on_message(ws, message, symbol):
     try:
         data = json.loads(message)["k"]
         if data["x"]:  # Candle closed
-            timestamp_ms = data.get("T") or data.get("t")  # Use 'T' (close time) or 't' (open time) if available
+            timestamp_ms = data.get("T") or data.get("t")
             candle = {
                 "timestamp": timestamp_ms,
                 "open": float(data["o"]),
@@ -120,10 +120,10 @@ if __name__ == "__main__":
         threads.append(thread)
         thread.start()
 
-    # Allow threads to run independently (don't join to keep main thread alive)
+    # Allow threads to run independently
     try:
         while True:
-            time.sleep(60)  # Keep main thread alive, check status if needed
+            time.sleep(60)
     except KeyboardInterrupt:
         logger.info("[Main] Script terminated by user")
         for thread in threads:

@@ -1,4 +1,4 @@
-import os
+﻿import os
 import numpy as np
 import pandas as pd
 from tensorflow.keras.models import Sequential, load_model
@@ -9,6 +9,7 @@ import logging
 import time
 from datetime import datetime
 import json
+import tensorflow as tf
 
 SEQ_LEN = 100
 MODEL_PATH = "models/lstm_model.keras"
@@ -18,12 +19,16 @@ logger = logging.getLogger(__name__)
 def build_lstm_model(input_shape=(SEQ_LEN, 5)):
     model = Sequential([
         Input(shape=input_shape),
-        LSTM(50, return_sequences=True),
-        LSTM(50),
-        Dense(25, activation='relu'),
+        LSTM(64, return_sequences=True, dropout=0.3),
+        LSTM(32, dropout=0.3),
+        Dense(16, activation='relu'),
         Dense(1, activation='sigmoid')
     ])
-    model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+    model.compile(
+        optimizer='adam',
+        loss='binary_crossentropy',
+        metrics=['accuracy', tf.keras.metrics.Precision()]
+    )
     return model
 
 def prepare_lstm_data(df):
@@ -50,14 +55,14 @@ def prepare_lstm_data(df):
     logger.info(f"[Model] Prepared X shape: {X.shape}, y shape: {y.shape}")
     return X, y, scaler
 
-def train_or_load_model(df):
+def train_or_load_model(df, symbol=None):
     os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
     logger.info(f"[Model] Attempting to train or load model with data shape {df.shape}")
 
     # Load metadata if exists
     meta = {}
     if os.path.exists(META_PATH):
-        with open(META_PATH, 'r') as f:
+        with open(META_PATH, 'r', encoding="utf-8-sig") as f:
             meta = json.load(f)
 
     try:
@@ -88,13 +93,18 @@ def train_or_load_model(df):
             'last_train_time': current_time,
             'last_train_close': float(df['close'].iloc[-1])
         }
-        with open(META_PATH, 'w') as f:
+        with open(META_PATH, 'w', encoding="utf-8-sig") as f:
             json.dump(meta, f)
-        logger.info(f"[Model] Trained successfully, last_train_time={datetime.fromtimestamp(current_time).strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info(f"[Model] Training completed for {symbol if symbol else 'global'} with {len(df)} rows")
         return model
     except Exception as e:
         logger.error(f"[Model] Training failed: {e}, returning None")
         return None
+
+def augment_data(X, y):
+    # Add Gaussian noise
+    X_noisy = X + np.random.normal(0, 0.01, X.shape)
+    return np.concatenate([X, X_noisy]), np.concatenate([y, y])
 
 if __name__ == "__main__":
     # Example usage for testing

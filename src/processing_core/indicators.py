@@ -1,4 +1,4 @@
-import pandas as pd
+﻿import pandas as pd
 import talib
 from src.database.db_handler import insert_metrics
 import logging

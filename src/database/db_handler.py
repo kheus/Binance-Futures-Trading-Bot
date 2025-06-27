@@ -1,359 +1,294 @@
-import yaml
+﻿import yaml
 import logging
-import sys
-import sqlite3
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from contextlib import contextmanager
 import json
 import pandas as pd
 import time
+import os
+import decimal
 
 # Configuration du logging
+os.makedirs("logs", exist_ok=True)
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+file_handler = logging.FileHandler('logs/db_handler_postgres.log', encoding="utf-8-sig")
+file_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+logger.addHandler(file_handler)
+logger.addHandler(console_handler)
 
-# Réglage de l'encodage UTF-8
-if sys.stdout.encoding != 'UTF-8':
-    sys.stdout.reconfigure(encoding='utf-8')
-if sys.stderr.encoding != 'UTF-8':
-    sys.stderr.reconfigure(encoding='utf-8')
-
-# Chargement de la configuration avec encodage explicite
+# Chargement de la configuration
 def load_config():
     try:
-        with open("config/db_config.yaml", "r", encoding='utf-8') as f:
-            config = yaml.safe_load(f)
-            return config
-    except UnicodeDecodeError as e:
-        logger.error(f"Erreur d'encodage dans db_config.yaml: {e}")
-        raise
+        config_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../config/db_config.yaml"))
+        with open(config_path, "r", encoding="utf-8-sig") as f:
+            return yaml.safe_load(f)
     except Exception as e:
         logger.error(f"Erreur lecture db_config.yaml: {e}")
         raise
 
 config = load_config()
-sqlite_conf = config['database']['sqlite']
+postgres_conf = config['database']['postgresql']
 
-# Gestionnaire de connexion
 @contextmanager
 def get_db_connection():
     conn = None
     try:
-        conn = sqlite3.connect(sqlite_conf['path'])
-        conn.execute("PRAGMA encoding = 'UTF-8';")  # Forcer UTF-8
+        db_params = config["database"]["postgresql"]
+        print(f"[DEBUG] Trying to connect to: host={db_params['host']} dbname={db_params['database']} user={db_params['user']}")
+        conn = psycopg2.connect(
+            dbname=db_params['database'],
+            user=db_params['user'],
+            password=db_params['password'],
+            host=db_params['host'],
+            port=db_params['port'],
+            connect_timeout=10
+        )
+        conn.set_client_encoding('UTF8')
+        
+        # Test de validation d'encodage
+        with conn.cursor() as cur:
+            cur.execute("SHOW client_encoding;")
+            encoding = cur.fetchone()[0]
+            if encoding.lower() != 'utf8':
+                raise RuntimeError(f"Mauvais encodage PostgreSQL: {encoding}")
+        
         yield conn
     except Exception as e:
-        logger.error(f"Erreur connexion DB: {e}")
+        logger.error(f"DB Connection Error: {str(e).encode('utf-8', errors='replace').decode('utf-8')}")
         raise
     finally:
         if conn:
             conn.close()
 
-# Création des tables
+
+def execute_query(query, params=None, fetch=False):
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            try:
+                cur.execute(query, params)
+                if fetch:
+                    return cur.fetchall()
+                else:
+                    conn.commit()
+            except Exception as e:
+                logger.error(f"Query execution error: {e}")
+                raise
+
 def create_tables():
-    schema = """
-    CREATE TABLE IF NOT EXISTS trades (
-        trade_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        order_id TEXT,
-        symbol TEXT NOT NULL,
-        side TEXT NOT NULL CHECK (side IN ('buy', 'sell')),
-        quantity REAL NOT NULL CHECK (quantity > 0),
-        price REAL NOT NULL CHECK (price > 0),
-        stop_loss REAL,
-        take_profit REAL,
-        timestamp INTEGER NOT NULL,
-        pnl REAL DEFAULT 0.0
-    );
-
-    CREATE TABLE IF NOT EXISTS signals (
-        signal_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        symbol TEXT NOT NULL,
-        signal_type TEXT NOT NULL CHECK (signal_type IN ('buy', 'sell', 'close_buy', 'close_sell')),
-        price REAL NOT NULL CHECK (price > 0),
-        quantity REAL,
-        timestamp INTEGER NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS metrics (
-        metric_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        symbol TEXT NOT NULL,
-        timestamp INTEGER NOT NULL,
-        rsi REAL,
-        macd REAL,
-        adx REAL,
-        ema20 REAL,
-        ema50 REAL,
-        atr REAL
-    );
-
-    CREATE TABLE IF NOT EXISTS training_data (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        symbol TEXT NOT NULL,
-        timestamp INTEGER NOT NULL,
-        prediction REAL,
-        action TEXT,
-        price REAL,
-        indicators TEXT,
-        market_context TEXT,
-        market_direction INTEGER,
-        price_change_pct REAL,
-        prediction_correct INTEGER,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp);
-    CREATE INDEX IF NOT EXISTS idx_signals_timestamp ON signals(timestamp);
-    CREATE INDEX IF NOT EXISTS idx_metrics_timestamp ON metrics(timestamp);
-    CREATE INDEX IF NOT EXISTS idx_training_timestamp ON training_data(timestamp);
-    """
     try:
+        with open("src/database/schema.sql", "r", encoding="utf-8-sig") as file:
+            schema_sql = file.read()
+        # Split les requêtes sur ';' et exécute une par une
+        queries = [q.strip() for q in schema_sql.split(';') if q.strip()]
         with get_db_connection() as conn:
-            logger.info("[DB] Executing schema creation")
-            conn.executescript(schema)
+            with conn.cursor() as cur:
+                for query in queries:
+                    try:
+                        cur.execute(query)
+                    except Exception as e:
+                        logger.error(f"Erreur lors de l'exécution de la requête : {query[:80]}... -> {e}")
+                        raise
             conn.commit()
-            logger.info("Tables créées ou vérifiées avec succès.")
+        logger.info("Tables created or verified successfully via schema.sql.")
     except Exception as e:
-        logger.error(f"Erreur création tables: {e}")
+        logger.error(f"Error reading or executing schema.sql: {e}")
         raise
 
-# Insertion d'un trade
-def insert_trade(order_details):
-    required = ["symbol", "side", "quantity", "price", "timestamp"]
-    if not all(k in order_details for k in required):
-        logger.error(f"Données manquantes dans order_details: {order_details}")
-        return
-
-    with get_db_connection() as conn:
-        cur = conn.cursor()
-        try:
-            logger.debug(f"Tentative d'insertion trade: {order_details}")
-            cur.execute("""
-                INSERT INTO trades (order_id, symbol, side, quantity, price, stop_loss, take_profit, timestamp, pnl)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                order_details.get("order_id"),
-                order_details["symbol"],
-                order_details["side"],
-                float(order_details["quantity"]),
-                float(order_details["price"]),
-                float(order_details.get("stop_loss", 0)),
-                float(order_details.get("take_profit", 0)),
-                int(order_details["timestamp"]),
-                float(order_details.get("pnl", 0)),
-            ))
-            conn.commit()
-            logger.info(f"Trade inséré: {order_details}")
-        except Exception as e:
-            logger.error(f"Erreur insertion trade: {e}")
-            raise
-        finally:
-            cur.close()
-
-# Insertion d'un signal
-def insert_signal(signal_details):
-    required = ["symbol", "signal_type", "price", "timestamp"]
-    if not all(k in signal_details for k in required):
-        logger.error(f"Données manquantes dans signal_details: {signal_details}")
-        return
-
-    valid_signals = {'buy', 'sell', 'close_buy', 'close_sell'}
-    signal_type = signal_details.get("signal_type")
-
-    if signal_type not in valid_signals:
-        logger.error(f"signal_type invalide: {signal_type} - skipping insertion")
-        return
-
-    with get_db_connection() as conn:
-        cur = conn.cursor()
-        try:
-            logger.debug(f"Tentative d'insertion signal: {signal_details}")
-            cur.execute("""
-                INSERT INTO signals (symbol, signal_type, price, quantity, timestamp)
-                VALUES (?, ?, ?, ?, ?)
-            """, (
-                signal_details["symbol"],
-                signal_type,
-                float(signal_details["price"]),
-                float(signal_details.get("quantity", 0)),
-                int(signal_details["timestamp"]),
-            ))
-            conn.commit()
-            logger.info(f"Signal inséré: {signal_details}")
-        except Exception as e:
-            logger.error(f"Erreur insertion signal: {e}")
-            raise
-        finally:
-            cur.close()
-
-# Insertion des métriques
-def insert_metrics(metric_details):
-    required = ["symbol", "timestamp"]
-    if not all(k in metric_details for k in required):
-        logger.error(f"Données manquantes dans metric_details: {metric_details}")
-        return
-
-    # Validation RSI
-    if not (0 <= metric_details.get("rsi", 0) <= 100):
-        logger.error(f"Invalid RSI: {metric_details['rsi']}")
-        return
-
-    with get_db_connection() as conn:
-        cur = conn.cursor()
-        try:
-            # Prevent duplicate metrics for the same symbol and timestamp
-            cur.execute("SELECT 1 FROM metrics WHERE symbol = ? AND timestamp = ?", 
-                        (metric_details["symbol"], metric_details["timestamp"]))
-            if cur.fetchone():
-                return
-
-            logger.debug(f"Tentative d'insertion métriques: {metric_details}")
-            cur.execute("""
-                INSERT INTO metrics (symbol, timestamp, rsi, macd, adx, ema20, ema50, atr)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                metric_details["symbol"],
-                int(metric_details["timestamp"]),
-                float(metric_details.get("rsi", 0)),
-                float(metric_details.get("macd", 0)),
-                float(metric_details.get("adx", 0)),
-                float(metric_details.get("ema20", 0)),
-                float(metric_details.get("ema50", 0)),
-                float(metric_details.get("atr", 0)),
-            ))
-            conn.commit()
-            logger.info(f"Métriques insérées: {metric_details}")
-        except Exception as e:
-            logger.error(f"Erreur insertion métriques: {e}")
-            raise
-        finally:
-            cur.close()
-
-# Insertion des données d'entraînement
-def insert_training_data(record):
-    """Store prediction and market context for future analysis"""
+def insert_trade(order):
     query = """
-    INSERT INTO training_data (
-        symbol, timestamp, prediction, action, price, indicators, market_context
-    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO trades (order_id, symbol, side, quantity, price, stop_loss, take_profit, timestamp, pnl)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+    """
+    params = (
+        order.get("order_id"),
+        order["symbol"],
+        order["side"],
+        order["quantity"],
+        order["price"],
+        order.get("stop_loss", 0),
+        order.get("take_profit", 0),
+        order["timestamp"],
+        order.get("pnl", 0)
+    )
+    execute_query(query, params)
+    logger.info(f"Trade insere: {order}")
+
+def insert_signal(signal):
+    if signal.get("signal_type") not in {'buy', 'sell', 'close_buy', 'close_sell'}:
+        logger.error(f"Signal type invalide: {signal}")
+        return
+
+    query = """
+    INSERT INTO signals (symbol, signal_type, price, quantity, timestamp)
+    VALUES (%s, %s, %s, %s, %s)
+    """
+    params = (
+        signal["symbol"],
+        signal["signal_type"],
+        signal["price"],
+        signal.get("quantity", 0),
+        signal["timestamp"]
+    )
+    execute_query(query, params)
+    logger.info(f"Signal insere: {signal}")
+
+def insert_metrics(metrics):
+    query = """
+    INSERT INTO metrics (symbol, timestamp, rsi, macd, adx, ema20, ema50, atr)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+    """
+    params = (
+        metrics["symbol"],
+        metrics["timestamp"],
+        metrics.get("rsi", 0),
+        metrics.get("macd", 0),
+        metrics.get("adx", 0),
+        metrics.get("ema20", 0),
+        metrics.get("ema50", 0),
+        metrics.get("atr", 0)
+    )
+    execute_query(query, params)
+    logger.info(f"Metriques inserees: {metrics}")
+
+def insert_training_data(record):
+    query = """
+    INSERT INTO training_data (symbol, timestamp, prediction, action, price, indicators, market_context)
+    VALUES (%s, %s, %s, %s, %s, %s, %s)
     """
     params = (
         record['symbol'],
         record['timestamp'],
-        record['prediction'],
-        record['action'],
-        record['price'],
-        json.dumps(record['indicators']),
-        json.dumps(record['market_context'])
+        record.get('prediction'),
+        record.get('action'),
+        record.get('price'),
+        json.dumps(record.get('indicators', {})),
+        json.dumps(record.get('market_context', {}))
     )
     execute_query(query, params)
+    logger.info(f"Training data inserted: {record}")
 
-def execute_query(query, params=None):
-    """Executes a query with optional parameters and returns the result if any."""
-    with get_db_connection() as conn:
-        cur = conn.cursor()
-        try:
-            if params is not None:
-                cur.execute(query, params)
-            else:
-                cur.execute(query)
-            if query.strip().upper().startswith("SELECT"):
-                result = cur.fetchall()
-            else:
-                conn.commit()
-                result = cur.lastrowid
-            return result
-        except Exception as e:
-            logger.error(f"Erreur lors de l'exécution de la requête: {e}")
-            raise
-        finally:
-            cur.close()
-
-# Récupération des données
 def get_trades():
+    query = "SELECT * FROM trades ORDER BY timestamp DESC"
     with get_db_connection() as conn:
-        cur = conn.cursor()
-        try:
-            cur.execute("SELECT * FROM trades ORDER BY timestamp DESC")
-            return cur.fetchall()
-        except Exception as e:
-            logger.error(f"Erreur récupération trades: {e}")
-            return []
-        finally:
-            cur.close()
+        return pd.read_sql_query(query, conn).to_dict(orient='records')
 
 def get_signals():
-    with get_db_connection() as conn:
-        cur = conn.cursor()
-        try:
-            cur.execute("SELECT * FROM signals ORDER BY timestamp DESC")
-            return cur.fetchall()
-        except Exception as e:
-            logger.error(f"Erreur récupération signals: {e}")
-            return []
-        finally:
-            cur.close()
+    query = "SELECT * FROM signals ORDER BY timestamp DESC"
+    return execute_query(query, fetch=True)
 
 def get_metrics():
-    with get_db_connection() as conn:
-        cur = conn.cursor()
-        try:
-            cur.execute("SELECT * FROM metrics ORDER BY timestamp DESC")
-            return cur.fetchall()
-        except Exception as e:
-            logger.error(f"Erreur récupération métriques: {e}")
-            return []
-        finally:
-            cur.close()
+    query = "SELECT * FROM metrics ORDER BY timestamp DESC"
+    return execute_query(query, fetch=True)
+
+def get_training_data_count():
+    query = "SELECT COUNT(*) FROM training_data"
+    result = execute_query(query, fetch=True)
+    return result[0]['count'] if result else 0
 
 def get_future_prices(symbol, signal_timestamp, candle_count=5):
-    """Retrieve prices after a signal timestamp"""
     query = """
     SELECT timestamp, open, high, low, close, volume
     FROM price_data
-    WHERE symbol = ? AND timestamp > ?
+    WHERE symbol = %s AND timestamp > %s
     ORDER BY timestamp ASC
-    LIMIT ?
+    LIMIT %s
     """
+    params = (symbol, signal_timestamp, candle_count)
     with get_db_connection() as conn:
-        return pd.read_sql(query, conn, params=(symbol, signal_timestamp, candle_count))
+        return pd.read_sql_query(query, conn, params=params)
 
 def get_pending_training_data():
-    """Get records needing outcome calculation"""
+    five_min_ago = int(time.time() * 1000) - 300000
     query = """
     SELECT * FROM training_data
     WHERE market_direction IS NULL
-    AND timestamp < ?
+    AND timestamp < %s
     """
-    five_min_ago = int(time.time() * 1000) - 300000
-    return execute_query(query, (five_min_ago,))
+    return execute_query(query, (five_min_ago,), fetch=True)
 
 def update_training_outcome(record_id, market_direction, price_change_pct, prediction_correct):
-    """Update record with actual market outcome"""
     query = """
     UPDATE training_data
-    SET market_direction = ?,
-        price_change_pct = ?,
-        prediction_correct = ?,
+    SET market_direction = %s,
+        price_change_pct = %s,
+        prediction_correct = %s,
         updated_at = CURRENT_TIMESTAMP
-    WHERE id = ?
+    WHERE id = %s
     """
     params = (market_direction, price_change_pct, prediction_correct, record_id)
     execute_query(query, params)
 
 def get_last_train_timestamp():
-    """Retrieve the last training timestamp, or 0 if none exists."""
-    query = "SELECT MAX(timestamp) FROM training_data"
-    result = execute_query(query)
-    return result[0][0] if result and result[0][0] is not None else 0
+    query = "SELECT MAX(timestamp) AS max_ts FROM training_data"
+    result = execute_query(query, fetch=True)
+    return result[0]['max_ts'] if result and result[0]['max_ts'] is not None else 0
 
-def get_training_data_count(since_last_train=False):
-    """Count available training data points"""
-    query = "SELECT COUNT(*) FROM training_data"
-    if since_last_train:
-        last_train = get_last_train_timestamp()
-        query += " WHERE timestamp > ?"
-        return execute_query(query, (last_train,))[0][0]
-    return execute_query(query)[0][0]
+def get_price_history(symbol, timeframe='1h'):
+    timeframe_to_limit = {
+        '5m': 288,
+        '15m': 96,
+        '1h': 168,
+        '4h': 84,
+        '1d': 30
+    }
+    limit = timeframe_to_limit.get(timeframe, 100)
 
-# Point d'entrée pour tests
+    query = """
+    SELECT timestamp, open, high, low, close, volume
+    FROM price_data
+    WHERE symbol = %s
+    ORDER BY timestamp DESC
+    LIMIT %s
+    """
+    params = (symbol, limit)
+
+    with get_db_connection() as conn:
+        return pd.read_sql_query(query, conn, params=params).sort_values('timestamp').to_dict(orient='records')
+
+def clean_old_data(retention_days=30, trades_retention_days=90):
+    current_time = int(time.time() * 1000)
+    retention_ms = retention_days * 24 * 3600 * 1000
+    trades_retention_ms = trades_retention_days * 24 * 3600 * 1000
+
+    tables = ["price_data", "metrics", "signals", "training_data"]
+    for table in tables:
+        query = f"DELETE FROM {table} WHERE timestamp < %s"
+        execute_query(query, (current_time - retention_ms,))
+        logger.info(f"[DB Cleanup] Deleted rows from {table}")
+
+    query = "DELETE FROM trades WHERE timestamp < %s"
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(query, (current_time - trades_retention_ms,))
+            deleted = cur.rowcount
+            conn.commit()
+    logger.info(f"[DB Cleanup] {deleted} rows deleted from trades")
+ 
+
+def test_connection():
+    try:
+        with get_db_connection() as conn:
+            logger.info("Successful connection to PostgreSQL.")
+            print("Successful connection to PostgreSQL.")
+    except Exception as e:
+        logger.error(f"Failed to connect to PostgreSQL: {e}")
+        print(f"Failed to connect to PostgreSQL: {e}")
+
+def get_latest_prices():
+    # Exemple, adapte ta requête ici
+    query = "SELECT symbol, price, timestamp FROM price_data ORDER BY timestamp DESC LIMIT 100"
+    with get_db_connection() as conn:
+        df = pd.read_sql_query(query, conn)
+    # Convertir tous les Decimal en float dans le DataFrame
+    for col in df.columns:
+        if df[col].dtype == 'object':
+            df[col] = df[col].apply(lambda x: float(x) if isinstance(x, decimal.Decimal) else x)
+    return df.to_dict(orient='records')
+
 if __name__ == "__main__":
     create_tables()
+    test_connection()

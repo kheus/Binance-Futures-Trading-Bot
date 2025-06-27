@@ -1,0 +1,12 @@
+﻿database:
+  type: "postgres"
+  postgresql:
+    host: "localhost"
+    port: 5432
+    database: "trading_bot_db"
+    user: "postgres"
+    password: "Cheikh12"
+  sqlite:
+    path: "trading_bot.db"
+trading:
+  symbols: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]

@@ -1,4 +1,4 @@
-# Signal Generator Module - Enhanced with Performance Tracking
+﻿# Signal Generator Module - Enhanced with Performance Tracking
 import logging
 import numpy as np
 import pandas as pd
@@ -114,18 +114,18 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
     # --- Signal logic (same as previous, can be customized) ---
     if strategy_mode == "scalp" and rsi_strong:
         if prediction > dynamic_up + 0.1 and roc > 1.0:  # Higher confidence
+            action = "Sell"
+            new_position = "short"
+        elif prediction < dynamic_down - 0.1 and roc < -1.0:
             action = "buy"
             new_position = "long"
-        elif prediction < dynamic_down - 0.1 and roc < -1.0:
-            action = "sell"
-            new_position = "short"
     elif strategy_mode == "trend":
         if (trend_up and macd_bullish and rsi_strong and prediction > dynamic_up and breakout_up and roc > 0.5):
+            action = "sell"
+            new_position = "shrort"
+        elif (trend_down and not macd_bullish and rsi_strong and prediction < dynamic_down and breakout_down and roc < -0.5):
             action = "buy"
             new_position = "long"
-        elif (trend_down and not macd_bullish and rsi_strong and prediction < dynamic_down and breakout_down and roc < -0.5):
-            action = "sell"
-            new_position = "short"
     elif strategy_mode == "range":
         range_high = rolling_high.iloc[-1]
         range_low = rolling_low.iloc[-1]
