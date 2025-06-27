@@ -15,4 +15,5 @@ rm -rf ta-lib-0.4.0*
 
 # Installe les dépendances Python
 pip install --upgrade pip
-pip install -r requirements.txt
+pip install -r src/requirements.txt
+
