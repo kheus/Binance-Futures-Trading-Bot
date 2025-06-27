@@ -1,4 +1,5 @@
 ﻿# adaptive-trend-rider
+
 A trading bot for Binance Futures using technical analysis (TA) and LSTM for signal generation, Kafka for data ingestion, PostgreSQL for storage, and Prometheus/Grafana/Telegram for monitoring.
 Setup
 
@@ -34,7 +35,7 @@ docker exec -it binance-trading-bot-postgres-1 psql -U postgres
 \c trading_bot
 SELECT * FROM trades;
 
-sqlite3 trading_bot.db   
+sqlite3 trading_bot.db
 
 
 
@@ -53,6 +54,6 @@ Notes
 
 Ensure Kafka and PostgreSQL services are running.
 Simulated orders are enabled by default. Uncomment order placement code in order_manager.py for live trading.
-Monitor metrics at http://localhost:8000 (Prometheus) and Grafana dashboards.
+Monitor metrics at [http://localhost:8000](http://localhost:8000) (Prometheus) and Grafana dashboards.
 
 

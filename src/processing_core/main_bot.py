@@ -11,7 +11,7 @@ from confluent_kafka import Consumer
 from src.data_ingestion.data_formatter import format_candle
 from src.processing_core.lstm_model import train_or_load_model
 from src.processing_core.signal_generator import check_signal, prepare_lstm_input
-from src.trade_execution.order_manager import place_order, update_trailing_stop
+from src.trade_execution.order_manager import place_order, update_trailing_stop, init_trailing_stop_manager
 from src.database.db_handler import insert_trade, insert_signal, insert_metrics, create_tables, execute_query
 from src.monitoring.metrics import record_trade_metric
 from src.monitoring.alerting import send_telegram_alert
@@ -94,6 +94,9 @@ client = init_binance_client(mode="testnet")
 if client is None:
     logger.error("[Binance Client] Failed to initialize, exiting.")
     raise Exception("Binance client initialization failed")
+
+# Initialisation du trailing stop manager global
+ts_manager = init_trailing_stop_manager(client)
 
 # Initialize Kafka consumer
 consumer = Consumer({
