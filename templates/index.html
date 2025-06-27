@@ -1,0 +1,366 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Trading Bot Dashboard</title>
+  <!-- Remplacement du CDN Tailwind par une version locale -->
+  <link href="/static/css/tailwind.css" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/socket.io-client@4/dist/socket.io.min.js"></script>
+  <style>
+    .card { background-color: #1f2937; border-radius: 0.5rem; padding: 1.5rem; color: #ffffff; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1); }
+    .positive { color: #10B981; }
+    .negative { color: #EF4444; }
+    .symbol-card { cursor: pointer; transition: all 0.3s ease; }
+    .symbol-card:hover { background-color: #374151; }
+    .symbol-card.active { border: 2px solid #3B82F6; background-color: #374151; }
+  </style>
+</head>
+<body class="bg-gray-900 text-white">
+  <header class="p-4 shadow-md bg-gradient-to-r from-gray-800 to-gray-900">
+    <div class="flex justify-between items-center">
+      <h1 class="text-2xl font-bold">Trading Bot Dashboard</h1>
+      <div class="flex items-center space-x-4">
+        <div class="bg-gray-800 px-3 py-1 rounded-full flex items-center">
+          <div class="w-3 h-3 rounded-full bg-green-500 mr-2 status-indicator"></div>
+          <span id="wsStatus">Connecting...</span>
+        </div>
+        <span id="currentTime">--:--:--</span>
+      </div>
+    </div>
+  </header>
+  <main class="p-4">
+    <section class="mb-8">
+      <h2 class="text-xl font-semibold mb-4">Live Market Prices</h2>
+      <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4" id="symbolsContainer">
+        <div class="card text-center">Loading data...</div>
+      </div>
+    </section>
+    <section class="card mb-8">
+      <h2 class="text-xl font-semibold mb-4">Technical Indicators</h2>
+      <div class="grid grid-cols-2 md:grid-cols-3 gap-4" id="indicatorsContainer">
+        <div class="bg-gray-800 p-4 rounded-lg">Loading...</div>
+      </div>
+    </section>
+    <section class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+      <div class="card">
+        <h2 class="text-xl font-semibold mb-4">Recent Trades</h2>
+        <table class="w-full text-sm">
+          <thead><tr><th>Symbol</th><th>Side</th><th>Price</th><th>Qty</th><th>Time</th><th class="text-right">PnL</th></tr></thead>
+          <tbody id="tradesTableBody"><tr><td colspan="6" class="text-center text-gray-400 py-2">Waiting for data...</td></tr></tbody>
+        </table>
+      </div>
+      <div class="card">
+        <h2 class="text-xl font-semibold mb-4">Recent Signals</h2>
+        <table class="w-full text-sm">
+          <thead><tr><th>Symbol</th><th>Type</th><th>Price</th><th>Time</th></tr></thead>
+          <tbody id="signalsTableBody"><tr><td colspan="4" class="text-center text-gray-400 py-2">Waiting for data...</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+    <section class="card mb-8">
+      <h2 class="text-xl font-semibold mb-4">Live Price Chart: <span id="chartSymbol">BTCUSDT</span></h2>
+      <canvas id="priceChart" height="100"></canvas>
+    </section>
+    <section class="card mb-8">
+      <h2 class="text-xl font-semibold mb-4">Indicator Chart: <span id="indicatorName">RSI</span></h2>
+      <select id="indicatorSelector" class="bg-gray-800 text-white px-2 py-1 rounded mb-4">
+        <option value="rsi">RSI</option>
+        <option value="macd">MACD</option>
+        <option value="adx">ADX</option>
+        <option value="ema20">EMA20</option>
+        <option value="ema50">EMA50</option>
+        <option value="atr">ATR</option>
+      </select>
+      <canvas id="indicatorChart" height="100"></canvas>
+    </section>
+  </main>
+  <script>
+    // Configuration robuste de Socket.IO
+    const socket = io('http://localhost:5000', {
+      transports: ['websocket'],
+      reconnectionAttempts: 5,
+      reconnectionDelay: 1000,
+      timeout: 20000,
+      debug: true
+    });
+
+    // Références aux éléments DOM
+    const symbolsContainer = document.getElementById('symbolsContainer');
+    const indicatorsContainer = document.getElementById('indicatorsContainer');
+    const tradesTableBody = document.getElementById('tradesTableBody');
+    const signalsTableBody = document.getElementById('signalsTableBody');
+    const wsStatus = document.getElementById('wsStatus');
+    const statusIndicator = document.querySelector('.status-indicator');
+
+    // Variables d'état
+    let chart, indicatorChart;
+    let priceHistory = {}, indicatorHistory = {};
+    let currentChartSymbol = 'BTCUSDT';
+    let selectedIndicator = 'rsi';
+
+    // Fonctions utilitaires
+    function formatTimestamp(ts) {
+      if (!ts) return '--:--:--';
+      return new Date(ts).toLocaleTimeString();
+    }
+
+    function updateTime() {
+      document.getElementById('currentTime').textContent = new Date().toLocaleTimeString();
+    }
+
+    function initChart() {
+      const ctx = document.getElementById('priceChart').getContext('2d');
+      if (chart) chart.destroy();
+      chart = new Chart(ctx, {
+        type: 'line',
+        data: { 
+          labels: [], 
+          datasets: [{
+            label: currentChartSymbol, 
+            data: [], 
+            borderColor: '#3B82F6', 
+            backgroundColor: 'rgba(59,130,246,0.1)', 
+            fill: true, 
+            tension: 0.3 
+          }] 
+        },
+        options: { 
+          responsive: true, 
+          plugins: { legend: { display: false } }, 
+          scales: { 
+            x: { ticks: { color: '#9CA3AF' } }, 
+            y: { ticks: { color: '#9CA3AF' } } 
+          } 
+        }
+      });
+    }
+
+    function initIndicatorChart() {
+      const ctx = document.getElementById('indicatorChart').getContext('2d');
+      if (indicatorChart) indicatorChart.destroy();
+      indicatorChart = new Chart(ctx, {
+        type: 'line',
+        data: { 
+          labels: [], 
+          datasets: [{
+            label: selectedIndicator.toUpperCase(), 
+            data: [], 
+            borderColor: '#F59E0B', 
+            backgroundColor: 'rgba(245,158,11,0.1)', 
+            fill: true, 
+            tension: 0.3 
+          }] 
+        },
+        options: { 
+          responsive: true, 
+          plugins: { legend: { display: false } }, 
+          scales: { 
+            x: { ticks: { color: '#9CA3AF' } }, 
+            y: { ticks: { color: '#9CA3AF' } } 
+          } 
+        }
+      });
+    }
+
+    function renderData(data) {
+      if (!data) {
+        console.error('No data received');
+        return;
+      }
+
+      // 1. Mise à jour des cartes de prix
+      if (data.prices && data.prices.length > 0) {
+        symbolsContainer.innerHTML = '';
+        data.prices.forEach(p => {
+          const card = document.createElement('div');
+          card.className = `symbol-card card text-center ${p.symbol === currentChartSymbol ? 'active' : ''}`;
+          card.innerHTML = `
+            <div class="text-lg font-semibold">${p.symbol}</div>
+            <div class="text-2xl font-bold">${parseFloat(p.price || 0).toFixed(2)}</div>
+            <div class="text-sm text-gray-400">${formatTimestamp(p.timestamp)}</div>
+          `;
+          card.onclick = () => {
+            currentChartSymbol = p.symbol;
+            document.getElementById('chartSymbol').textContent = p.symbol;
+            priceHistory[currentChartSymbol] = [];
+            indicatorHistory[currentChartSymbol] = [];
+            renderData(data); // Re-render avec le nouveau symbole
+          };
+          symbolsContainer.appendChild(card);
+        });
+      }
+
+      // 2. Mise à jour des indicateurs techniques
+      if (data.metrics && data.metrics[currentChartSymbol]) {
+        indicatorsContainer.innerHTML = '';
+        const metrics = data.metrics[currentChartSymbol];
+        
+        Object.entries(metrics).forEach(([key, value]) => {
+          if (key !== 'timestamp') {
+            const div = document.createElement('div');
+            div.className = 'bg-gray-800 p-4 rounded-lg';
+            div.innerHTML = `
+              <div class="font-semibold">${key.toUpperCase()}</div>
+              <div class="text-lg">${parseFloat(value || 0).toFixed(2)}</div>
+            `;
+            indicatorsContainer.appendChild(div);
+          }
+        });
+      }
+
+      // 3. Mise à jour des trades
+      if (data.trades) {
+        tradesTableBody.innerHTML = '';
+        const relevantTrades = data.trades.filter(t => t.symbol === currentChartSymbol);
+        
+        if (relevantTrades.length === 0) {
+          tradesTableBody.innerHTML = `
+            <tr>
+              <td colspan="6" class="text-center text-gray-400 py-2">
+                No trades for ${currentChartSymbol}
+              </td>
+            </tr>
+          `;
+        } else {
+          relevantTrades.slice(0, 10).forEach(t => {
+            const row = document.createElement('tr');
+            row.className = 'border-b border-gray-700';
+            row.innerHTML = `
+              <td>${t.symbol}</td>
+              <td class="${t.side === 'buy' ? 'positive' : 'negative'}">${t.side || ''}</td>
+              <td>${parseFloat(t.price || 0).toFixed(2)}</td>
+              <td>${parseFloat(t.quantity || 0).toFixed(4)}</td>
+              <td>${formatTimestamp(t.timestamp)}</td>
+              <td class="text-right">${(t.pnl || 0).toFixed(2)}</td>
+            `;
+            tradesTableBody.appendChild(row);
+          });
+        }
+      }
+
+      // 4. Mise à jour des signaux
+      if (data.signals) {
+        signalsTableBody.innerHTML = '';
+        const relevantSignals = data.signals.filter(s => s.symbol === currentChartSymbol);
+        
+        if (relevantSignals.length === 0) {
+          signalsTableBody.innerHTML = `
+            <tr>
+              <td colspan="4" class="text-center text-gray-400 py-2">
+                No signals for ${currentChartSymbol}
+              </td>
+            </tr>
+          `;
+        } else {
+          relevantSignals.slice(0, 10).forEach(s => {
+            const row = document.createElement('tr');
+            row.className = 'border-b border-gray-700';
+            row.innerHTML = `
+              <td>${s.symbol}</td>
+              <td class="${s.type === 'buy' ? 'positive' : s.type === 'sell' ? 'negative' : ''}">
+                ${s.type || ''}
+              </td>
+              <td>${parseFloat(s.price || 0).toFixed(2)}</td>
+              <td>${formatTimestamp(s.timestamp)}</td>
+            `;
+            signalsTableBody.appendChild(row);
+          });
+        }
+      }
+
+      // 5. Mise à jour des graphiques
+      updateCharts(data);
+    }
+
+    function updateCharts(data) {
+      // Mise à jour du graphique de prix
+      const priceData = data.prices?.find(p => p.symbol === currentChartSymbol);
+      if (priceData && chart) {
+        priceHistory[currentChartSymbol] = priceHistory[currentChartSymbol] || [];
+        const history = priceHistory[currentChartSymbol];
+        const label = formatTimestamp(priceData.timestamp);
+        
+        if (history.length === 0 || history[history.length-1].label !== label) {
+          if (history.length >= 50) history.shift();
+          history.push({
+            label: label,
+            value: parseFloat(priceData.price || 0)
+          });
+          
+          chart.data.labels = history.map(d => d.label);
+          chart.data.datasets[0].data = history.map(d => d.value);
+          chart.update();
+        }
+      }
+
+      // Mise à jour du graphique d'indicateurs
+      const metrics = data.metrics?.[currentChartSymbol];
+      if (metrics && indicatorChart) {
+        indicatorHistory[currentChartSymbol] = indicatorHistory[currentChartSymbol] || [];
+        const history = indicatorHistory[currentChartSymbol];
+        const label = formatTimestamp(metrics.timestamp);
+        const value = parseFloat(metrics[selectedIndicator] || 0);
+        
+        if (history.length === 0 || history[history.length-1].label !== label) {
+          if (history.length >= 50) history.shift();
+          history.push({
+            label: label,
+            value: value
+          });
+          
+          indicatorChart.data.labels = history.map(d => d.label);
+          indicatorChart.data.datasets[0].data = history.map(d => d.value);
+          indicatorChart.update();
+        }
+      }
+    }
+
+    // Initialisation
+    document.addEventListener('DOMContentLoaded', () => {
+      initChart();
+      initIndicatorChart();
+      setInterval(updateTime, 1000);
+      updateTime();
+
+      document.getElementById('indicatorSelector').addEventListener('change', (e) => {
+        selectedIndicator = e.target.value;
+        document.getElementById('indicatorName').textContent = selectedIndicator.toUpperCase();
+        indicatorHistory[currentChartSymbol] = []; // Reset history
+      });
+    });
+
+    // Gestion des événements Socket.IO
+    socket.on('connect', () => {
+      console.log('Connected to server');
+      wsStatus.textContent = 'Connected';
+      if (statusIndicator) {
+        statusIndicator.classList.remove('bg-red-500', 'bg-yellow-500');
+        statusIndicator.classList.add('bg-green-500');
+      }
+    });
+
+    socket.on('disconnect', () => {
+      console.log('Disconnected from server');
+      wsStatus.textContent = 'Disconnected';
+      if (statusIndicator) {
+        statusIndicator.classList.remove('bg-green-500', 'bg-yellow-500');
+        statusIndicator.classList.add('bg-red-500');
+      }
+    });
+
+    socket.on('connect_error', (err) => {
+      console.error('Connection error:', err);
+      wsStatus.textContent = 'Connection error';
+      if (statusIndicator) {
+        statusIndicator.classList.remove('bg-green-500', 'bg-red-500');
+        statusIndicator.classList.add('bg-yellow-500');
+      }
+    });
+
+    socket.on('initial_data', renderData);
+    socket.on('update', renderData);
+  </script>
+</body>
+</html>
