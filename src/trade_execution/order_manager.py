@@ -60,27 +60,18 @@ def round_to_tick(value, tick_size):
     return round(round(value / tick_size) * tick_size, 8)
 
 def place_order(signal, price, atr, client, symbol, capital, leverage):
-    global ts_manager
-    logger.info(f"[OrderManager] Placing {signal} for {symbol} with price={price}, atr={atr}, capital={capital}, leverage={leverage}")
-
-    if signal not in ["buy", "sell"]:
-        logger.error(f"[OrderManager] Invalid signal: {signal}")
-        return None
-
-    # Vérification de la marge AVANT de continuer
-    if not check_margin(client, capital, leverage):
-        logger.error(f"[OrderManager] Annulation de l'ordre pour {symbol} : marge insuffisante.")
-        return None
-
     try:
-        if ts_manager is None:
-            ts_manager = init_trailing_stop_manager(client)
+        # 1. Vérification améliorée de la marge
+        if not check_margin(client, symbol, capital, leverage):
+            logger.error("Annulation - Problème de marge")
+            return None
 
-        tick_size, quantity_precision = get_tick_info(client, symbol)
+        # 2. Calcul de quantité sécurisé
+        tick_size, qty_precision = get_tick_info(client, symbol)
         base_qty = capital / price
-        qty = round(base_qty * leverage, quantity_precision)
+        qty = round(base_qty * leverage, qty_precision)
 
-        # Quantité minimale selon l'exchange info
+        # 3. Vérification du minimum (utilise l'exchange info pour robustesse)
         exchange_info = client.exchange_info()
         symbol_info = next((s for s in exchange_info["symbols"] if s["symbol"] == symbol), None)
         min_qty = 1.0
@@ -89,17 +80,22 @@ def place_order(signal, price, atr, client, symbol, capital, leverage):
             if lot_size:
                 min_qty = float(lot_size["minQty"])
         if qty < min_qty:
+            logger.warning(f"Quantité ajustée à {min_qty} (min)")
             qty = min_qty
-            logger.warning(f"[OrderManager] Adjusted qty to minimum {min_qty} for {symbol}")
 
-        side = SIDE_BUY if signal == "buy" else SIDE_SELL
-        order = client.new_order(symbol=symbol, side=side, type=ORDER_TYPE_MARKET, quantity=qty)
-        log_order_as_table(signal, symbol, price, atr, qty, order)
+        # 4. Placement d'ordre avec timeout
+        order = client.new_order(
+            symbol=symbol,
+            side=SIDE_BUY if signal == "buy" else SIDE_SELL,
+            type=ORDER_TYPE_MARKET,
+            quantity=qty,
+            recvWindow=5000  # Timeout augmenté
+        )
 
+        # Gestion des réponses alternatives
         order_id = order.get('orderId') or order.get('clientOrderId')
         if not order_id:
-            logger.error(f"[OrderManager] No order ID received in Binance response: {order}")
-            return None
+            raise ValueError("Réponse d'ordre invalide de Binance")
 
         # Attendre que l'ordre soit finalisé
         order_status = wait_until_order_finalized(client, symbol, order_id)
@@ -148,12 +144,7 @@ def place_order(signal, price, atr, client, symbol, capital, leverage):
         return order_details
 
     except Exception as e:
-        # Gestion spécifique de l’erreur de marge
-        if hasattr(e, 'code') and e.code == -2019:
-            logger.error(f"ERREUR CRITIQUE: Marge insuffisante. Capital: {capital}, Levier: {leverage}x")
-            logger.error(f"Solution: Réduire le levier ou augmenter le capital dans config.yaml")
-        else:
-            logger.error(f"[OrderManager] Order placement failed: {e}")
+        logger.error(f"Échec placement ordre: {str(e)}")
         logger.debug(f"Full Binance response: {locals().get('order', {})}")
         import traceback
         logger.error(traceback.format_exc())
@@ -336,19 +327,43 @@ def monitor_and_update_trailing_stop(client, symbol, order_id, ts_manager):
         logger.error(f"[OrderManager] Error monitoring order {order_id} for {symbol}: {e}")
         return None
 
-def check_margin(client, capital, leverage):
+def check_margin(client, symbol, capital, leverage):
+    """
+    Vérifie que la marge disponible sur le compte Futures est suffisante pour placer l'ordre.
+    """
     try:
-        balance = client.balance()
-        free_margin = float(balance['availableBalance'])
-        required_margin = (capital * leverage) / 100  # Ajustez selon la logique de votre exchange
-        logger.info(f"[Margin Check] Disponible: {free_margin} USDT, Requis: {required_margin} USDT")
-        if free_margin < required_margin:
-            logger.error(f"[Margin Check] Marge insuffisante. Disponible: {free_margin}, Requis: {required_margin}")
+        # 1. Récupérer le solde disponible sur le compte Futures
+        account_info = client.account()
+        available_balance = float(account_info['availableBalance'])
+
+        # 2. Calculer la marge requise pour l'ordre (capital utilisé pour la position)
+        required_margin = float(capital)  # Pour les Futures, la marge requise = capital utilisé
+
+        logger.info(f"[Margin Check] Solde disponible: {available_balance} USDT, Marge requise: {required_margin} USDT")
+
+        if available_balance < required_margin:
+            logger.error(f"[Margin Check] Marge insuffisante. Disponible: {available_balance} USDT, Requis: {required_margin} USDT")
             return False
         return True
+
     except Exception as e:
-        logger.error(f"[Margin Check] Erreur lors de la récupération du solde: {e}")
+        logger.error(f"[Margin Check] Erreur: {str(e)}")
         return False
+
+def get_min_qty(client, symbol):
+    """
+    Retourne la quantité minimale autorisée pour un symbole donné selon les règles de Binance Futures.
+    """
+    try:
+        info = client.exchange_info()
+        for s in info['symbols']:
+            if s['symbol'] == symbol:
+                for f in s['filters']:
+                    if f['filterType'] == 'LOT_SIZE':
+                        return float(f['minQty'])
+    except Exception as e:
+        logger.error(f"[OrderManager] Erreur lors de la récupération du minQty pour {symbol}: {e}")
+    return 0.001  # Valeur par défaut sécurisée
 
 # Ensure you have a Binance client instance before this loop.
 # For example, if you use python-binance:
