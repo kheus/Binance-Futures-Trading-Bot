@@ -139,12 +139,14 @@ def place_order(signal, price, atr, client, symbol, capital, leverage):
             "pnl": 0.0
         }
         logger.info(f"[OrderManager] Successfully placed {signal} order for {symbol}: {order_details}")
+        logger.warning(f"TELEGRAM ALERT: Order placed for {symbol} - {signal.upper()} at {avg_price:.2f} USDT, Qty: {qty:.4f} with ATR: {atr:.2f}")
         log_order_as_table(signal, symbol, price, atr, qty, order_details)
         track_order_locally(order_details)
         return order_details
 
     except Exception as e:
         logger.error(f"Échec placement ordre: {str(e)}")
+        send_telegram_alert(f"Order placement failed for {symbol}: {str(e)}")
         logger.debug(f"Full Binance response: {locals().get('order', {})}")
         import traceback
         logger.error(traceback.format_exc())
@@ -339,15 +341,17 @@ def check_margin(client, symbol, capital, leverage):
         # 2. Calculer la marge requise pour l'ordre (capital utilisé pour la position)
         required_margin = float(capital)  # Pour les Futures, la marge requise = capital utilisé
 
-        logger.info(f"[Margin Check] Solde disponible: {available_balance} USDT, Marge requise: {required_margin} USDT")
+        logger.info(f"[Margin Check] Available Balance: {available_balance} USDT, Required Margin: {required_margin} USDT")
+        send_telegram_alert(f"Margin verification for {symbol} - Available Balance: {available_balance} USDT, Required Margin: {required_margin} USDT")
 
         if available_balance < required_margin:
-            logger.error(f"[Margin Check] Marge insuffisante. Disponible: {available_balance} USDT, Requis: {required_margin} USDT")
+            logger.error(f"[Margin Check] Insufficient margin. Available: {available_balance} USDT, Required: {required_margin} USDT")
+            send_telegram_alert(f"Margin {symbol} - Insufficient margin.")
             return False
         return True
 
     except Exception as e:
-        logger.error(f"[Margin Check] Erreur: {str(e)}")
+        logger.error(f"[Margin Check] Error: {str(e)}")
         return False
 
 def get_min_qty(client, symbol):
@@ -362,7 +366,7 @@ def get_min_qty(client, symbol):
                     if f['filterType'] == 'LOT_SIZE':
                         return float(f['minQty'])
     except Exception as e:
-        logger.error(f"[OrderManager] Erreur lors de la récupération du minQty pour {symbol}: {e}")
+        logger.error(f"[OrderManager] Error retrieving minQty for {symbol}: {e}")
     return 0.001  # Valeur par défaut sécurisée
 
 # Ensure you have a Binance client instance before this loop.
