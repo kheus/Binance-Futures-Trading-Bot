@@ -98,24 +98,26 @@ def create_tables():
         logger.error(f"Error reading or executing schema.sql: {e}")
         raise
 
-def insert_trade(order):
+def insert_trade(trade):
     query = """
-    INSERT INTO trades (order_id, symbol, side, quantity, price, stop_loss, take_profit, timestamp, pnl)
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+    INSERT INTO trades (order_id, symbol, side, quantity, price, stop_loss, take_profit, timestamp, pnl, is_trailing)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """
+    stop_loss = None if trade.get("is_trailing") else trade.get("stop_loss")
     params = (
-        order.get("order_id"),
-        order["symbol"],
-        order["side"],
-        order["quantity"],
-        order["price"],
-        order.get("stop_loss", 0),
-        order.get("take_profit", 0),
-        order["timestamp"],
-        order.get("pnl", 0)
+        trade["order_id"],
+        trade["symbol"],
+        trade["side"],
+        trade["quantity"],
+        trade["price"],
+        stop_loss,
+        trade.get("take_profit"),
+        trade["timestamp"],
+        trade["pnl"],
+        trade.get("is_trailing", False)
     )
     execute_query(query, params)
-    logger.info(f"Trade insere: {order}")
+    logger.info(f"Trade insere: {trade}")
 
 def insert_signal(signal):
     if signal.get("signal_type") not in {'buy', 'sell', 'close_buy', 'close_sell'}:
@@ -136,13 +138,13 @@ def insert_signal(signal):
     execute_query(query, params)
     logger.info(f"Signal insere: {signal}")
 
-def insert_metrics(metrics):
+def insert_metrics(symbol, metrics):
     query = """
     INSERT INTO metrics (symbol, timestamp, rsi, macd, adx, ema20, ema50, atr)
     VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
     """
     params = (
-        metrics["symbol"],
+        symbol,
         metrics["timestamp"],
         metrics.get("rsi", 0),
         metrics.get("macd", 0),
@@ -152,7 +154,7 @@ def insert_metrics(metrics):
         metrics.get("atr", 0)
     )
     execute_query(query, params)
-    logger.info(f"Metriques inserees: {metrics}")
+    logger.info(f"Inserted metrics for {symbol}: {metrics}")
 
 def insert_training_data(record):
     query = """
@@ -288,6 +290,90 @@ def get_latest_prices():
         if df[col].dtype == 'object':
             df[col] = df[col].apply(lambda x: float(x) if isinstance(x, decimal.Decimal) else x)
     return df.to_dict(orient='records')
+
+def backfill_orders(client, symbol):
+    all_orders = client.get_all_orders(symbol=symbol)
+    for order in all_orders:
+        # insère dans PostgreSQL si non déjà présent
+        insert_metrics(symbol, order)
+
+def insert_order_if_missing(order):
+    """
+    Insère un ordre dans la table orders s'il n'existe pas déjà (par order_id et symbol).
+    Retourne True si inséré, False si déjà présent.
+    """
+    query_check = "SELECT 1 FROM orders WHERE order_id = %s AND symbol = %s"
+    query_insert = """
+        INSERT INTO orders (order_id, symbol, side, quantity, price, timestamp, status)
+        VALUES (%s, %s, %s, %s, %s, to_timestamp(%s / 1000.0), %s)
+    """
+    params_check = (order['order_id'], order['symbol'])
+    params_insert = (
+        order['order_id'],
+        order['symbol'],
+        order['side'],
+        order['quantity'],
+        order['price'],
+        order['timestamp'],
+        order['status']
+    )
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query_check, params_check)
+                exists = cursor.fetchone()
+                if exists:
+                    logger.info(f"Order {order['order_id']} for {order['symbol']} already exists in DB.")
+                    return False  # déjà en base
+                cursor.execute(query_insert, params_insert)
+                conn.commit()
+                logger.info(f"Order {order['order_id']} for {order['symbol']} inserted in DB.")
+                return True
+    except Exception as e:
+        logger.error(f"Failed to insert order {order['order_id']} for {order['symbol']}: {e}")
+        return False
+
+def sync_orders_with_db(client, symbol_list):
+    """Nouvelle version corrigée pour l'API Binance"""
+    try:
+        create_tables()
+        
+        all_orders = []
+        for symbol in symbol_list:
+            try:
+                # Utilisation de get_all_orders avec filtrage sur le statut ouvert
+                orders = client.get_all_orders(symbol=symbol, limit=50)
+                open_orders = [o for o in orders if o['status'] in ['NEW', 'PARTIALLY_FILLED']]
+                
+                for order in open_orders:
+                    order_data = {
+                        'order_id': str(order['orderId']),
+                        'symbol': order['symbol'],
+                        'side': order['side'].lower(),
+                        'quantity': float(order['origQty']),
+                        'price': float(order['price']),
+                        'timestamp': order['time'],
+                        'status': order['status'].lower()
+                    }
+                    all_orders.append(order_data)
+                    
+            except Exception as e:
+                logger.error(f"Error processing {symbol}: {str(e)}")
+
+        synced_count = 0
+        for order in all_orders:
+            try:
+                if insert_order_if_missing(order):
+                    synced_count += 1
+            except Exception as e:
+                logger.error(f"DB insert failed for {order['order_id']}: {str(e)}")
+
+        logger.info(f"Orders sync completed. Total: {len(all_orders)}, New: {synced_count}")
+        return synced_count
+
+    except Exception as e:
+        logger.error(f"Critical sync error: {str(e)}", exc_info=True)
+        return 0
 
 if __name__ == "__main__":
     create_tables()

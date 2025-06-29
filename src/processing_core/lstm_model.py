@@ -1,6 +1,7 @@
 ﻿import os
 import numpy as np
 import pandas as pd
+from binance.client import Client
 from tensorflow.keras.models import Sequential, load_model
 from tensorflow.keras.layers import LSTM, Dense, Input
 from tensorflow.keras.callbacks import EarlyStopping
@@ -10,13 +11,103 @@ import time
 from datetime import datetime
 import json
 import tensorflow as tf
+import yaml
+from pathlib import Path
 
-SEQ_LEN = 100
-MODEL_PATH = "models/lstm_model.keras"
-META_PATH = "models/lstm_model_meta.json"
+# Charger la configuration YAML
+CONFIG_PATH = Path(__file__).parent.parent.parent / "config" / "config.yaml"
+with open(CONFIG_PATH, "r", encoding="utf-8-sig") as f:
+    config = yaml.safe_load(f)
+
+# Configuration générale
+SEQ_LEN = config["model"]["sequence_length"]
+MODEL_PATH = config["model"]["path"]
+META_PATH = "models/lstm_model_meta.json"  # Ajoute ce chemin si besoin
+
+API_KEY = config["binance"]["api_key"]
+API_SECRET = config["binance"]["api_secret"]
+SYMBOLS = config["binance"]["symbols"]
+SYMBOL = SYMBOLS[0]  # Premier symbole de la liste
+INTERVAL = config["binance"].get("timeframe", "1h")
+LIMIT = 500  # Ou mets une valeur de config si tu veux la rendre dynamique
+
 logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - [%(name)s] %(message)s',
+    handlers=[logging.FileHandler("logs/lstm_model.log", encoding='utf-8'), logging.StreamHandler()]
+)
+
+def fetch_binance_data(symbol, interval, limit):
+    """Fetch historical data from Binance."""
+    try:
+        client = Client(API_KEY, API_SECRET)
+        klines = client.get_klines(symbol=symbol, interval=interval, limit=limit)
+        df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'trades', 'taker_buy_base', 'taker_buy_quote', 'ignored'])
+        df['close'] = df['close'].astype(float)
+        df['volume'] = df['volume'].astype(float)
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        logger.info(f"[Data] Fetched {len(df)} {interval} candles for {symbol}")
+        return df[['timestamp', 'close', 'volume']]
+    except Exception as e:
+        logger.error(f"[Data] Failed to fetch Binance data: {e}")
+        return None
+
+def calculate_indicators(df):
+    """Calculate RSI, MACD, and ADX indicators."""
+    def calculate_rsi(data, period=14):
+        delta = data.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        rs = gain / loss
+        return 100 - (100 / (1 + rs))
+
+    def calculate_macd(data, fast=12, slow=26, signal=9):
+        exp1 = data.ewm(span=fast, adjust=False).mean()
+        exp2 = data.ewm(span=slow, adjust=False).mean()
+        macd = exp1 - exp2
+        signal_line = macd.ewm(span=signal, adjust=False).mean()
+        return macd, signal_line
+
+    df['RSI'] = calculate_rsi(df['close'])
+    macd, signal = calculate_macd(df['close'])
+    df['MACD'] = macd
+    df['ADX'] = df['RSI'].rolling(window=14).mean()  # Simplified ADX proxy
+    return df.dropna()
+
+def prepare_lstm_data(df):
+    """Prepare LSTM sequences with refined labeling."""
+    logger.info(f"[Model] Preparing LSTM data with shape {df.shape}")
+    required_cols = ["close", "volume", "RSI", "MACD", "ADX"]
+    if not all(col in df.columns for col in required_cols):
+        logger.error(f"[Model] Missing columns: {required_cols}")
+        return None, None, None
+    df = df[required_cols].dropna()
+    if len(df) <= SEQ_LEN + 5:  # Need extra rows for future labeling
+        logger.error(f"[Model] Insufficient data: {len(df)} rows, need {SEQ_LEN + 6}")
+        return None, None, None
+    scaler = MinMaxScaler()
+    scaled_data = scaler.fit_transform(df)
+    X, y = [], []
+    for i in range(SEQ_LEN, len(scaled_data) - 5):
+        X.append(scaled_data[i-SEQ_LEN:i])
+        future_avg = np.mean(scaled_data[i+1:i+6, 0])  # Average of next 5 closes
+        current = scaled_data[i, 0]
+        y.append(1 if future_avg > current else 0)
+    X, y = np.array(X), np.array(y)
+    if len(X) == 0:
+        logger.warning("[Model] No sequences generated")
+        return None, None, None
+    logger.info(f"[Model] Prepared X shape: {X.shape}, y shape: {y.shape}")
+    return X, y, scaler
+
+def augment_data(X, y):
+    """Augment data with Gaussian noise."""
+    X_noisy = X + np.random.normal(0, 0.01, X.shape)
+    return np.concatenate([X, X_noisy]), np.concatenate([y, y])
 
 def build_lstm_model(input_shape=(SEQ_LEN, 5)):
+    """Build and compile the LSTM model."""
     model = Sequential([
         Input(shape=input_shape),
         LSTM(64, return_sequences=True, dropout=0.3),
@@ -25,44 +116,21 @@ def build_lstm_model(input_shape=(SEQ_LEN, 5)):
         Dense(1, activation='sigmoid')
     ])
     model.compile(
-        optimizer='adam',
+        optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
         loss='binary_crossentropy',
         metrics=['accuracy', tf.keras.metrics.Precision()]
     )
     return model
 
-def prepare_lstm_data(df):
-    logger.info(f"[Model] Preparing LSTM data with shape {df.shape}")
-    required_cols = ["close", "volume", "RSI", "MACD", "ADX"]
-    if not all(col in df.columns for col in required_cols):
-        logger.error(f"[Model] Missing columns: {required_cols}")
-        return None, None, None
-    df = df[required_cols].dropna()
-    if len(df) <= SEQ_LEN:
-        logger.error(f"[Model] Insufficient data: {len(df)} rows, need {SEQ_LEN + 1}")
-        return None, None, None
-    scaler = MinMaxScaler()
-    scaled_data = scaler.fit_transform(df)
-    X, y = [], []
-    for i in range(SEQ_LEN, len(scaled_data)):
-        X.append(scaled_data[i-SEQ_LEN:i])
-        y.append(1 if scaled_data[i, 0] > scaled_data[i-1, 0] else 0)
-    X, y = np.array(X), np.array(y)
-    if len(X) == 0:
-        logger.warning("[Model] No sequences generated, using last sequence")
-        X = [scaled_data[-SEQ_LEN:]]
-        y = [0]  # Default label
-    logger.info(f"[Model] Prepared X shape: {X.shape}, y shape: {y.shape}")
-    return X, y, scaler
-
-def train_or_load_model(df, symbol=None):
+def train_or_load_model(df, symbol=SYMBOL):
+    """Train or load the LSTM model with real data."""
     os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
-    logger.info(f"[Model] Attempting to train or load model with data shape {df.shape}")
+    logger.info(f"[Model] Attempting to train or load model for {symbol} with data shape {df.shape}")
 
     # Load metadata if exists
     meta = {}
     if os.path.exists(META_PATH):
-        with open(META_PATH, 'r', encoding="utf-8-sig") as f:
+        with open(META_PATH, 'r', encoding="utf-8-sig") as f:  # Changed from utf-8
             meta = json.load(f)
 
     try:
@@ -71,8 +139,8 @@ def train_or_load_model(df, symbol=None):
         last_train_time = meta.get('last_train_time', 0)
         last_train_close = meta.get('last_train_close', 0)
         current_close = df['close'].iloc[-1]
-        if last_train_time and abs(current_close - last_train_close) < 1.0:  # Adjustable threshold
-            logger.info(f"[Model] Data unchanged since last training at {datetime.fromtimestamp(last_train_time).strftime('%Y-%m-%d %H:%M:%S')}, reusing model")
+        if last_train_time and abs(current_close - last_train_close) < 1.0:
+            logger.info(f"[Model] Data unchanged since {datetime.fromtimestamp(last_train_time).strftime('%Y-%m-%d %H:%M:%S')}, reusing model")
             return model
         logger.info(f"[Model] Data changed, retraining model")
     except Exception as e:
@@ -80,34 +148,45 @@ def train_or_load_model(df, symbol=None):
 
     try:
         X, y, scaler = prepare_lstm_data(df)
-        if X is None or len(X) == 0:
-            logger.error("[Model] No valid data for training")
+        if X is None or len(X) < 10:  # Minimum sequences for training
+            logger.error("[Model] Insufficient valid data for training")
             return None
+        X, y = augment_data(X, y)
         model = build_lstm_model()
         logger.info(f"[Model] Training with X shape {X.shape}, y shape {y.shape}")
-        early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
-        model.fit(X, y, epochs=100, batch_size=32, validation_split=0.1, verbose=1, callbacks=[early_stopping])
+        early_stopping = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+        history = model.fit(
+            X, y,
+            validation_split=0.1,
+            epochs=100,
+            batch_size=32,
+            verbose=1,
+            callbacks=[early_stopping]
+        )
         model.save(MODEL_PATH)
         current_time = time.time()
         meta = {
             'last_train_time': current_time,
-            'last_train_close': float(df['close'].iloc[-1])
+            'last_train_close': float(df['close'].iloc[-1]),
+            'symbol': symbol
         }
-        with open(META_PATH, 'w', encoding="utf-8-sig") as f:
+        with open(META_PATH, 'w', encoding="utf-8") as f:
             json.dump(meta, f)
-        logger.info(f"[Model] Training completed for {symbol if symbol else 'global'} with {len(df)} rows")
+        logger.info(f"[Model] Training completed for {symbol} with {len(df)} rows")
         return model
     except Exception as e:
-        logger.error(f"[Model] Training failed: {e}, returning None")
+        logger.error(f"[Model] Training failed: {e}")
         return None
 
-def augment_data(X, y):
-    # Add Gaussian noise
-    X_noisy = X + np.random.normal(0, 0.01, X.shape)
-    return np.concatenate([X, X_noisy]), np.concatenate([y, y])
-
 if __name__ == "__main__":
-    # Example usage for testing
-    df = pd.DataFrame({'close': np.random.rand(150), 'volume': np.random.rand(150), 'RSI': np.random.rand(150),
-                       'MACD': np.random.rand(150), 'ADX': np.random.rand(150)})
-    model = train_or_load_model(df)
+    # Fetch real data from Binance
+    df = fetch_binance_data(SYMBOL, INTERVAL, LIMIT)
+    if df is not None:
+        df = calculate_indicators(df)
+        model = train_or_load_model(df, symbol=SYMBOL)
+        if model:
+            logger.info("[Main] Model training or loading successful")
+        else:
+            logger.error("[Main] Model training or loading failed")
+    else:
+        logger.error("[Main] Failed to proceed due to data fetch failure")

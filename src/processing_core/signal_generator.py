@@ -85,7 +85,7 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
     roc = talib.ROC(df['close'], timeperiod=5).iloc[-1] * 100
 
     strategy_mode = select_strategy_mode(adx, rsi, atr)
-    logger.info(f"[Strategy] Switched to {strategy_mode}, ADX: {adx:.2f}, RSI: {rsi:.2f}, ATR: {atr:.2f}, Roc: {atr:.2f} for {symbol}")
+    logger.info(f"[Strategy] Switched to {strategy_mode}, ADX: {adx:.2f}, RSI: {rsi:.2f}, ATR: {atr:.2f}, Roc: {roc:.2f} for {symbol}")
 
 
     lstm_input = prepare_lstm_input(df)
@@ -122,7 +122,7 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
     elif strategy_mode == "trend":
         if (trend_up and macd_bullish and rsi_strong and prediction > dynamic_up and breakout_up and roc > 0.5):
             action = "sell"
-            new_position = "shrort"
+            new_position = "short"
         elif (trend_down and not macd_bullish and rsi_strong and prediction < dynamic_down and breakout_down and roc < -0.5):
             action = "buy"
             new_position = "long"
@@ -193,7 +193,7 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
     if action != "None":
         signal_details = {
             "symbol": symbol,
-            "signal_type": action,
+            "signal_type": action.lower() if isinstance(action, str) else action,
             "price": float(close),
             "timestamp": signal_timestamp,
             "quantity": 0.0,
@@ -209,5 +209,24 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
         logger.info(f"[Signal Stored] {action} at {close} for {symbol}")
     else:
         logger.info(f"[No Signal] Conditions not met for {symbol}")
+
+    # --- Confidence Score ---
+    confidence_factors = []
+
+    if prediction > 0.6 or prediction < 0.4:
+        confidence_factors.append("LSTM strong")
+    if (trend_up and macd > signal_line) or (trend_down and macd < signal_line):
+        confidence_factors.append("MACD aligned")
+    if rsi > 55 or rsi < 45:
+        confidence_factors.append("RSI strong")
+    if (trend_up and ema20 > ema50) or (trend_down and ema20 < ema50):
+        confidence_factors.append("EMA trend")
+    if abs(roc) > 1.0:
+        confidence_factors.append("ROC momentum")
+    if breakout_up or breakout_down:
+        confidence_factors.append("Breakout detected")
+
+    score = len(confidence_factors)
+    logger.info(f"[Confidence Score] {symbol} → {score}/6 | Factors: {', '.join(confidence_factors) if confidence_factors else 'None'}")
 
     return action, new_position

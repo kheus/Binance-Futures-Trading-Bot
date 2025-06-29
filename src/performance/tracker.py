@@ -7,8 +7,10 @@ import os
 import time
 
 import pandas as pd
+import numpy as np
 
 from src.database.db_handler import get_pending_training_data, update_training_outcome, clean_old_data, execute_query
+from tabulate import tabulate
 
 
 
@@ -227,17 +229,14 @@ def performance_tracker_loop():
                     if direction is not None:
 
                         prediction_correct = 1 if direction == (1 if action == 'buy' else 0) else 0
-
+                        # Convertit en booléen Python natif si besoin
+                        if isinstance(prediction_correct, np.bool_):
+                            prediction_correct = bool(prediction_correct)
                         update_training_outcome(
-
                             record_id=record_id,
-
                             market_direction=direction,
-
                             price_change_pct=pct_change,
-
                             prediction_correct=prediction_correct
-
                         )
 
                         logger.info(
@@ -270,7 +269,11 @@ def performance_tracker_loop():
 
                 accuracy = total_correct / processed_records
 
+                # Utilise le dernier record_id et symbol traités pour le tableau
+
                 logger.info(f"[Tracker] Batch accuracy: {accuracy:.2%} ({total_correct}/{processed_records})")
+
+                log_performance_as_table(record_id, symbol, accuracy, processed_records)
 
             else:
 
@@ -297,6 +300,22 @@ def performance_tracker_loop():
             logger.error(f"[Tracker] Error in tracker loop: {str(e)}")
 
             time.sleep(60)  # Attendre avant de reessayer en cas d'erreur
+
+
+
+def log_performance_as_table(record_id, symbol, accuracy, processed_records):
+    """
+
+    Log performance metrics as a table.
+
+    """
+    table_data = [
+        ["Record ID", record_id],
+        ["Symbol", symbol],
+        ["Accuracy", f"{accuracy:.2%}"],
+        ["Processed Records", processed_records]
+    ]
+    logger.info("Performance Tracker:\n%s", tabulate(table_data, headers=["Metric", "Value"], tablefmt="grid"))
 
 
 

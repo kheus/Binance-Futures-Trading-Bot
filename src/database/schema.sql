@@ -6,7 +6,7 @@ CREATE TABLE IF NOT EXISTS trades (
     side TEXT NOT NULL CHECK (side IN ('buy', 'sell')),
     quantity NUMERIC NOT NULL CHECK (quantity > 0),
     price NUMERIC NOT NULL CHECK (price > 0),
-    stop_loss NUMERIC,
+    stop_loss VARCHAR(20),
     take_profit NUMERIC,
     timestamp BIGINT NOT NULL,
     pnl NUMERIC DEFAULT 0.0
@@ -65,7 +65,31 @@ CREATE TABLE IF NOT EXISTS price_data (
     UNIQUE(symbol, timestamp)  -- Pour permettre les upserts sans doublons
 );
 
--- Index pour améliorer les performances des requêtes temporelles
+CREATE TABLE IF NOT EXISTS daily_reports (
+    report_date VARCHAR(10),
+    total_trades INTEGER,
+    win_rate FLOAT,
+    total_pnl FLOAT,
+    avg_duration FLOAT,
+    symbol_summary TEXT
+);
+
+CREATE TABLE IF NOT EXISTS orders (
+    id SERIAL PRIMARY KEY,
+    order_id VARCHAR(50) NOT NULL,
+    symbol VARCHAR(20) NOT NULL,
+    side VARCHAR(10) NOT NULL,
+    quantity DECIMAL(20, 8) NOT NULL,
+    price DECIMAL(20, 8) NOT NULL,
+    status VARCHAR(20) NOT NULL,
+    timestamp TIMESTAMP NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(order_id, symbol)
+);
+
+CREATE INDEX IF NOT EXISTS idx_orders_order_id ON orders(order_id);
+CREATE INDEX IF NOT EXISTS idx_orders_symbol ON orders(symbol);
 CREATE INDEX IF NOT EXISTS idx_price_data_symbol_timestamp ON price_data(symbol, timestamp);
 CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp);
 CREATE INDEX IF NOT EXISTS idx_signals_timestamp ON signals(timestamp);
