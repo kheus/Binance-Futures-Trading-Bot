@@ -61,17 +61,17 @@ def round_to_tick(value, tick_size):
 
 def place_order(signal, price, atr, client, symbol, capital, leverage):
     try:
-        # 1. Vérification améliorée de la marge
+        # 1. Enhanced margin check
         if not check_margin(client, symbol, capital, leverage):
-            logger.error("Annulation - Problème de marge")
+            logger.error("Cancellation - margin problem")
             return None
 
-        # 2. Calcul de quantité sécurisé
+        # 2. Secure quantity calculation
         tick_size, qty_precision = get_tick_info(client, symbol)
         base_qty = capital / price
         qty = round(base_qty * leverage, qty_precision)
 
-        # 3. Vérification du minimum (utilise l'exchange info pour robustesse)
+        # 3. Minimum check (uses exchange info for robustness)
         exchange_info = client.exchange_info()
         symbol_info = next((s for s in exchange_info["symbols"] if s["symbol"] == symbol), None)
         min_qty = 1.0
@@ -83,21 +83,21 @@ def place_order(signal, price, atr, client, symbol, capital, leverage):
             logger.warning(f"Quantité ajustée à {min_qty} (min)")
             qty = min_qty
 
-        # 4. Placement d'ordre avec timeout
+        # 4. Order placement with timeout
         order = client.new_order(
             symbol=symbol,
             side=SIDE_BUY if signal == "buy" else SIDE_SELL,
             type=ORDER_TYPE_MARKET,
             quantity=qty,
-            recvWindow=5000  # Timeout augmenté
+            recvWindow=5000  # Increased timeout
         )
 
-        # Gestion des réponses alternatives
+        # Alternative response handling
         order_id = order.get('orderId') or order.get('clientOrderId')
         if not order_id:
-            raise ValueError("Réponse d'ordre invalide de Binance")
+            raise ValueError("Invalid order response from Binance")
 
-        # Attendre que l'ordre soit finalisé
+        # Wait for the order to be finalized
         order_status = wait_until_order_finalized(client, symbol, order_id)
 
         if isinstance(order_status, dict) and order_status.get("status") == "REJECTED":
@@ -331,15 +331,15 @@ def monitor_and_update_trailing_stop(client, symbol, order_id, ts_manager):
 
 def check_margin(client, symbol, capital, leverage):
     """
-    Vérifie que la marge disponible sur le compte Futures est suffisante pour placer l'ordre.
+    Verify that the available margin on the Futures account is sufficient to place the order.
     """
     try:
-        # 1. Récupérer le solde disponible sur le compte Futures
+        # 1. Retrieve the available balance on the Futures account
         account_info = client.account()
         available_balance = float(account_info['availableBalance'])
 
-        # 2. Calculer la marge requise pour l'ordre (capital utilisé pour la position)
-        required_margin = float(capital)  # Pour les Futures, la marge requise = capital utilisé
+        # 2. Calculate the required margin for the order (capital used for the position)
+        required_margin = float(capital)  # For Futures, the required margin = capital used
 
         logger.info(f"[Margin Check] Available Balance: {available_balance} USDT, Required Margin: {required_margin} USDT")
         send_telegram_alert(f"Margin verification for {symbol} - Available Balance: {available_balance} USDT, Required Margin: {required_margin} USDT")
@@ -356,7 +356,7 @@ def check_margin(client, symbol, capital, leverage):
 
 def get_min_qty(client, symbol):
     """
-    Retourne la quantité minimale autorisée pour un symbole donné selon les règles de Binance Futures.
+    Return the minimum quantity allowed for a given symbol according to Binance Futures rules.
     """
     try:
         info = client.exchange_info()
