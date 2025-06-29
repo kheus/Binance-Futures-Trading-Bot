@@ -56,4 +56,16 @@ Ensure Kafka and PostgreSQL services are running.
 Simulated orders are enabled by default. Uncomment order placement code in order_manager.py for live trading.
 Monitor metrics at [http://localhost:8000](http://localhost:8000) (Prometheus) and Grafana dashboards.
 
+PS C:\Users\Cheikh\binance-trading-bot> git add C:\Users\Cheikh\binance-trading-bot\src\database\db_handler.py
+PS C:\Users\Cheikh\binance-trading-bot> git add C:\Users\Cheikh\binance-trading-bot\src\database\schema.sql
+PS C:\Users\Cheikh\binance-trading-bot> git add C:\Users\Cheikh\binance-trading-bot\src\performance\tracker.py
+PS C:\Users\Cheikh\binance-trading-bot> git add C:\Users\Cheikh\binance-trading-bot\src\processing_core\main_bot.py
+PS C:\Users\Cheikh\binance-trading-bot> git add C:\Users\Cheikh\binance-trading-bot\src\processing_core\lstm_model.py
+PS C:\Users\Cheikh\binance-trading-bot> git add C:\Users\Cheikh\binance-trading-bot\src\processing_core\signal_generator.py
+PS C:\Users\Cheikh\binance-trading-bot> git add C:\Users\Cheikh\binance-trading-bot\src\trade_execution\order_manager.py
+PS C:\Users\Cheikh\binance-trading-bot> git add C:\Users\Cheikh\binance-trading-bot\src\trade_execution\sync_orders.py
+PS C:\Users\Cheikh\binance-trading-bot> git commit -m "Updates"
+git commit -m "Premier push du bot de trading"
 
+git branch -M main
+git push -u origin main
