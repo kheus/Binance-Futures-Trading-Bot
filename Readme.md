@@ -44,8 +44,7 @@ Get-ChildItem -Recurse -File | ForEach-Object {
     (Get-Content $_.FullName) -replace 'postgres', 'postgres' | Set-Content $_.FullName
 }
 
-sqlite3 trading_bot.db
-sqlite> SELECT * FROM trades LIMIT 10;
+ & "C:\Program Files\PostgreSQL\16\bin\psql.exe" -U postgres -d trading_bot_db
 
 python app.py
 npm run watch
@@ -56,15 +55,15 @@ Ensure Kafka and PostgreSQL services are running.
 Simulated orders are enabled by default. Uncomment order placement code in order_manager.py for live trading.
 Monitor metrics at [http://localhost:8000](http://localhost:8000) (Prometheus) and Grafana dashboards.
 
-PS C:\Users\Cheikh\binance-trading-bot> git add C:\Users\Cheikh\binance-trading-bot\src\database\db_handler.py
-PS C:\Users\Cheikh\binance-trading-bot> git add C:\Users\Cheikh\binance-trading-bot\src\database\schema.sql
-PS C:\Users\Cheikh\binance-trading-bot> git add C:\Users\Cheikh\binance-trading-bot\src\performance\tracker.py
-PS C:\Users\Cheikh\binance-trading-bot> git add C:\Users\Cheikh\binance-trading-bot\src\processing_core\main_bot.py
-PS C:\Users\Cheikh\binance-trading-bot> git add C:\Users\Cheikh\binance-trading-bot\src\processing_core\lstm_model.py
-PS C:\Users\Cheikh\binance-trading-bot> git add C:\Users\Cheikh\binance-trading-bot\src\processing_core\signal_generator.py
-PS C:\Users\Cheikh\binance-trading-bot> git add C:\Users\Cheikh\binance-trading-bot\src\trade_execution\order_manager.py
-PS C:\Users\Cheikh\binance-trading-bot> git add C:\Users\Cheikh\binance-trading-bot\src\trade_execution\sync_orders.py
-PS C:\Users\Cheikh\binance-trading-bot> git commit -m "Updates"
+git add C:\Users\Cheikh\binance-trading-bot\src\database\db_handler.py
+git add C:\Users\Cheikh\binance-trading-bot\src\database\schema.sql
+git add C:\Users\Cheikh\binance-trading-bot\src\performance\tracker.py
+git add C:\Users\Cheikh\binance-trading-bot\src\processing_core\main_bot.py
+git add C:\Users\Cheikh\binance-trading-bot\src\processing_core\lstm_model.py
+git add C:\Users\Cheikh\binance-trading-bot\src\processing_core\signal_generator.py
+git add C:\Users\Cheikh\binance-trading-bot\src\trade_execution\order_manager.py
+git add C:\Users\Cheikh\binance-trading-bot\src\trade_execution\sync_orders.py
+git commit -m "Updates"
 git commit -m "Premier push du bot de trading"
 
 git branch -M main

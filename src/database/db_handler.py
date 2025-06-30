@@ -53,12 +53,16 @@ def get_db_connection():
         with conn.cursor() as cur:
             cur.execute("SHOW client_encoding;")
             encoding = cur.fetchone()[0]
+            logger.info(f"[DEBUG] Client encoding: {encoding}")
             if encoding.lower() != 'utf8':
                 raise RuntimeError(f"Mauvais encodage PostgreSQL: {encoding}")
         
         yield conn
+    except psycopg2.Error as e:
+        logger.error(f"PostgreSQL connection error: {e.pgerror}, code: {e.pgcode}")
+        raise
     except Exception as e:
-        logger.error(f"DB Connection Error: {e}")
+        logger.error(f"Unexpected connection error: {str(e)}, type: {type(e).__name__}")
         raise
     finally:
         if conn:
@@ -68,13 +72,17 @@ def execute_query(query, params=None, fetch=False):
     with get_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             try:
+                logger.debug(f"[execute_query] Executing query: {query[:100]}... with params: {params}")
                 cur.execute(query, params)
                 if fetch:
                     return cur.fetchall()
                 else:
                     conn.commit()
+            except psycopg2.Error as e:
+                logger.error(f"PostgreSQL query execution error: {e.pgerror}, code: {e.pgcode}, query: {query[:100]}..., params: {params}")
+                raise
             except Exception as e:
-                logger.error(f"Query execution error: {e}")
+                logger.error(f"Unexpected query execution error: {str(e)}, type: {type(e).__name__}, query: {query[:100]}..., params: {params}")
                 raise
 
 def create_tables():
@@ -82,15 +90,14 @@ def create_tables():
         schema_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "schema.sql"))
         with open(schema_path, "r", encoding="utf-8-sig") as file:
             schema_sql = file.read()
-        # Split les requêtes sur ';' et exécute une par une
         queries = [q.strip() for q in schema_sql.split(';') if q.strip()]
         with get_db_connection() as conn:
             with conn.cursor() as cur:
                 for query in queries:
                     try:
                         cur.execute(query)
-                    except Exception as e:
-                        logger.error(f"Erreur lors de l'exécution de la requête : {query[:80]}... -> {e}")
+                    except psycopg2.Error as e:
+                        logger.error(f"Erreur lors de l'exécution de la requête : {query[:80]}... -> {e.pgerror}")
                         raise
             conn.commit()
         logger.info("Tables created or verified successfully via schema.sql.")
@@ -139,23 +146,31 @@ def insert_price_data(df, symbol):
     ON CONFLICT (symbol, timestamp) DO NOTHING
     """
     try:
+        logger.info(f"[insert_price_data] DataFrame for {symbol}: {df.to_dict()}")
         with get_db_connection() as conn:
             with conn.cursor() as cur:
                 for _, row in df.iterrows():
+                    if not isinstance(row['timestamp'], pd.Timestamp):
+                        logger.error(f"[insert_price_data] Invalid timestamp format for {symbol}: {row['timestamp']} (type: {type(row['timestamp'])})")
+                        continue
                     params = (
                         symbol,
-                        int(row['timestamp'].timestamp() * 1000) if isinstance(row['timestamp'], pd.Timestamp) else int(row['timestamp']),
+                        row['timestamp'],
                         float(row['open']),
                         float(row['high']),
                         float(row['low']),
                         float(row['close']),
                         float(row['volume'])
                     )
-                    cur.execute(query, params)
+                    try:
+                        cur.execute(query, params)
+                    except psycopg2.Error as e:
+                        logger.error(f"[insert_price_data] PostgreSQL error for {symbol}: {e.pgerror}, code: {e.pgcode}")
+                        raise
                 conn.commit()
                 logger.info(f"Inserted price data for {symbol}")
     except Exception as e:
-        logger.error(f"Failed to insert price data for {symbol}: {e}")
+        logger.error(f"Failed to insert price data for {symbol}: {str(e)}, type: {type(e).__name__}")
         raise
 
 def insert_signal(signal):
@@ -272,7 +287,7 @@ def get_future_prices(symbol, signal_timestamp, candle_count=5):
     ORDER BY timestamp ASC
     LIMIT %s
     """
-    params = (symbol, signal_timestamp, candle_count)
+    params = (str(symbol), int(signal_timestamp), int(candle_count))
     try:
         with get_db_connection() as conn:
             return pd.read_sql_query(query, conn, params=params)
@@ -307,7 +322,7 @@ def update_training_outcome(record_id, market_direction, price_change_pct, predi
             int(market_direction) if market_direction is not None else None,
             float(price_change_pct) if price_change_pct is not None else None,
             bool(prediction_correct) if prediction_correct is not None else None,
-            record_id
+            int(record_id)
         )
         execute_query(query, params)
         logger.info(f"Updated training outcome for record_id={record_id}")
@@ -340,7 +355,7 @@ def get_price_history(symbol, timeframe='1h'):
     ORDER BY timestamp DESC
     LIMIT %s
     """
-    params = (symbol, limit)
+    params = (str(symbol), int(limit))
     try:
         with get_db_connection() as conn:
             return pd.read_sql_query(query, conn, params=params).sort_values('timestamp').to_dict(orient='records')
@@ -466,6 +481,18 @@ def sync_orders_with_db(client, symbol_list):
     except Exception as e:
         logger.error(f"Critical sync error: {str(e)}", exc_info=True)
         return 0
+
+def _validate_timestamp(ts):
+    """Valide et convertit un timestamp en millisecondes"""
+    try:
+        ts = int(float(ts))  # Double conversion pour sécurité
+        # Plage de validation raisonnable (années 2000-2100)
+        if ts < 946684800000 or ts > 4102444800000:
+            raise ValueError(f"Timestamp {ts} hors plage valide")
+        return ts
+    except (TypeError, ValueError) as e:
+        logger.error(f"Timestamp invalide: {ts} - {str(e)}")
+        raise ValueError(f"Format de timestamp invalide: {ts}") from e
 
 if __name__ == "__main__":
     create_tables()

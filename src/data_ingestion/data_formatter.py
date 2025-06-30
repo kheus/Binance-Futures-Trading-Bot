@@ -1,26 +1,26 @@
 ﻿import pandas as pd
-import json
 import logging
 
 logger = logging.getLogger(__name__)
 
-def format_candle(candle_json):
+def format_candle(candle, symbol):
+    """
+    Formate une bougie (candle) brute en DataFrame pandas standardisée pour l'insertion en base.
+    """
     try:
-        logger.debug(f"[Formatter] Raw input JSON: {candle_json}")
-        candle = json.loads(candle_json)
-        required_keys = ["timestamp", "open", "high", "low", "close", "volume"]
-        if not all(key in candle for key in required_keys):
-            logger.error(f"[Formatter] Missing keys in candle: {candle.keys()}")
-            return pd.DataFrame()
-        return pd.DataFrame([{
-            "timestamp": pd.to_datetime(candle["timestamp"], unit="ms"),
-            "open": float(candle["open"]),
-            "high": float(candle["high"]),
-            "low": float(candle["low"]),
-            "close": float(candle["close"]),
-            "volume": float(candle["volume"])
-        }])
+        # Vérifier si 'T' ou 'timestamp' est présent pour le timestamp
+        timestamp_key = 'T' if 'T' in candle else 'timestamp'
+        candle_data = {
+            'timestamp': pd.to_datetime(candle[timestamp_key], unit='ms'),
+            'open': float(candle['o' if 'o' in candle else 'open']),
+            'high': float(candle['h' if 'h' in candle else 'high']),
+            'low': float(candle['l' if 'l' in candle else 'low']),
+            'close': float(candle['c' if 'c' in candle else 'close']),
+            'volume': float(candle['v' if 'v' in candle else 'volume'])
+        }
+        df = pd.DataFrame([candle_data])
+        logger.debug(f"[format_candle] Formatted DataFrame for {symbol}: {df.to_dict()}")
+        return df
     except Exception as e:
-        logger.error(f"[Formatter] Data formatting error: {str(e)}, Input: {candle_json}")
+        logger.error(f"[format_candle] Error formatting candle for {symbol}: {e} | data: {candle}", exc_info=True)
         return pd.DataFrame()
-

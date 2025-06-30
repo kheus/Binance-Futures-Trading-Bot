@@ -18,14 +18,15 @@ from src.database.db_handler import insert_trade, insert_signal, insert_metrics,
 from src.monitoring.metrics import record_trade_metric
 from src.monitoring.alerting import send_telegram_alert
 from src.trade_execution.sync_orders import sync_binance_trades_with_postgres
+from src.performance.tracker import performance_tracker_loop
 import sys
 import os
 import time
 import numpy as np
 import threading
-from src.performance.tracker import performance_tracker_loop
 import io
 import platform
+import json
 
 # Force UTF-8 encoding
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8-sig")
@@ -99,7 +100,6 @@ client = UMFutures(
     secret="20fe2ccf55a7114e576e5830e6ebadbdfdb66df849a326d50ebfb2ca394ce7ec",
     base_url="https://testnet.binancefuture.com"
 )
-logger.info(f"[Binance] Account info: {client.account()}")
 
 # Initialize trailing stop manager
 ts_manager = init_trailing_stop_manager(client)
@@ -180,12 +180,11 @@ def start_websocket():
     """Démarre le client WebSocket et maintient la connexion."""
     ws_client = UMFuturesWebsocketClient()
     ws_client.user_data(
-        listen_key=client.get_listen_key()['listenKey'],
+        listen_key=client.new_listen_key()['listenKey'],
         id=1,
         callback=handle_order_update
     )
     logger.info("[WebSocket] WebSocket client initialized.")
-    # Maintient la connexion WebSocket active
     while True:
         eventlet.sleep(3600)  # Garde la connexion ouverte, rafraîchit le listen_key toutes les heures
         try:
@@ -367,8 +366,8 @@ async def main():
                 continue
 
             try:
-                candle_data = msg.value().decode("utf-8") if msg.value() else None
-                if not candle_data or not isinstance(candle_data, str):
+                candle_data = json.loads(msg.value().decode("utf-8")) if msg.value() else None
+                if not candle_data or not isinstance(candle_data, dict):
                     logger.error(f"[Kafka] Invalid candle data for topic {msg.topic()}: {candle_data}")
                     continue
                 topic = msg.topic()
@@ -377,13 +376,15 @@ async def main():
                     logger.error(f"[Kafka] Invalid symbol for topic {topic}")
                     continue
 
-                candle_df = format_candle(candle_data)
+                candle_df = format_candle(candle_data, symbol)
                 if candle_df.empty or "close" not in candle_df.columns:
                     logger.error(f"[Kafka] Invalid or empty candle data for {symbol}: {candle_data}")
                     continue
-                candle_df["timestamp"] = pd.to_datetime(candle_df["timestamp"], unit="ms")
-                candle_df.set_index("timestamp", inplace=True)
+
+                # On garde la colonne 'timestamp' pour l'insertion
                 insert_price_data(candle_df, symbol)
+                # On définit l'index après l'insertion pour la suite du traitement
+                candle_df.set_index("timestamp", inplace=True)
                 dataframes[symbol] = pd.concat([dataframes[symbol], candle_df], ignore_index=False)
                 dataframes[symbol] = calculate_indicators(dataframes[symbol], symbol)
                 if len(dataframes[symbol]) >= 101:
@@ -484,4 +485,3 @@ else:
         
         # Run main loop
         asyncio.run(main())
-

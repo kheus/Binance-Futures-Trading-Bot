@@ -58,7 +58,7 @@ CREATE TABLE IF NOT EXISTS training_data (
 CREATE TABLE IF NOT EXISTS price_data (
     id SERIAL PRIMARY KEY,
     symbol TEXT NOT NULL,
-    timestamp BIGINT NOT NULL,
+    timestamp TIMESTAMP NOT NULL,
     open NUMERIC NOT NULL,
     high NUMERIC NOT NULL,
     low NUMERIC NOT NULL,
