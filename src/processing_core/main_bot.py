@@ -16,7 +16,7 @@ from src.trade_execution.order_manager import place_order, update_trailing_stop,
 from src.trade_execution.sync_orders import get_current_atr, get_current_price
 from src.database.db_handler import insert_trade, insert_signal, insert_metrics, create_tables, insert_price_data, get_db_connection
 from src.monitoring.metrics import record_trade_metric
-from src.monitoring.alerting import send_telegram_alert
+from monitoring.alerting import send_telegram_alert
 from src.trade_execution.sync_orders import sync_binance_trades_with_postgres
 from src.performance.tracker import performance_tracker_loop
 import sys
