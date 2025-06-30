@@ -110,7 +110,7 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
     action = "None"
     new_position = None
     signal_timestamp = int(time.time() * 1000)
-
+    logger.debug(f"Processing signal for {symbol} at timestamp {signal_timestamp}") 
     # --- Signal logic (same as previous, can be customized) ---
     if strategy_mode == "scalp" and rsi_strong:
         if prediction > dynamic_up + 0.1 and roc > 1.0:  # Higher confidence

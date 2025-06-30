@@ -257,6 +257,8 @@ async def main():
     last_action_sent = {symbol: None for symbol in SYMBOLS}
     last_sl_order_ids = {symbol: None for symbol in SYMBOLS}
     models = {symbol: None for symbol in SYMBOLS}
+    last_sync_time = time.time()  # Initialisation pour la synchronisation périodique
+    sync_interval = 300  # 5 minutes en secondes
 
     try:
         logger.info("[Main] Creating database tables")
@@ -331,11 +333,16 @@ async def main():
     iteration_count = 0
     try:
         while True:
+            current_time = time.time()
+            if current_time - last_sync_time >= sync_interval:
+                logger.info("[MainBot] Running periodic trade sync...")
+                sync_binance_trades_with_postgres(client, SYMBOLS, ts_manager)
+                last_sync_time = current_time
+
             if iteration_count % 10 == 0:
                 logger.info("[Main Loop] Starting iteration")
             iteration_count += 1
             msg = consumer.poll(1.0)
-            current_time = time.time()
 
             if msg is None:
                 if current_time - last_log_time >= 5:

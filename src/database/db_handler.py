@@ -368,9 +368,19 @@ def clean_old_data(retention_days=30, trades_retention_days=90):
     retention_ms = retention_days * 24 * 3600 * 1000
     trades_retention_ms = trades_retention_days * 24 * 3600 * 1000
     tables = ["price_data", "metrics", "signals", "training_data"]
+    timestamp_is_bigint = {
+        "metrics": True,
+        "signals": True,
+        "training_data": True,
+        "trades": True,
+        "price_data": False
+    }
     try:
         for table in tables:
-            query = f"DELETE FROM {table} WHERE timestamp < %s"
+            if timestamp_is_bigint.get(table, True):
+                query = f"DELETE FROM {table} WHERE timestamp < %s"
+            else:
+                query = f"DELETE FROM {table} WHERE timestamp < to_timestamp(%s / 1000.0)"
             execute_query(query, (current_time - retention_ms,))
             logger.info(f"[DB Cleanup] Deleted rows from {table}")
         query = "DELETE FROM trades WHERE timestamp < %s"
