@@ -1,7 +1,7 @@
 ﻿-- Table des transactions exécutées
 CREATE TABLE IF NOT EXISTS trades (
     trade_id SERIAL PRIMARY KEY,
-    order_id TEXT UNIQUE NOT NULL,
+    order_id TEXT NOT NULL,
     symbol TEXT NOT NULL,
     side TEXT NOT NULL CHECK (side IN ('buy', 'sell')),
     quantity NUMERIC NOT NULL CHECK (quantity > 0),
@@ -9,7 +9,9 @@ CREATE TABLE IF NOT EXISTS trades (
     stop_loss VARCHAR(20),
     take_profit NUMERIC,
     timestamp BIGINT NOT NULL,
-    pnl NUMERIC DEFAULT 0.0
+    pnl NUMERIC DEFAULT 0.0,
+    is_trailing BOOLEAN DEFAULT FALSE,
+    UNIQUE(order_id, symbol)
 );
 
 -- Table des signaux de trading
@@ -62,7 +64,7 @@ CREATE TABLE IF NOT EXISTS price_data (
     low NUMERIC NOT NULL,
     close NUMERIC NOT NULL,
     volume NUMERIC NOT NULL,
-    UNIQUE(symbol, timestamp)  -- Pour permettre les upserts sans doublons
+    UNIQUE(symbol, timestamp)
 );
 
 CREATE TABLE IF NOT EXISTS daily_reports (
@@ -95,7 +97,6 @@ CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp);
 CREATE INDEX IF NOT EXISTS idx_signals_timestamp ON signals(timestamp);
 CREATE INDEX IF NOT EXISTS idx_metrics_timestamp ON metrics(timestamp);
 CREATE INDEX IF NOT EXISTS idx_training_timestamp ON training_data(timestamp);
--- Index pour les symboles dans les tables de signaux et de métriques
 CREATE INDEX IF NOT EXISTS idx_signals_symbol ON signals(symbol);
 CREATE INDEX IF NOT EXISTS idx_metrics_symbol ON metrics(symbol);
 CREATE INDEX IF NOT EXISTS idx_training_symbol ON training_data(symbol);

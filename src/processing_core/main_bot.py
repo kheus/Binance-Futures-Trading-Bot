@@ -1,5 +1,4 @@
 ﻿import eventlet
-from rich import inspect
 eventlet.monkey_patch()
 import asyncio
 import yaml
@@ -8,59 +7,37 @@ import talib
 import logging
 from logging.handlers import RotatingFileHandler
 from binance.um_futures import UMFutures
+from binance.websocket.um_futures.websocket_client import UMFuturesWebsocketClient
 from confluent_kafka import Consumer
 from src.data_ingestion.data_formatter import format_candle
 from src.processing_core.lstm_model import train_or_load_model
 from src.processing_core.signal_generator import check_signal, prepare_lstm_input
 from src.trade_execution.order_manager import place_order, update_trailing_stop, init_trailing_stop_manager
-from src.database.db_handler import insert_trade, insert_signal, insert_metrics, create_tables, execute_query
+from src.trade_execution.sync_orders import get_current_atr, get_current_price
+from src.database.db_handler import insert_trade, insert_signal, insert_metrics, create_tables, insert_price_data, get_db_connection
 from src.monitoring.metrics import record_trade_metric
-from monitoring.alerting import send_telegram_alert
-import platform
+from src.monitoring.alerting import send_telegram_alert
+from src.trade_execution.sync_orders import sync_binance_trades_with_postgres
 import sys
 import os
 import time
 import numpy as np
 import threading
 from src.performance.tracker import performance_tracker_loop
-from tabulate import tabulate
-import sys
 import io
+import platform
+
+# Force UTF-8 encoding
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8-sig")
-
-import builtins, traceback
-
-orig_open = builtins.open
-
-def tracked_open(file, mode='r', *args, **kwargs):
-    try:
-        return orig_open(file, mode, *args, **kwargs)
-    except Exception as e:
-        print(f"[OPEN ERROR] fichier: {file} mode: {mode} -> {e}")
-        traceback.print_exc()
-        raise
-
-builtins.open = tracked_open
-
-# Force UTF-8 encoding for the console
-sys.stdout.reconfigure(encoding="utf-8-sig")
 sys.stderr.reconfigure(encoding="utf-8-sig")
 
 # Set up logging
 os.makedirs("logs", exist_ok=True)
-log_file = "logs/trading_bot.log"
-file_handler = RotatingFileHandler(log_file, maxBytes=1_000_000, backupCount=3)
-file_handler.setLevel(logging.INFO)
-file_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.INFO)
-console_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
-
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - [%(name)s] %(message)s',
     handlers=[
-        logging.FileHandler('logs/trading_bot.log', encoding="utf-8-sig"),
+        RotatingFileHandler('logs/trading_bot.log', maxBytes=1_000_000, backupCount=3, encoding="utf-8-sig"),
         logging.StreamHandler()
     ]
 )
@@ -84,50 +61,28 @@ try:
         kafka_config = yaml.safe_load(f)
 except Exception as e:
     logger.error(f"[Config Error] Failed to load configuration files: {e}")
-    raise Exception(f"Failed to load configuration files: {e}")
+    raise
 
-# Validate required configuration keys
+# Validate configuration
 required_top_level_keys = ["binance"]
 for key in required_top_level_keys:
     if key not in config or not config[key]:
-        logger.error(f"[Config Error] Missing or invalid key in config.yaml: {key} - Config: {config}")
+        logger.error(f"[Config Error] Missing or invalid key in config.yaml: {key}")
         raise ValueError(f"Missing or invalid key in config.yaml: {key}")
-
-# Validate binance section structure
-if not isinstance(config["binance"], dict):
-    logger.error("[Config Error] 'binance' must be a dictionary in config.yaml")
-    raise ValueError("'binance' must be a dictionary in config.yaml")
 
 binance_config = config["binance"]
 required_binance_keys = ["symbols", "timeframe", "capital", "leverage"]
 for key in required_binance_keys:
     if key not in binance_config or not binance_config[key]:
-        logger.error(f"[Config Error] Missing or invalid '{key}' under 'binance' in config.yaml - Config: {binance_config}")
+        logger.error(f"[Config Error] Missing or invalid '{key}' under 'binance' in config.yaml")
         raise ValueError(f"Missing or invalid '{key}' under 'binance' in config.yaml")
-    if key == "symbols":
-        if not isinstance(binance_config["symbols"], list) or not binance_config["symbols"]:
-            logger.error("[Config Error] 'symbols' must be a non-empty list under 'binance' in config.yaml")
-            raise ValueError("'symbols' must be a non-empty list under 'binance' in config.yaml")
-        if not all(isinstance(s, str) for s in binance_config["symbols"]):
-            logger.error("[Config Error] All 'symbols' must be strings under 'binance' in config.yaml")
-            raise ValueError("All 'symbols' must be strings under 'binance' in config.yaml")
-    elif key == "timeframe" and not isinstance(binance_config["timeframe"], str):
-        logger.error("[Config Error] 'timeframe' must be a string under 'binance' in config.yaml")
-        raise ValueError("'timeframe' must be a string under 'binance' in config.yaml")
-    elif key in ["capital", "leverage"] and not isinstance(binance_config[key], (int, float)):
-        logger.error(f"[Config Error] '{key}' must be a number under 'binance' in config.yaml")
-        raise ValueError(f"'{key}' must be a number under 'binance' in config.yaml")
-
-if "kafka" not in kafka_config or "bootstrap_servers" not in kafka_config["kafka"]:
-    logger.error("[Config Error] Missing or invalid Kafka configuration in kafka_config_local.yaml")
-    raise ValueError("Missing or invalid Kafka configuration in kafka_config_local.yaml")
 
 SYMBOLS = binance_config["symbols"]
 TIMEFRAME = binance_config["timeframe"]
 CAPITAL = binance_config["capital"]
 LEVERAGE = binance_config["leverage"]
 KAFKA_BOOTSTRAP = kafka_config["kafka"]["bootstrap_servers"]
-MODEL_UPDATE_INTERVAL = 900  # Model retraining every 15 minutes
+MODEL_UPDATE_INTERVAL = 900  # 15 minutes
 
 # Initialize Binance client
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -137,33 +92,22 @@ try:
     logger.info("[Debug] binance_client module imported successfully")
 except ImportError as e:
     logger.error(f"[Import Error] Failed to import binance_client: {e}")
-    raise Exception("Binance client module not found")
-client = UMFutures(key="f52c3046240c9514626cf7619ea6bb93f329e2ad39dac256291f48655e750545", secret="20fe2ccf55a7114e576e5830e6ebadbdfdb66df849a326d50ebfb2ca394ce7ec", base_url="https://testnet.binancefuture.com")
-print(client.account())
-if client is None:
-    logger.error("[Binance Client] Failed to initialize, exiting.")
-    raise Exception("Binance client initialization failed")
+    raise
 
-from src.trade_execution.sync_orders import sync_binance_orders_with_postgres
-
-# ⚙️ Synchronisation initiale des ordres Binance ↔ PostgreSQL
-logger.info("[MainBot] Syncing Binance open orders with PostgreSQL and internal tracker...")
-sync_binance_orders_with_postgres(client, SYMBOLS)
-logger.info("[MainBot] Sync completed. Proceeding with normal bot operation...")
-
-def periodic_sync(client, symbols, interval=300):  # toutes les 5 minutes
-    while True:
-        logger.info("[Sync] Starting periodic Binance ↔ PostgreSQL check")
-        sync_binance_orders_with_postgres(client, symbols)
-        time.sleep(interval)
-
-# Démarrer la synchronisation périodique dans un thread dédié
-sync_thread = threading.Thread(target=periodic_sync, args=(client, SYMBOLS))
-sync_thread.daemon = True
-sync_thread.start()
+client = UMFutures(
+    key="f52c3046240c9514626cf7619ea6bb93f329e2ad39dac256291f48655e750545",
+    secret="20fe2ccf55a7114e576e5830e6ebadbdfdb66df849a326d50ebfb2ca394ce7ec",
+    base_url="https://testnet.binancefuture.com"
+)
+logger.info(f"[Binance] Account info: {client.account()}")
 
 # Initialize trailing stop manager
 ts_manager = init_trailing_stop_manager(client)
+
+# Synchronisation initiale des trades
+logger.info("[MainBot] Syncing Binance trades with PostgreSQL and internal tracker...")
+sync_binance_trades_with_postgres(client, SYMBOLS, ts_manager)
+logger.info("[MainBot] Initial trade sync completed.")
 
 # Initialize Kafka consumer
 try:
@@ -176,9 +120,83 @@ try:
     logger.info(f"[Kafka] Consumer initialized with bootstrap servers: {KAFKA_BOOTSTRAP}")
 except Exception as e:
     logger.error(f"[Kafka] Failed to initialize consumer: {e}")
-    raise Exception("Kafka consumer initialization failed")
+    raise
 
-inserted_metrics = []  # À placer en haut du fichier ou dans une portée globale si besoin
+# Initialize WebSocket client
+def handle_order_update(message):
+    """Gère les mises à jour des ordres via WebSocket."""
+    try:
+        if 'e' in message and message['e'] == 'ORDER_TRADE_UPDATE':
+            order = message['o']
+            order_data = {
+                'order_id': str(order['i']),
+                'symbol': order['s'],
+                'side': order['S'].lower(),
+                'quantity': float(order['q']),
+                'price': float(order['ap'] or order['p']),
+                'timestamp': order['T'],
+                'status': order['X'].lower(),
+                'is_trailing': order['o'] == 'TRAILING_STOP_MARKET'
+            }
+            if order_data['status'] == 'filled':
+                query = "SELECT order_id, symbol FROM trades WHERE order_id = %s AND symbol = %s"
+                with get_db_connection() as conn:
+                    existing = pd.read_sql_query(query, conn, params=(order_data['order_id'], order_data['symbol']))
+                if existing.empty:
+                    trade_data = {
+                        'order_id': order_data['order_id'],
+                        'symbol': order_data['symbol'],
+                        'side': order_data['side'],
+                        'quantity': order_data['quantity'],
+                        'price': order_data['price'],
+                        'stop_loss': None,
+                        'take_profit': None,
+                        'timestamp': order_data['timestamp'],
+                        'pnl': 0.0,
+                        'is_trailing': order_data['is_trailing']
+                    }
+                    insert_trade(trade_data)
+                    logger.info(f"Inserted WebSocket-triggered trade for {order_data['symbol']}: {order_data['order_id']}")
+                    if not order_data['is_trailing']:
+                        atr = get_current_atr(client, order_data['symbol'])
+                        position_type = 'long' if order_data['side'] == 'buy' else 'short'
+                        ts_manager.initialize_trailing_stop(
+                            symbol=order_data['symbol'],
+                            entry_price=order_data['price'],
+                            position_type=position_type,
+                            quantity=order_data['quantity'],
+                            atr=atr
+                        )
+                        logger.info(f"Initialized trailing stop for WebSocket trade {order_data['order_id']} ({order_data['symbol']})")
+                if order_data['is_trailing']:
+                    current_price = get_current_price(client, order_data['symbol'])
+                    if current_price:
+                        ts_manager.update_trailing_stop(order_data['symbol'], current_price)
+                        logger.info(f"Updated trailing stop for {order_data['symbol']} at price {current_price}")
+    except Exception as e:
+        logger.error(f"Error handling WebSocket order update: {str(e)}")
+
+def start_websocket():
+    """Démarre le client WebSocket et maintient la connexion."""
+    ws_client = UMFuturesWebsocketClient()
+    ws_client.user_data(
+        listen_key=client.get_listen_key()['listenKey'],
+        id=1,
+        callback=handle_order_update
+    )
+    logger.info("[WebSocket] WebSocket client initialized.")
+    # Maintient la connexion WebSocket active
+    while True:
+        eventlet.sleep(3600)  # Garde la connexion ouverte, rafraîchit le listen_key toutes les heures
+        try:
+            client.renew_listen_key(ws_client.listen_key)
+            logger.info("[WebSocket] Listen key renewed.")
+        except Exception as e:
+            logger.error(f"[WebSocket] Failed to renew listen key: {e}")
+
+# Lancer le WebSocket dans un thread séparé
+websocket_thread = threading.Thread(target=start_websocket, daemon=True)
+websocket_thread.start()
 
 def calculate_indicators(df, symbol):
     logger.info(f"Calculating indicators for {symbol} DataFrame with {len(df)} rows")
@@ -230,48 +248,6 @@ def calculate_indicators(df, symbol):
         logger.error(traceback.format_exc())
 
     return df
-def insert_price_data(candle_df, symbol):
-    try:
-        latest = candle_df.iloc[-1]
-        timestamp_ms = int(latest.name.timestamp() * 1000)
-        query = """
-            INSERT INTO price_data (symbol, timestamp, open, high, low, close, volume)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (symbol, timestamp) DO UPDATE
-            SET open = EXCLUDED.open,
-                high = EXCLUDED.high,
-                low = EXCLUDED.low,
-                close = EXCLUDED.close,
-                volume = EXCLUDED.volume
-        """
-        params = (
-            symbol,
-            timestamp_ms,
-            float(latest['open']),
-            float(latest['high']),
-            float(latest['low']),
-            float(latest['close']),
-            float(latest['volume'])
-        )
-        execute_query(query, params)
-        logger.info(f"[Price Data] Inserted price data for {symbol}: {params}")
-    except Exception as e:
-        logger.error(f"[Price Data] Error inserting price data for {symbol}: {e}")
-
-def log_indicators_as_table(symbol, indicators, timestamp):
-    table_data = [
-        ["Timestamp", timestamp],
-        ["Symbol", symbol],
-        ["RSI", f"{indicators['RSI']:.2f}"],
-        ["MACD", f"{indicators['MACD']:.2f}"],
-        ["MACD_signal", f"{indicators['MACD_signal']:.2f}"],
-        ["MACD_hist", f"{indicators['MACD_hist']:.2f}"],
-        ["ADX", f"{indicators['ADX']:.2f}"],
-        ["EMA20", f"{indicators['EMA20']:.2f}"],
-        ["EMA50", f"{indicators['EMA50']:.2f}"],
-        ["ATR", f"{indicators['ATR']:.2f}"]
-    ]
-    logger.info("Indicators Table:\n%s", tabulate(table_data, headers=["Metric", "Value"], tablefmt="grid"))
 
 async def main():
     dataframes = {symbol: pd.DataFrame() for symbol in SYMBOLS}
@@ -377,7 +353,6 @@ async def main():
                                     return np.array([[0.5]])
                             models[symbol] = MockModel()
                         last_model_updates[symbol] = current_time
-                        send_telegram_alert(f"Model updated successfully for {symbol}.")
                         send_telegram_alert(f"Bingo ! Model updated successfully for {symbol}.")
                         lstm_input = prepare_lstm_input(dataframes[symbol])
                         pred = models[symbol].predict(lstm_input, verbose=0)[0][0]
@@ -431,7 +406,6 @@ async def main():
                             "price": float(candle_df["close"].iloc[-1]),
                             "timestamp": int(candle_df.index[-1].timestamp() * 1000)
                         }
-                        # Évite les doublons d'insertion de signaux
                         if not any(s["timestamp"] == signal_details["timestamp"] for s in getattr(main, "last_signals", [])):
                             insert_signal(signal_details)
                             if not hasattr(main, "last_signals"):
@@ -481,31 +455,13 @@ async def main():
                                     else:
                                         order_details[symbol]["pnl"] = 0.0
                                     insert_trade(order_details[symbol])
+                                    last_order_details[symbol] = order_details[symbol]
                                     record_trade_metric(order_details[symbol])
-                                    send_telegram_alert(f"Trade Closed: {action.upper()} {symbol} at {price}\nPNL: {order_details[symbol]['pnl']:.2f} USDT")
-                                    last_order_details[symbol] = None
+                                    send_telegram_alert(f"Trade closed: {action.upper()} {symbol} at {price}, PNL: {order_details[symbol]['pnl']}")
                                     current_positions[symbol] = None
-                                else:
-                                    logger.error(f"[Order] Failed to close {action} for {symbol}")
+                                    last_sl_order_ids[symbol] = None
                             except (TypeError, ValueError, IndexError) as e:
-                                logger.error(f"[Order] Error closing {action} for {symbol}: {e}")
-
-                        current_market_price = float(candle_df["close"].iloc[-1])
-                        current_atr = float(dataframes[symbol]["ATR"].iloc[-1]) if 'ATR' in dataframes[symbol].columns and not np.isnan(dataframes[symbol]["ATR"].iloc[-1]) else 0
-                        if current_positions[symbol] is not None and last_sl_order_ids[symbol] is not None:
-                            try:
-                                last_sl_order_ids[symbol] = update_trailing_stop(
-                                    client=client,
-                                    symbol=symbol,
-                                    signal=action,
-                                    current_price=current_market_price,
-                                    atr=current_atr,
-                                    base_qty=last_order_details[symbol]["quantity"] if last_order_details[symbol] else 0,
-                                    existing_sl_order_id=last_sl_order_ids[symbol]
-                                )
-                            except (TypeError, ValueError) as e:
-                                logger.error(f"[Trailing Stop] Error updating for {symbol}: {e}")
-                        dataframes[symbol] = dataframes[symbol].tail(200)
+                                logger.error(f"[Order] Error closing {action} order for {symbol}: {e}")
             except Exception as e:
                 logger.error(f"[Kafka] Exception while processing candle for {symbol}: {e}")
                 continue
@@ -522,13 +478,10 @@ if platform.system() == "Emscripten":
     asyncio.ensure_future(main())
 else:
     if __name__ == "__main__":
-        tracker_thread = threading.Thread(target=performance_tracker_loop, daemon=True)
-        tracker_thread.start()
-        try:
-            asyncio.run(main())
-        except KeyboardInterrupt:
-            logger.info("Script terminated by user")
-        except Exception as e:
-            logger.error(f"[Main] Unexpected error in main loop: {e}")
-            send_telegram_alert(f"Unexpected error: {str(e)}")
+        # Start performance tracker in a separate thread
+        performance_thread = threading.Thread(target=performance_tracker_loop, args=(client, SYMBOLS), daemon=True)
+        performance_thread.start()
+        
+        # Run main loop
+        asyncio.run(main())
 
