@@ -1,54 +1,13 @@
 ﻿import logging
-
-from logging.handlers import RotatingFileHandler
-
-import os
-
 import time
-
 import pandas as pd
 import numpy as np
-
 from src.database.db_handler import get_pending_training_data, update_training_outcome, clean_old_data, execute_query
 from tabulate import tabulate
-
-
-
-# Set up logging
-
-os.makedirs("logs", exist_ok=True)
-
-log_file = "logs/tracker.log"
-
-file_handler = RotatingFileHandler(log_file, maxBytes=1_000_000, backupCount=3, encoding="utf-8-sig")
-
-file_handler.setLevel(logging.INFO)
-
-file_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
-
-console_handler = logging.StreamHandler()
-
-console_handler.setLevel(logging.INFO)
-
-console_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
-
-
-
-logging.basicConfig(
-
-    level=logging.INFO,
-
-    handlers=[file_handler, console_handler],
-
-    encoding='utf-8'
-
-)
-
-
+import psycopg2.pool
+import eventlet
 
 logger = logging.getLogger(__name__)
-
-
 
 def calculate_market_direction(symbol, signal_ts):
     """
@@ -84,23 +43,18 @@ def calculate_market_direction(symbol, signal_ts):
         logger.debug(f"[Market Direction] Recent prices for {symbol}: {recent_prices}")
         logger.warning(f"[Market Direction] No future price data for {symbol} at {future_ts}")
         return None, None
+    except psycopg2.pool.PoolError as e:
+        logger.error(f"[Market Direction] Connection pool exhausted for {symbol} at {signal_ts}: {str(e)}")
+        return None, None
     except Exception as e:
         logger.error(f"[Market Direction] Error for {symbol} at {signal_ts}: {str(e)}")
         return None, None
 
-
-
 def should_retrain_model():
-
     """
-
     Determine if the model should be retrained.
-
     """
-
-    return False  # a implementer selon les critÃ¨res de retraining
-
-
+    return False  # À implémenter selon les critères de retraining
 
 def performance_tracker_loop(client, symbols):
     """
@@ -122,7 +76,11 @@ def performance_tracker_loop(client, symbols):
             current_time = time.time()
             if current_time - last_cleanup > cleanup_interval:
                 logger.info("[Tracker] Starting database cleanup")
-                clean_old_data(retention_days=30, trades_retention_days=90)
+                try:
+                    clean_old_data(retention_days=30, trades_retention_days=90)
+                    logger.info("[Tracker] Database cleanup completed")
+                except psycopg2.pool.PoolError as e:
+                    logger.error(f"[Tracker] Connection pool exhausted during cleanup: {str(e)}")
                 last_cleanup = current_time
 
             # Récupérer les enregistrements en attente
@@ -169,6 +127,8 @@ def performance_tracker_loop(client, symbols):
                     else:
                         logger.error(f"[Tracker] Insufficient data for {symbol} at {signal_ts}")
 
+                    # Pause pour réduire la pression sur le pool de connexions
+                    eventlet.sleep(0.1)
                 except Exception as e:
                     logger.error(f"[Tracker] Error processing record {record}: {str(e)}")
                     continue
@@ -186,19 +146,18 @@ def performance_tracker_loop(client, symbols):
                 logger.info("[Tracker] Starting model retraining...")
                 # À implémenter : logic for retraining the model
 
-            time.sleep(60)  # wait before next iteration
+            time.sleep(60)  # Wait before next iteration
 
+        except psycopg2.pool.PoolError as e:
+            logger.error(f"[Tracker] Connection pool exhausted in tracker loop: {str(e)}")
+            time.sleep(60)  # Wait before retrying
         except Exception as e:
             logger.error(f"[Tracker] Error in tracker loop: {str(e)}")
-            time.sleep(60)  # wait before retrying
-
-
+            time.sleep(60)  # Wait before retrying
 
 def log_performance_as_table(record_id, symbol, accuracy, processed_records):
     """
-
     Log performance metrics as a table.
-
     """
     table_data = [
         ["Record ID", record_id],
@@ -208,10 +167,6 @@ def log_performance_as_table(record_id, symbol, accuracy, processed_records):
     ]
     logger.info("Performance Tracker:\n%s", tabulate(table_data, headers=["Metric", "Value"], tablefmt="grid"))
 
-
-
 if __name__ == "__main__":
-
     logger.info("Starting [Tracker] performance tracker")
-
-    performance_tracker_loop()
+    performance_tracker_loop(None, [])  # Placeholder arguments for standalone testing

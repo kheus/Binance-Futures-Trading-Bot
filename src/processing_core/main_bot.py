@@ -30,6 +30,7 @@ import json
 from rich.console import Console
 from rich.table import Table
 from rich.logging import RichHandler
+import psycopg2.pool
 
 # Initialize rich console for enhanced logging
 console = Console()
@@ -110,7 +111,12 @@ order_manager = EnhancedOrderManager(client, SYMBOLS)
 
 # Synchronisation initiale des trades
 logger.info("[MainBot] Syncing Binance trades with PostgreSQL and internal tracker... 🚀")
-sync_binance_trades_with_postgres(client, SYMBOLS, ts_manager)
+try:
+    sync_binance_trades_with_postgres(client, SYMBOLS, ts_manager)
+except psycopg2.pool.PoolError as e:
+    logger.error(f"❌ [MainBot] Failed to sync trades due to connection pool exhaustion: {e}")
+    send_telegram_alert(f"Failed to sync trades: connection pool exhausted")
+    raise
 logger.info("[MainBot] Initial trade sync completed. ✅")
 
 # Initialize Kafka consumer
@@ -171,6 +177,9 @@ def handle_order_update(message):
                 
                 if not order_data['is_trailing']:
                     atr = get_current_atr(client, order_data['symbol'])
+                    if atr <= 0:
+                        logger.error(f"❌ [Trailing Stop] Invalid ATR for {order_data['symbol']}: {atr}")
+                        return
                     position_type = 'long' if order_data['side'] == 'buy' else 'short'
                     ts_manager.initialize_trailing_stop(
                         symbol=order_data['symbol'],
@@ -287,6 +296,10 @@ async def main():
             raise FileNotFoundError(f"Database schema file not found: {schema_path}")
         create_tables()
         logger.info("[Main] Database tables created successfully ✅")
+    except psycopg2.pool.PoolError as e:
+        logger.error(f"❌ [Main] Error creating database tables due to connection pool exhaustion: {e}")
+        send_telegram_alert(f"Error creating database tables: connection pool exhausted")
+        raise
     except Exception as e:
         logger.error(f"❌ [Main] Error creating database tables: {e}")
         raise
@@ -353,7 +366,11 @@ async def main():
             current_time = time.time()
             if current_time - last_sync_time >= sync_interval:
                 logger.info("[MainBot] Running periodic trade sync... 🚀")
-                sync_binance_trades_with_postgres(client, SYMBOLS, ts_manager)
+                try:
+                    sync_binance_trades_with_postgres(client, SYMBOLS, ts_manager)
+                except psycopg2.pool.PoolError as e:
+                    logger.error(f"❌ [MainBot] Failed to sync trades due to connection pool exhaustion: {e}")
+                    send_telegram_alert(f"Failed to sync trades: connection pool exhausted")
                 last_sync_time = current_time
 
             if iteration_count % 10 == 0:
@@ -464,21 +481,20 @@ async def main():
                         # Insérer le signal
                         timestamp = int(candle_df.index[-1].timestamp() * 1000)
                         trade_id = str(int(timestamp))
-                        insert_signal(symbol, action, timestamp, confidence)
-
-                        # Create a table for the signal
-                        table = Table(title=f"Signal Generated for {symbol}")
-                        table.add_column("Field", style="cyan")
-                        table.add_column("Value", style="magenta")
-                        table.add_row("Action", action)
-                        table.add_row("Timestamp", str(timestamp))
-                        table.add_row("Confidence", f"{confidence:.2f}")
-                        console.log(table)
+                        try:
+                            insert_signal(symbol, action, timestamp, confidence)
+                        except psycopg2.pool.PoolError as e:
+                            logger.error(f"❌ [Signal] Failed to insert signal for {symbol} due to connection pool exhaustion: {e}")
+                            send_telegram_alert(f"Failed to insert signal for {symbol}: connection pool exhausted")
+                            continue
 
                         if action in ["buy", "sell"]:
                             try:
                                 price = float(candle_df["close"].iloc[-1])
                                 atr = float(dataframes[symbol]["ATR"].iloc[-1]) if 'ATR' in dataframes[symbol].columns and not np.isnan(dataframes[symbol]["ATR"].iloc[-1]) else 0
+                                if atr <= 0:
+                                    logger.error(f"❌ [Order] Invalid ATR for {symbol}: {atr}")
+                                    continue
                                 order_details[symbol] = order_manager.place_enhanced_order(action, symbol, CAPITAL, LEVERAGE, trade_id)
                                 if order_details[symbol]:
                                     insert_trade(order_details[symbol])
@@ -509,13 +525,17 @@ async def main():
                                     console.log(table)
                                 else:
                                     logger.error(f"❌ [Order] Failed to place {action} order for {symbol}")
-                            except (TypeError, ValueError, IndexError) as e:
+                            except (TypeError, ValueError, IndexError, psycopg2.pool.PoolError) as e:
                                 logger.error(f"❌ [Order] Error placing {action} order for {symbol}: {e}")
+                                send_telegram_alert(f"Error placing {action} order for {symbol}: {str(e)}")
                         elif action in ["close_buy", "close_sell"]:
                             try:
                                 close_side = "sell" if action == "close_buy" else "buy"
                                 price = float(candle_df["close"].iloc[-1])
                                 atr = float(dataframes[symbol]["ATR"].iloc[-1]) if 'ATR' in dataframes[symbol].columns and not np.isnan(dataframes[symbol]["ATR"].iloc[-1]) else 0
+                                if atr <= 0:
+                                    logger.error(f"❌ [Order] Invalid ATR for {symbol}: {atr}")
+                                    continue
                                 order_details[symbol] = order_manager.place_enhanced_order(close_side, symbol, CAPITAL, LEVERAGE, trade_id)
                                 if order_details[symbol]:
                                     if last_order_details[symbol] and last_order_details[symbol].get("price"):
@@ -544,8 +564,9 @@ async def main():
                                     table.add_row("Price", f"{order_details[symbol].get('price', 0):.4f}")
                                     table.add_row("PNL", f"{order_details[symbol].get('pnl', 0):.2f}")
                                     console.log(table)
-                            except (TypeError, ValueError, IndexError) as e:
+                            except (TypeError, ValueError, IndexError, psycopg2.pool.PoolError) as e:
                                 logger.error(f"❌ [Order] Error closing {action} order for {symbol}: {e}")
+                                send_telegram_alert(f"Error closing {action} order for {symbol}: {str(e)}")
             except Exception as e:
                 logger.error(f"❌ [Kafka] Exception while processing candle for {symbol}: {e}")
                 continue

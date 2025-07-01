@@ -1,90 +1,83 @@
-﻿
-import logging
+﻿import logging
 import psycopg2
-import yaml
+from psycopg2 import pool
 from pathlib import Path
-from psycopg2.extras import RealDictCursor
-from contextlib import contextmanager
+import yaml
 import json
 import pandas as pd
 import time
 import os
 import decimal
 
-# Configuration du logging
-os.makedirs("logs", exist_ok=True)
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-file_handler = logging.FileHandler('logs/db_handler_postgres.log', encoding="utf-8-sig")
-file_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
-console_handler = logging.StreamHandler()
-console_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
-logger.addHandler(file_handler)
-logger.addHandler(console_handler)
 
-# Chargement de la configuration
-def load_config():
+# Load database configuration
+CONFIG_PATH = Path(__file__).parent.parent.parent / "config" / "db_config.yaml"
+with open(CONFIG_PATH, "r", encoding="utf-8-sig") as f:
+    config = yaml.safe_load(f)
+
+DB_CONFIG = config["database"]["postgresql"]
+HOST = DB_CONFIG["host"]
+DBNAME = DB_CONFIG["database"]
+USER = DB_CONFIG["user"]
+PASSWORD = DB_CONFIG["password"]
+PORT = DB_CONFIG.get("port", 5432)
+
+# Initialize connection pool with increased max connections
+try:
+    connection_pool = psycopg2.pool.ThreadedConnectionPool(
+        minconn=2,
+        maxconn=20,  # Augmenté pour gérer plus de connexions simultanées
+        host=HOST,
+        dbname=DBNAME,
+        user=USER,
+        password=PASSWORD,
+        port=PORT
+    )
+    logger.debug("[db_handler] Database connection pool initialized.")
+except Exception as e:
+    logger.error(f"[db_handler] Failed to initialize connection pool: {e}")
+    raise
+
+def get_db_connection():
     try:
-        config_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../config/db_config.yaml"))
-        with open(config_path, "r", encoding="utf-8-sig") as f:
-            return yaml.safe_load(f)
+        conn = connection_pool.getconn()
+        conn.set_client_encoding('UTF8')
+        logger.debug("[db_handler] Client encoding set to UTF8")
+        return conn
     except Exception as e:
-        logger.error(f"Erreur lecture db_config.yaml: {e}")
+        logger.error(f"[db_handler] Error getting database connection: {e}")
         raise
 
-config = load_config()
-postgres_conf = config['database']['postgresql']
+def release_db_connection(conn):
+    try:
+        connection_pool.putconn(conn)
+    except Exception as e:
+        logger.error(f"[db_handler] Error releasing database connection: {e}")
 
-@contextmanager
-def get_db_connection():
+def execute_query(query, params=None, fetch=False):
     conn = None
     try:
-        db_params = config["database"]["postgresql"]
-        logger.info(f"[DEBUG] Trying to connect to: host={db_params['host']} dbname={db_params['database']} user={db_params['user']}")
-        conn = psycopg2.connect(
-            dbname=db_params['database'],
-            user=db_params['user'],
-            password=db_params['password'],
-            host=db_params['host'],
-            port=db_params['port'],
-            connect_timeout=10
-        )
-        conn.set_client_encoding('UTF8')
-        
+        conn = get_db_connection()
         with conn.cursor() as cur:
-            cur.execute("SHOW client_encoding;")
-            encoding = cur.fetchone()[0]
-            logger.info(f"[DEBUG] Client encoding: {encoding}")
-            if encoding.lower() != 'utf8':
-                raise RuntimeError(f"Mauvais encodage PostgreSQL: {encoding}")
-        
-        yield conn
+            logger.debug(f"[execute_query] Executing query: {query[:100]}... with params: {params}")
+            cur.execute(query, params)
+            if fetch:
+                return cur.fetchall()
+            conn.commit()
     except psycopg2.Error as e:
-        logger.error(f"PostgreSQL connection error: {e.pgerror}, code: {e.pgcode}")
+        logger.error(f"PostgreSQL query execution error: {e.pgerror}, code: {e.pgcode}, query: {query[:100]}..., params: {params}")
+        if conn:
+            conn.rollback()
         raise
     except Exception as e:
-        logger.error(f"Unexpected connection error: {str(e)}, type: {type(e).__name__}")
+        logger.error(f"Unexpected query execution error: {str(e)}, type: {type(e).__name__}, query: {query[:100]}..., params: {params}")
+        if conn:
+            conn.rollback()
         raise
     finally:
         if conn:
-            conn.close()
-
-def execute_query(query, params=None, fetch=False):
-    with get_db_connection() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) if fetch else conn.cursor() as cur:
-            try:
-                logger.debug(f"[execute_query] Executing query: {query[:100]}... with params: {params}")
-                cur.execute(query, params)
-                if fetch:
-                    return cur.fetchall()
-                else:
-                    conn.commit()
-            except psycopg2.Error as e:
-                logger.error(f"PostgreSQL query execution error: {e.pgerror}, code: {e.pgcode}, query: {query[:100]}..., params: {params}")
-                raise
-            except Exception as e:
-                logger.error(f"Unexpected query execution error: {str(e)}, type: {type(e).__name__}, query: {query[:100]}..., params: {params}")
-                raise
+            release_db_connection(conn)
 
 def create_tables():
     try:
@@ -92,7 +85,8 @@ def create_tables():
         with open(schema_path, "r", encoding="utf-8-sig") as file:
             schema_sql = file.read()
         queries = [q.strip() for q in schema_sql.split(';') if q.strip()]
-        with get_db_connection() as conn:
+        conn = get_db_connection()
+        try:
             with conn.cursor() as cur:
                 for query in queries:
                     try:
@@ -101,7 +95,9 @@ def create_tables():
                         logger.error(f"Erreur lors de l'exécution de la requête : {query[:80]}... -> {e.pgerror}")
                         raise
             conn.commit()
-        logger.info("Tables created or verified successfully via schema.sql.")
+            logger.info("Tables created or verified successfully via schema.sql.")
+        finally:
+            release_db_connection(conn)
     except Exception as e:
         logger.error(f"Error reading or executing schema.sql: {e}")
         raise
@@ -117,67 +113,91 @@ def insert_or_update_order(order):
         INSERT INTO orders (order_id, symbol, side, quantity, price, status, timestamp)
         VALUES (%s, %s, %s, %s, %s, %s, to_timestamp(%s / 1000.0))
     """
-    with get_db_connection() as conn:
+    conn = None
+    try:
+        conn = get_db_connection()
         with conn.cursor() as cur:
-            try:
-                order_id_str = str(order['orderId']) if 'orderId' in order else str(order['order_id'])
-                cur.execute(query_check, (order_id_str,))
-                exists = cur.fetchone()
+            order_id_str = str(order['orderId']) if 'orderId' in order else str(order['order_id'])
+            cur.execute(query_check, (order_id_str,))
+            exists = cur.fetchone()
 
-                symbol = order.get('symbol')
-                side = order.get('side')
-                quantity = float(order.get('origQty', order.get('quantity', 0)))
-                price = float(order.get('price'))
-                status = order.get('status')
-                timestamp = int(order.get('time', order.get('timestamp', 0)))
+            symbol = order.get('symbol')
+            side = order.get('side')
+            quantity = float(order.get('origQty', order.get('quantity', 0)))
+            price = float(order.get('price'))
+            status = order.get('status')
+            timestamp = int(order.get('time', order.get('timestamp', 0)))
 
-                if exists:
-                    cur.execute(
-                        query_update,
-                        (
-                            symbol,
-                            side,
-                            quantity,
-                            price,
-                            status,
-                            timestamp,
-                            order_id_str
-                        )
-                    )
-                    logger.info(f"Order {order_id_str} for {symbol} updated in DB.")
-                else:
-                    cur.execute(
-                        query_insert,
-                        (
-                            order_id_str,
-                            symbol,
-                            side,
-                            quantity,
-                            price,
-                            status,
-                            timestamp
-                        )
-                    )
-                    logger.info(f"Order {order_id_str} for {symbol} inserted in DB.")
-                conn.commit()
-                return True
-            except Exception as e:
-                logger.error(f"Error inserting/updating order {order_id_str}: {str(e)}")
-                conn.rollback()
-                return False
+            if exists:
+                cur.execute(
+                    query_update,
+                    (symbol, side, quantity, price, status, timestamp, order_id_str)
+                )
+                logger.debug(f"Order {order_id_str} for {symbol} updated in DB.")
+            else:
+                cur.execute(
+                    query_insert,
+                    (order_id_str, symbol, side, quantity, price, status, timestamp)
+                )
+                logger.debug(f"Order {order_id_str} for {symbol} inserted in DB.")
+            conn.commit()
+            return True
+    except Exception as e:
+        logger.error(f"Error inserting/updating order {order_id_str}: {str(e)}")
+        if conn:
+            conn.rollback()
+        return False
+    finally:
+        if conn:
+            release_db_connection(conn)
 
-def insert_signal(symbol, signal_type, timestamp, confidence):
+def insert_trade(trade_data):
     query = """
-    INSERT INTO signals (symbol, signal_type, timestamp, confidence)
-    VALUES (%s, %s, %s, %s)
+    INSERT INTO trades (order_id, symbol, side, quantity, price, stop_loss, take_profit, timestamp, pnl, is_trailing, trade_id)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    ON CONFLICT (trade_id) DO UPDATE
+    SET order_id = EXCLUDED.order_id,
+        side = EXCLUDED.side,
+        quantity = EXCLUDED.quantity,
+        price = EXCLUDED.price,
+        stop_loss = EXCLUDED.stop_loss,
+        take_profit = EXCLUDED.take_profit,
+        timestamp = EXCLUDED.timestamp,
+        pnl = EXCLUDED.pnl,
+        is_trailing = EXCLUDED.is_trailing;
     """
     try:
-        execute_query(query, (symbol, signal_type, timestamp, confidence))
-        logger.info(f"Signal inserted for {symbol}: {signal_type} at {timestamp} with confidence {confidence}")
-        return True
+        execute_query(query, (
+            trade_data['order_id'],
+            trade_data['symbol'],
+            trade_data['side'],
+            trade_data['quantity'],
+            trade_data['price'],
+            trade_data.get('stop_loss'),
+            trade_data.get('take_profit'),
+            trade_data['timestamp'],
+            trade_data['pnl'],
+            trade_data['is_trailing'],
+            trade_data['trade_id']
+        ))
+        logger.info(f"[db_handler] Trade inserted for {trade_data['symbol']}: {trade_data['order_id']}")
     except Exception as e:
-        logger.error(f"Error inserting signal for {symbol}: {str(e)}")
-        return False
+        logger.error(f"[db_handler] Error inserting trade for {trade_data['symbol']}: {e}")
+        raise
+
+def insert_signal(symbol, action, timestamp, confidence):
+    query = """
+    INSERT INTO signals (symbol, action, timestamp, confidence)
+    VALUES (%s, %s, %s, %s)
+    ON CONFLICT (symbol, timestamp) DO UPDATE
+    SET action = EXCLUDED.action, confidence = EXCLUDED.confidence;
+    """
+    try:
+        execute_query(query, (symbol, action, timestamp, confidence))
+        logger.info(f"[db_handler] Signal inserted for {symbol}: {action} at {timestamp} with confidence {confidence:.2f}")
+    except Exception as e:
+        logger.error(f"[db_handler] Error inserting signal for {symbol}: {e}")
+        raise
 
 def insert_training_data(symbol, data, timestamp):
     query = """
@@ -217,30 +237,6 @@ def get_training_data_count(symbol):
     except Exception as e:
         logger.error(f"Error fetching training data count for {symbol}: {str(e)}")
         return 0
-
-def insert_trade(trade_data):
-    query = """
-    INSERT INTO trades (order_id, symbol, side, quantity, price, stop_loss, take_profit, timestamp, pnl, is_trailing)
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-    """
-    try:
-        execute_query(query, (
-            trade_data.get('order_id'),
-            trade_data.get('symbol'),
-            trade_data.get('side'),
-            trade_data.get('quantity'),
-            trade_data.get('price'),
-            trade_data.get('stop_loss'),
-            trade_data.get('take_profit'),
-            trade_data.get('timestamp'),
-            trade_data.get('pnl', 0.0),
-            trade_data.get('is_trailing', False)
-        ))
-        logger.info(f"Trade inserted for {trade_data.get('symbol')}: {trade_data.get('order_id')}")
-        return True
-    except Exception as e:
-        logger.error(f"Error inserting trade for {trade_data.get('order_id')}: {str(e)}")
-        return False
 
 def insert_metrics(symbol, metrics):
     query = """
@@ -445,41 +441,52 @@ def clean_old_data(retention_days=30, trades_retention_days=90):
         "signals": True,
         "training_data": True,
         "trades": True,
-        "price_data": False  # Correction : price_data utilise TIMESTAMP
+        "price_data": False
     }
+    conn = None
     try:
-        for table in tables:
-            if timestamp_is_bigint.get(table, True):
-                query = f"DELETE FROM {table} WHERE timestamp < %s"
-            else:
-                query = f"DELETE FROM {table} WHERE timestamp < to_timestamp(%s / 1000.0)"
-            execute_query(query, (current_time - retention_ms,))
-            logger.info(f"[DB Cleanup] Deleted rows from {table}")
-        query = "DELETE FROM trades WHERE timestamp < %s"
-        with get_db_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(query, (current_time - trades_retention_ms,))
-                deleted = cur.rowcount
-                conn.commit()
-        logger.info(f"[DB Cleanup] {deleted} rows deleted from trades")
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            for table in tables:
+                if timestamp_is_bigint.get(table, True):
+                    query = f"DELETE FROM {table} WHERE timestamp < %s"
+                else:
+                    query = f"DELETE FROM {table} WHERE timestamp < to_timestamp(%s / 1000.0)"
+                cur.execute(query, (current_time - retention_ms,))
+                logger.info(f"[DB Cleanup] Deleted rows from {table}")
+            query = "DELETE FROM trades WHERE timestamp < %s"
+            cur.execute(query, (current_time - trades_retention_ms,))
+            deleted = cur.rowcount
+            logger.info(f"[DB Cleanup] {deleted} rows deleted from trades")
+            conn.commit()
     except Exception as e:
         logger.error(f"Failed to clean old data: {e}")
+        if conn:
+            conn.rollback()
         raise
+    finally:
+        if conn:
+            release_db_connection(conn)
 
 def test_connection():
+    conn = None
     try:
-        with get_db_connection() as conn:
-            logger.info("Successful connection to PostgreSQL.")
-            print("Successful connection to PostgreSQL.")
+        conn = get_db_connection()
+        logger.info("Successful connection to PostgreSQL.")
+        print("Successful connection to PostgreSQL.")
     except Exception as e:
         logger.error(f"Failed to connect to PostgreSQL: {e}")
         print(f"Failed to connect to PostgreSQL: {e}")
+    finally:
+        if conn:
+            release_db_connection(conn)
 
 def get_latest_prices():
     query = "SELECT symbol, close AS price, timestamp FROM price_data ORDER BY timestamp DESC LIMIT 100"
+    conn = None
     try:
-        with get_db_connection() as conn:
-            df = pd.read_sql_query(query, conn)
+        conn = get_db_connection()
+        df = pd.read_sql_query(query, conn)
         for col in df.columns:
             if df[col].dtype == 'object':
                 df[col] = df[col].apply(lambda x: float(x) if isinstance(x, decimal.Decimal) else x)
@@ -487,6 +494,9 @@ def get_latest_prices():
     except Exception as e:
         logger.error(f"Failed to fetch latest prices: {e}")
         raise
+    finally:
+        if conn:
+            release_db_connection(conn)
 
 def insert_order_if_missing(order):
     query_check = "SELECT 1 FROM orders WHERE order_id = %s AND symbol = %s"
@@ -494,31 +504,35 @@ def insert_order_if_missing(order):
     INSERT INTO orders (order_id, symbol, side, quantity, price, timestamp, status)
     VALUES (%s, %s, %s, %s, %s, to_timestamp(%s / 1000.0), %s)
     """
-    params_check = (str(order['order_id']), str(order['symbol']))
-    params_insert = (
-        str(order['order_id']),
-        str(order['symbol']),
-        str(order['side']),
-        float(order['quantity']),
-        float(order['price']),
-        int(order['timestamp']),
-        str(order['status'])
-    )
+    conn = None
     try:
-        with get_db_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(query_check, params_check)
-                exists = cur.fetchone()
-                if exists:
-                    logger.info(f"Order {order['order_id']} for {order['symbol']} already exists in DB.")
-                    return False
-                cur.execute(query_insert, params_insert)
-                conn.commit()
-                logger.info(f"Order {order['order_id']} for {order['symbol']} inserted in DB.")
-                return True
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            params_check = (str(order['order_id']), str(order['symbol']))
+            cur.execute(query_check, params_check)
+            exists = cur.fetchone()
+            if exists:
+                logger.debug(f"Order {order['order_id']} for {order['symbol']} already exists in DB.")
+                return False
+            params_insert = (
+                str(order['order_id']),
+                str(order['symbol']),
+                str(order['side']),
+                float(order['quantity']),
+                float(order['price']),
+                int(order['timestamp']),
+                str(order['status'])
+            )
+            cur.execute(query_insert, params_insert)
+            conn.commit()
+            logger.debug(f"Order {order['order_id']} for {order['symbol']} inserted in DB.")
+            return True
     except Exception as e:
         logger.error(f"Failed to insert order {order['order_id']} for {order['symbol']}: {e}")
         return False
+    finally:
+        if conn:
+            release_db_connection(conn)
 
 def sync_orders_with_db(client, symbol_list):
     try:
@@ -544,11 +558,8 @@ def sync_orders_with_db(client, symbol_list):
 
         synced_count = 0
         for order in all_orders:
-            try:
-                if insert_order_if_missing(order):
-                    synced_count += 1
-            except Exception as e:
-                logger.error(f"DB insert failed for {order['order_id']}: {str(e)}")
+            if insert_order_if_missing(order):
+                synced_count += 1
 
         logger.info(f"Orders sync completed. Total: {len(all_orders)}, New: {synced_count}")
         return synced_count

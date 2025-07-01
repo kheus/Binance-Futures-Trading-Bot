@@ -3,6 +3,7 @@
     from binance.enums import SIDE_BUY, SIDE_SELL, ORDER_TYPE_MARKET
     from src.trade_execution.correlation_monitor import CorrelationMonitor
     from src.trade_execution.trade_analyzer import TradeAnalyzer
+    from src.monitoring.metrics import get_current_atr
     from src.trade_execution.ultra_aggressive_trailing import TrailingStopManager, get_average_fill_price
 except ImportError:
     SIDE_BUY = 'BUY'
@@ -301,84 +302,72 @@ def track_order_locally(order):
         logger.error(f"Invalid order format - missing key {e}")
 
 class EnhancedOrderManager:
-    def __init__(self, client, symbols):
+    def __init__(self, client: UMFutures, symbols):
         self.client = client
-        self.ts_manager = TrailingStopManager(client)
-        self.crash_protector = MarketCrashProtector()
-        self.correlation_monitor = CorrelationMonitor(symbols)
-        self.trade_analyzer = TradeAnalyzer()
+        self.symbols = symbols
 
     def get_current_price(self, symbol):
         try:
             ticker = self.client.ticker_price(symbol=symbol)
-            price = float(ticker['price'])
-            return price
+            return float(ticker['price'])
         except Exception as e:
-            logger.error(f"[EnhancedOrderManager] Failed to get current price for {symbol}: {e}")
+            logger.error(f"[EnhancedOrderManager] Failed to get price for {symbol}: {e}")
             return None
 
-    def is_overexposed(self, symbol, corr_matrix):
+    def check_margin(self, symbol, quantity, price, leverage):
         try:
-            if corr_matrix is None or symbol not in corr_matrix.index:
+            account_info = self.client.account()
+            balance = float(account_info['availableBalance'])
+            required_margin = (quantity * price) / leverage
+            if balance < required_margin:
+                logger.error(f"[Margin Check] Insufficient margin for {symbol}: available={balance}, required={required_margin}")
                 return False
-            high_corr = corr_matrix[symbol][corr_matrix[symbol] > 0.8].index.tolist()
-            if len(high_corr) > 2:  # More than 2 highly correlated symbols
-                logger.warning(f"[EnhancedOrderManager] Overexposure risk for {symbol} with {high_corr}")
-                return True
-            return False
+            return True
         except Exception as e:
-            logger.error(f"[EnhancedOrderManager] Error checking exposure for {symbol}: {e}")
+            logger.error(f"[Margin Check] Error for {symbol}: {e}")
             return False
 
-    def dynamic_position_sizing(self, symbol, capital):
+    def place_enhanced_order(self, action, symbol, capital, leverage, trade_id):
         try:
-            price = self.get_current_price(symbol)
-            if price is None or price == 0:
-                logger.error(f"[EnhancedOrderManager] Invalid price for {symbol}")
-                return 0
-            return capital / price
-        except Exception as e:
-            logger.error(f"[EnhancedOrderManager] Error calculating position size for {symbol}: {e}")
-            return 0
+            atr = get_current_atr(self.client, symbol)
+            if atr is None or atr <= 0:
+                logger.error(f"[EnhancedOrderManager] Failed to calculate ATR for {symbol}: {atr}")
+                return None
 
-    def place_enhanced_order(self, signal, symbol, capital, leverage, trade_id=None):
-        try:
-            corr_matrix = self.correlation_monitor.get_correlation_matrix()
-            if self.is_overexposed(symbol, corr_matrix):
-                logger.warning(f"[EnhancedOrderManager] Skipping order for {symbol} due to overexposure")
-                return None
-            atr = self.get_current_atr(symbol)
             price = self.get_current_price(symbol)
-            if price is None or atr is None:
-                logger.error(f"[EnhancedOrderManager] Invalid price or ATR for {symbol}")
+            if not price:
+                logger.error(f"[EnhancedOrderManager] Failed to get current price for {symbol}")
                 return None
-            quantity = self.dynamic_position_sizing(symbol, capital)
-            order = place_order(signal, price, atr, self.client, symbol, quantity, leverage, trade_id)
-            if order:
-                self.crash_protector.check_market_crash(symbol, price)
-                place_scaled_take_profits(self.client, symbol, order["price"], order["quantity"], signal, atr, self.ts_manager, trade_id)
-                self.trade_analyzer.add_trade(order)
-                logger.info(f"[EnhancedOrderManager] Placed enhanced order for {symbol}: {order}")
-            return order
+
+            # Calculer la quantité en fonction du capital et du levier
+            quantity = (capital * leverage) / price
+            if not self.check_margin(symbol, quantity, price, leverage):
+                logger.error(f"[EnhancedOrderManager] Cancellation - margin problem for {symbol}")
+                return None
+
+            side = 'BUY' if action == 'buy' else 'SELL'
+            order = self.client.new_order(
+                symbol=symbol,
+                side=side,
+                type='MARKET',
+                quantity=quantity,
+                newClientOrderId=f"trade_{trade_id}"
+            )
+            order_data = {
+                'order_id': str(order['orderId']),
+                'symbol': symbol,
+                'side': action,
+                'quantity': quantity,
+                'price': price,
+                'timestamp': int(order.get('updateTime', order.get('transactTime', 0))),
+                'status': order['status'].lower(),
+                'trade_id': trade_id
+            }
+            logger.info(f"[EnhancedOrderManager] Order placed for {symbol}: {order_data['order_id']}")
+            return order_data
         except Exception as e:
-            logger.error(f"[EnhancedOrderManager] Error placing enhanced order for {symbol}: {e}")
+            logger.error(f"[EnhancedOrderManager] Failed to place {action} order for {symbol}: {e}")
             return None
-
-    def get_current_atr(self, symbol):
-        try:
-            klines = self.client.klines(symbol=symbol, interval='1h', limit=14)
-            if len(klines) < 14:
-                logger.warning(f"Insufficient data for ATR calculation for {symbol}: {len(klines)}")
-                return 0.0
-            df = pd.DataFrame(klines, columns=["open_time", "open", "high", "low", "close", "volume",
-                                              "close_time", "quote_asset_vol", "num_trades", "taker_buy_base_vol",
-                                              "taker_buy_quote_vol", "ignore"])
-            df = df[["high", "low", "close"]].astype(float)
-            atr = talib.ATR(df["high"], df["low"], df["close"], timeperiod=14)[-1]
-            return float(atr) if not pd.isna(atr) else 0.0
-        except Exception as e:
-            logger.error(f"[EnhancedOrderManager] Failed to calculate ATR for {symbol}: {e}")
-            return 0.0
 
 def wait_until_order_finalized(client, symbol, order_id, max_retries=5, sleep_seconds=1):
     for _ in range(max_retries):
