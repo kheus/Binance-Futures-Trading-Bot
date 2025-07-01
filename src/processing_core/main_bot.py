@@ -82,6 +82,7 @@ CAPITAL = binance_config["capital"]
 LEVERAGE = binance_config["leverage"]
 KAFKA_BOOTSTRAP = kafka_config["kafka"]["bootstrap_servers"]
 MODEL_UPDATE_INTERVAL = 900  # 15 minutes
+METRICS_UPDATE_INTERVAL = 300  # 5 minutes
 
 # Initialize Binance client
 try:
@@ -191,7 +192,7 @@ def calculate_indicators(df, symbol):
         logger.info(f"Skipping indicator calculation for {symbol} due to insufficient data")
         return df
 
-    df = df.dropna(subset=['open', 'high', 'low', 'close', 'volume'])
+    df = df.dropna(subset=['open', 'high', 'low', 'close', 'volume']).copy()
     if len(df) < 50:
         logger.warning(f"Data cleaned, insufficient rows for {symbol}: {len(df)}")
         return df
@@ -204,9 +205,14 @@ def calculate_indicators(df, symbol):
         df['EMA50'] = talib.EMA(df['close'], timeperiod=50)
         df['ATR'] = talib.ATR(df['high'], df['low'], df['close'], timeperiod=14)
 
+        # Remplir les NaN avec la méthode forward fill, puis backward fill
         required_cols = ['RSI', 'MACD', 'MACD_signal', 'MACD_hist', 'ADX', 'EMA20', 'EMA50', 'ATR']
-        df[required_cols] = df[required_cols].ffill().bfill().interpolate()
+        df[required_cols] = df[required_cols].ffill().bfill()
 
+        # Vérifier si des NaN persistent
+        if df[required_cols].isna().any().any():
+            logger.warning(f"[Indicators] NaN values persist in indicators for {symbol} after filling")
+        
         metrics = {
             "symbol": symbol,
             "timestamp": int(df.index[-1].timestamp() * 1000),
@@ -238,7 +244,6 @@ async def main():
     last_sync_time = time.time()
     sync_interval = 300  # 5 minutes
     last_metrics_update = {symbol: 0 for symbol in SYMBOLS}
-    metrics_update_interval = 300  # 5 minutes
 
     try:
         logger.info("[Main] Creating database tables")
@@ -317,10 +322,6 @@ async def main():
                 sync_binance_trades_with_postgres(client, SYMBOLS, ts_manager)
                 last_sync_time = current_time
 
-            if current_time - last_metrics_update[symbol] >= metrics_update_interval:
-                dataframes[symbol] = calculate_indicators(dataframes[symbol], symbol)
-                last_metrics_update[symbol] = current_time
-
             if iteration_count % 10 == 0:
                 logger.info("[Main Loop] Starting iteration")
             iteration_count += 1
@@ -357,23 +358,36 @@ async def main():
             try:
                 candle_data = json.loads(msg.value().decode("utf-8")) if msg.value() else None
                 if not candle_data or not isinstance(candle_data, dict):
-                    logger.error(f"[Kafka] Invalid candle data for topic {msg.topic()}: {candle_data}")
-                    continue
+                   logger.error(f"[Kafka] Invalid candle data for topic {msg.topic()}: {candle_data}")
+                   continue
                 topic = msg.topic()
                 symbol = next((s for s in SYMBOLS if f"{s}_candle" in topic), None)
                 if not symbol or symbol not in dataframes:
-                    logger.error(f"[Kafka] Invalid symbol for topic {topic}")
+                   logger.error(f"[Kafka] Invalid symbol for topic {topic}")
+                   continue
+
+                # Validation des clés Kafka
+                required_keys = ['T', 'o', 'h', 'l', 'c', 'v']
+                alt_required_keys = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
+                if not all(key in candle_data for key in required_keys) and not all(key in candle_data for key in alt_required_keys):
+                    logger.error(f"[Kafka] Missing required keys in candle data for {symbol}: {candle_data}")
                     continue
 
                 candle_df = format_candle(candle_data, symbol)
                 if candle_df.empty or "close" not in candle_df.columns:
                     logger.error(f"[Kafka] Invalid or empty candle data for {symbol}: {candle_data}")
                     continue
-
+                if not isinstance(candle_df.index, pd.DatetimeIndex):
+                    logger.error(f"[Kafka] candle_df index is not a DatetimeIndex for {symbol}: {type(candle_df.index)}")
+                    continue
                 insert_price_data(candle_df, symbol)
-                candle_df.set_index("timestamp", inplace=True)
                 dataframes[symbol] = pd.concat([dataframes[symbol], candle_df], ignore_index=False)
-                dataframes[symbol] = calculate_indicators(dataframes[symbol], symbol)
+
+                # Calculer les indicateurs immédiatement après une nouvelle bougie si les données sont suffisantes
+                if len(dataframes[symbol]) >= 50:
+                    dataframes[symbol] = calculate_indicators(dataframes[symbol], symbol)
+                    last_metrics_update[symbol] = current_time
+
                 if len(dataframes[symbol]) >= 101:
                     action, new_position = check_signal(
                         dataframes[symbol],
@@ -389,14 +403,34 @@ async def main():
                     last_action_sent[symbol] = action
 
                     if action in ["buy", "sell", "close_buy", "close_sell"]:
-                        signal_details = {
-                            "symbol": symbol,
-                            "signal_type": action,
-                            "price": float(candle_df["close"].iloc[-1]),
-                            "timestamp": int(candle_df.index[-1].timestamp() * 1000)
-                        }
-                        insert_signal(signal_details)
-                        logger.info(f"[Signal] Stored signal details for {symbol}: {signal_details}")
+                        # Calculer la confiance (similaire à signal_generator.py)
+                        rsi = dataframes[symbol]['RSI'].iloc[-1]
+                        macd = dataframes[symbol]['MACD'].iloc[-1]
+                        signal_line = dataframes[symbol]['MACD_signal'].iloc[-1]
+                        ema20 = dataframes[symbol]['EMA20'].iloc[-1]
+                        ema50 = dataframes[symbol]['EMA50'].iloc[-1]
+                        atr = dataframes[symbol]['ATR'].iloc[-1]
+                        close = dataframes[symbol]['close'].iloc[-1]
+                        roc = talib.ROC(dataframes[symbol]['close'], timeperiod=5).iloc[-1] * 100
+                        lstm_input = prepare_lstm_input(dataframes[symbol])
+                        prediction = models[symbol].predict(lstm_input, verbose=0)[0][0]
+                        trend_up = ema20 > ema50
+                        trend_down = ema20 < ema50
+                        breakout_up = close > (dataframes[symbol]['high'].rolling(window=20).max().iloc[-1] - 0.2 * atr) if len(dataframes[symbol]) >= 20 else False
+                        breakout_down = close < (dataframes[symbol]['low'].rolling(window=20).min().iloc[-1] + 0.2 * atr) if len(dataframes[symbol]) >= 20 else False
+                        confidence = len([f for f in [
+                            prediction > 0.55 or prediction < 0.45,
+                            (trend_up and macd > signal_line) or (trend_down and macd < signal_line),
+                            rsi > 50 or rsi < 50,
+                            (trend_up and ema20 > ema50) or (trend_down and ema20 < ema50),
+                            abs(roc) > 0.5,
+                            breakout_up or breakout_down
+                        ] if f]) / 6.0
+                        
+                        # Insérer le signal
+                        timestamp = int(candle_df.index[-1].timestamp() * 1000)
+                        insert_signal(symbol, action, timestamp, confidence)
+                        logger.info(f"[Signal] Stored signal for {symbol}: {action} at {timestamp} with confidence {confidence:.2f}")
 
                         if action in ["buy", "sell"]:
                             try:

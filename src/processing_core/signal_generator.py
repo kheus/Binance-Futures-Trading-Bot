@@ -5,7 +5,8 @@ import talib
 import time
 from datetime import datetime, timedelta
 from src.database.db_handler import insert_signal, insert_training_data, get_future_prices, get_training_data_count
-from src.monitoring.alerting import send_telegram_alert
+from monitoring.alerting import send_telegram_alert
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -169,30 +170,24 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
                 }
             }
             training_record["check_timestamp"] = int((datetime.now() + timedelta(minutes=5)).timestamp() * 1000)
-            insert_training_data(training_record)
-            logger.info(f"[Performance Tracking] Stored training data for {symbol} signal")
+            insert_training_data(symbol, json.dumps(training_record), signal_timestamp)
+            logger.info(f"[Performance Tracking] Stored training data for {symbol} at {signal_timestamp}")
             check_time = datetime.now() + timedelta(minutes=5)
             logger.info(f"[Performance Tracking] Will verify market direction at {check_time.strftime('%H:%M')}")
         except Exception as e:
             logger.error(f"[Performance Tracking] Error storing training data: {e}")
 
     if action != "None":
-        signal_details = {
-            "symbol": symbol,
-            "signal_type": action.lower(),
-            "price": float(close),
-            "timestamp": signal_timestamp,
-            "quantity": 0.0,
-            "indicators": {
-                "rsi": round(rsi, 2),
-                "macd": round(macd, 4),
-                "adx": round(adx, 2),
-                "roc": round(roc, 2),
-                "strategy": strategy_mode
-            }
-        }
-        insert_signal(signal_details)
-        logger.info(f"[Signal Stored] {action} at {close} for {symbol}")
+        confidence = len([f for f in [
+            prediction > 0.55 or prediction < 0.45,
+            (trend_up and macd > signal_line) or (trend_down and macd < signal_line),
+            rsi > 50 or rsi < 50,
+            (trend_up and ema20 > ema50) or (trend_down and ema20 < ema50),
+            abs(roc) > 0.5,
+            breakout_up or breakout_down
+        ] if f]) / 6.0
+        insert_signal(symbol, action.lower(), signal_timestamp, confidence)
+        logger.info(f"[Signal Stored] {action} at {close} for {symbol} with confidence {confidence:.2f}")
 
     confidence_factors = []
     if prediction > 0.55 or prediction < 0.45:

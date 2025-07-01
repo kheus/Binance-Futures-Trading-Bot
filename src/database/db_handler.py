@@ -1,4 +1,5 @@
-﻿import logging
+﻿
+import logging
 import psycopg2
 import yaml
 from pathlib import Path
@@ -50,7 +51,6 @@ def get_db_connection():
         )
         conn.set_client_encoding('UTF8')
         
-        # Test de validation d'encodage
         with conn.cursor() as cur:
             cur.execute("SHOW client_encoding;")
             encoding = cur.fetchone()[0]
@@ -107,10 +107,6 @@ def create_tables():
         raise
 
 def insert_or_update_order(order):
-    """
-    Insère ou met à jour un ordre dans la table orders.
-    Gère explicitement les conversions de types pour éviter les erreurs de clé primaire ou de type.
-    """
     query_check = "SELECT order_id FROM orders WHERE order_id = %s"
     query_update = """
         UPDATE orders
@@ -189,7 +185,7 @@ def insert_training_data(symbol, data, timestamp):
     VALUES (%s, %s, %s)
     """
     try:
-        execute_query(query, (symbol, str(data), timestamp))
+        execute_query(query, (symbol, json.dumps(data), timestamp))
         logger.info(f"Training data inserted for {symbol} at {timestamp}")
         return True
     except Exception as e:
@@ -198,7 +194,8 @@ def insert_training_data(symbol, data, timestamp):
 
 def get_future_prices(symbol, limit=10):
     query = """
-    SELECT price, timestamp FROM price_history
+    SELECT timestamp, open, high, low, close, volume
+    FROM price_data
     WHERE symbol = %s
     ORDER BY timestamp DESC
     LIMIT %s
@@ -244,14 +241,12 @@ def insert_trade(trade_data):
     except Exception as e:
         logger.error(f"Error inserting trade for {trade_data.get('order_id')}: {str(e)}")
         return False
-    except Exception as e:
-        logger.error(f"Error inserting trade for {trade_data.get('order_id')}: {str(e)}")
-        return False
 
 def insert_metrics(symbol, metrics):
     query = """
     INSERT INTO metrics (symbol, timestamp, rsi, macd, adx, ema20, ema50, atr)
     VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+    ON CONFLICT (symbol, timestamp) DO NOTHING
     """
     try:
         execute_query(query, (
@@ -264,27 +259,56 @@ def insert_metrics(symbol, metrics):
             metrics.get('ema50'),
             metrics.get('atr')
         ))
-        logger.info(f"Metrics inserted for {symbol} at {metrics.get('timestamp')}")
+        logger.info(f"Metrics inserted or skipped (if duplicate) for {symbol} at {metrics.get('timestamp')}")
         return True
     except Exception as e:
         logger.error(f"Error inserting metrics for {symbol}: {str(e)}")
         return False
 
 def insert_price_data(price_data, symbol):
-    query = """
-    INSERT INTO price_history (symbol, price, timestamp)
-    VALUES (%s, %s, %s)
+    """
+    Insère les données de prix dans la table price_data.
+    Valide que price_data est un DataFrame valide avec les colonnes nécessaires.
     """
     try:
+        # Vérifier que price_data est un DataFrame
+        if not isinstance(price_data, pd.DataFrame):
+            logger.error(f"[insert_price_data] price_data is not a DataFrame for {symbol}: {type(price_data)}, data: {price_data}")
+            return False
+
+        # Vérifier les colonnes nécessaires
+        required_columns = ['open', 'high', 'low', 'close', 'volume']
+        if not all(col in price_data.columns for col in required_columns):
+            logger.error(f"[insert_price_data] Missing required columns in price_data for {symbol}: {price_data.columns}, data: {price_data}")
+            return False
+
+        # Vérifier que l'index est un DatetimeIndex
+        if not isinstance(price_data.index, pd.DatetimeIndex):
+            logger.error(f"[insert_price_data] price_data index is not a DatetimeIndex for {symbol}: {type(price_data.index)}, data: {price_data}")
+            return False
+
+        # Vérifier que le DataFrame n'est pas vide
+        if price_data.empty:
+            logger.error(f"[insert_price_data] Empty price_data for {symbol}, data: {price_data}")
+            return False
+
+        query = """
+        INSERT INTO price_data (symbol, timestamp, open, high, low, close, volume)
+        VALUES (%s, to_timestamp(%s / 1000.0), %s, %s, %s, %s, %s)
+        """
         execute_query(query, (
             symbol,
-            price_data['close'].iloc[-1],
-            int(price_data.index[-1].timestamp() * 1000)
+            int(price_data.index[-1].timestamp() * 1000),  # Timestamp en millisecondes
+            float(price_data['open'].iloc[-1]),
+            float(price_data['high'].iloc[-1]),
+            float(price_data['low'].iloc[-1]),
+            float(price_data['close'].iloc[-1]),
+            float(price_data['volume'].iloc[-1])
         ))
         logger.info(f"Price data inserted for {symbol} at {int(price_data.index[-1].timestamp() * 1000)}")
         return True
     except Exception as e:
-        logger.error(f"Error inserting price data for {symbol}: {str(e)}")
+        logger.error(f"Error inserting price data for {symbol}: {str(e)}, data: {price_data}")
         return False
 
 def get_trades():
@@ -421,7 +445,7 @@ def clean_old_data(retention_days=30, trades_retention_days=90):
         "signals": True,
         "training_data": True,
         "trades": True,
-        "price_data": False
+        "price_data": False  # Correction : price_data utilise TIMESTAMP
     }
     try:
         for table in tables:
@@ -456,7 +480,6 @@ def get_latest_prices():
     try:
         with get_db_connection() as conn:
             df = pd.read_sql_query(query, conn)
-        # Convertir les Decimal en float
         for col in df.columns:
             if df[col].dtype == 'object':
                 df[col] = df[col].apply(lambda x: float(x) if isinstance(x, decimal.Decimal) else x)
@@ -466,10 +489,6 @@ def get_latest_prices():
         raise
 
 def insert_order_if_missing(order):
-    """
-    Insère un ordre dans la table orders s'il n'existe pas déjà (par order_id et symbol).
-    Retourne True si inséré, False si déjà présent.
-    """
     query_check = "SELECT 1 FROM orders WHERE order_id = %s AND symbol = %s"
     query_insert = """
     INSERT INTO orders (order_id, symbol, side, quantity, price, timestamp, status)
@@ -487,13 +506,13 @@ def insert_order_if_missing(order):
     )
     try:
         with get_db_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(query_check, params_check)
-                exists = cursor.fetchone()
+            with conn.cursor() as cur:
+                cur.execute(query_check, params_check)
+                exists = cur.fetchone()
                 if exists:
                     logger.info(f"Order {order['order_id']} for {order['symbol']} already exists in DB.")
                     return False
-                cursor.execute(query_insert, params_insert)
+                cur.execute(query_insert, params_insert)
                 conn.commit()
                 logger.info(f"Order {order['order_id']} for {order['symbol']} inserted in DB.")
                 return True
@@ -502,9 +521,6 @@ def insert_order_if_missing(order):
         return False
 
 def sync_orders_with_db(client, symbol_list):
-    """
-    Synchronise les ordres de Binance avec la base de données.
-    """
     try:
         create_tables()
         all_orders = []
@@ -541,10 +557,8 @@ def sync_orders_with_db(client, symbol_list):
         return 0
 
 def _validate_timestamp(ts):
-    """Valide et convertit un timestamp en millisecondes"""
     try:
-        ts = int(float(ts))  # Double conversion pour sécurité
-        # Plage de validation raisonnable (années 2000-2100)
+        ts = int(float(ts))
         if ts < 946684800000 or ts > 4102444800000:
             raise ValueError(f"Timestamp {ts} hors plage valide")
         return ts

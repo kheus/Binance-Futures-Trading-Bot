@@ -1,8 +1,7 @@
 ﻿-- Suppression et recréation de la table metrics
-DROP TABLE IF EXISTS metrics;
-CREATE TABLE metrics (
-    symbol TEXT NOT NULL,
-    timestamp BIGINT NOT NULL,
+CREATE TABLE IF NOT EXISTS metrics (
+    symbol VARCHAR(50),
+    timestamp BIGINT,
     rsi DOUBLE PRECISION,
     macd DOUBLE PRECISION,
     adx DOUBLE PRECISION,
@@ -36,15 +35,14 @@ CREATE TABLE IF NOT EXISTS trades (
     is_trailing BOOLEAN
 );
 CREATE TABLE IF NOT EXISTS price_data (
-    id SERIAL PRIMARY KEY,
-    symbol VARCHAR(20),
-    timestamp TIMESTAMP,
-    open DECIMAL,
-    high DECIMAL,
-    low DECIMAL,
-    close DECIMAL,
-    volume DECIMAL,
-    UNIQUE (symbol, timestamp)
+    symbol VARCHAR(50),
+    timestamp BIGINT,
+    open DOUBLE PRECISION,
+    high DOUBLE PRECISION,
+    low DOUBLE PRECISION,
+    close DOUBLE PRECISION,
+    volume DOUBLE PRECISION,
+    PRIMARY KEY (symbol, timestamp)
 );
 CREATE TABLE IF NOT EXISTS metrics (
     id SERIAL PRIMARY KEY,
@@ -59,11 +57,10 @@ CREATE TABLE IF NOT EXISTS metrics (
 );
 CREATE TABLE IF NOT EXISTS signals (
     id SERIAL PRIMARY KEY,
-    symbol VARCHAR(20),
-    signal_type VARCHAR(20),
-    price DECIMAL,
-    quantity DECIMAL,
-    timestamp BIGINT
+    symbol VARCHAR(50),
+    signal_type VARCHAR(50),
+    timestamp BIGINT,
+    confidence DOUBLE PRECISION
 );
 CREATE TABLE IF NOT EXISTS training_data (
     id SERIAL PRIMARY KEY,
@@ -81,10 +78,10 @@ CREATE TABLE IF NOT EXISTS training_data (
 );
 
 CREATE TABLE IF NOT EXISTS price_history (
-    id SERIAL PRIMARY KEY,
-    symbol VARCHAR(20),
-    price DECIMAL,
-    timestamp BIGINT
+    symbol VARCHAR(50),
+    price DOUBLE PRECISION,
+    timestamp BIGINT,
+    PRIMARY KEY (symbol, timestamp)
 );
 
 CREATE INDEX IF NOT EXISTS idx_orders_order_id ON orders(order_id);
