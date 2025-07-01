@@ -27,6 +27,12 @@ import threading
 import io
 import platform
 import json
+from rich.console import Console
+from rich.table import Table
+from rich.logging import RichHandler
+
+# Initialize rich console for enhanced logging
+console = Console()
 
 # Force UTF-8 encoding
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8-sig")
@@ -40,7 +46,7 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - [%(name)s] %(message)s',
     handlers=[
         RotatingFileHandler('logs/trading_bot.log', maxBytes=1_000_000, backupCount=3, encoding="utf-8-sig"),
-        logging.StreamHandler()
+        RichHandler(console=console, rich_tracebacks=True)
     ]
 )
 logger = logging.getLogger(__name__)
@@ -52,7 +58,7 @@ kafka_config_path = os.path.join(project_root, 'config', 'kafka_config_local.yam
 
 for config_file in [config_path, kafka_config_path]:
     if not os.path.exists(config_file):
-        logger.error(f"[Config Error] Configuration file not found: {config_file}")
+        logger.error(f"❌ [Config Error] Configuration file not found: {config_file}")
         raise FileNotFoundError(f"Configuration file not found: {config_file}")
 
 try:
@@ -61,20 +67,20 @@ try:
     with open(kafka_config_path, 'r', encoding='utf-8-sig') as f:
         kafka_config = yaml.safe_load(f)
 except Exception as e:
-    logger.error(f"[Config Error] Failed to load configuration files: {e}")
+    logger.error(f"❌ [Config Error] Failed to load configuration files: {e}")
     raise
 
 required_top_level_keys = ["binance"]
 for key in required_top_level_keys:
     if key not in config or not config[key]:
-        logger.error(f"[Config Error] Missing or invalid key in config.yaml: {key}")
+        logger.error(f"❌ [Config Error] Missing or invalid key in config.yaml: {key}")
         raise ValueError(f"Missing or invalid key in config.yaml: {key}")
 
 binance_config = config["binance"]
 required_binance_keys = ["symbols", "timeframe", "capital", "leverage"]
 for key in required_binance_keys:
     if key not in binance_config or not binance_config[key]:
-        logger.error(f"[Config Error] Missing or invalid '{key}' under 'binance' in config.yaml")
+        logger.error(f"❌ [Config Error] Missing or invalid '{key}' under 'binance' in config.yaml")
         raise ValueError(f"Missing or invalid '{key}' under 'binance' in config.yaml")
 
 SYMBOLS = binance_config["symbols"]
@@ -89,7 +95,7 @@ METRICS_UPDATE_INTERVAL = 300  # 5 minutes
 try:
     from src.trade_execution.binance_client import init_binance_client
 except ImportError as e:
-    logger.error(f"[Import Error] Failed to import binance_client: {e}")
+    logger.error(f"❌ [Import Error] Failed to import binance_client: {e}")
     raise
 
 client = UMFutures(
@@ -103,9 +109,9 @@ ts_manager = init_trailing_stop_manager(client)
 order_manager = EnhancedOrderManager(client, SYMBOLS)
 
 # Synchronisation initiale des trades
-logger.info("[MainBot] Syncing Binance trades with PostgreSQL and internal tracker...")
+logger.info("[MainBot] Syncing Binance trades with PostgreSQL and internal tracker... 🚀")
 sync_binance_trades_with_postgres(client, SYMBOLS, ts_manager)
-logger.info("[MainBot] Initial trade sync completed.")
+logger.info("[MainBot] Initial trade sync completed. ✅")
 
 # Initialize Kafka consumer
 try:
@@ -115,9 +121,9 @@ try:
         "auto.offset.reset": "latest",
         "security.protocol": "PLAINTEXT"
     })
-    logger.info(f"[Kafka] Consumer initialized with bootstrap servers: {KAFKA_BOOTSTRAP}")
+    logger.info(f"[Kafka] Consumer initialized with bootstrap servers: {KAFKA_BOOTSTRAP} 🛠️")
 except Exception as e:
-    logger.error(f"[Kafka] Failed to initialize consumer: {e}")
+    logger.error(f"❌ [Kafka] Failed to initialize consumer: {e}")
     raise
 
 def handle_order_update(message):
@@ -150,7 +156,19 @@ def handle_order_update(message):
                     'trade_id': order_data['trade_id']
                 }
                 insert_trade(trade_data)
-                logger.info(f"Inserted WebSocket-triggered trade for {order_data['symbol']}: {order_data['order_id']}")
+                
+                # Create a table for the trade
+                table = Table(title=f"Trade Executed for {order_data['symbol']}")
+                table.add_column("Field", style="cyan")
+                table.add_column("Value", style="magenta")
+                table.add_row("Order ID", order_data['order_id'])
+                table.add_row("Symbol", order_data['symbol'])
+                table.add_row("Side", order_data['side'])
+                table.add_row("Quantity", f"{order_data['quantity']:.2f}")
+                table.add_row("Price", f"{order_data['price']:.4f}")
+                table.add_row("Timestamp", str(order_data['timestamp']))
+                console.log(table)
+                
                 if not order_data['is_trailing']:
                     atr = get_current_atr(client, order_data['symbol'])
                     position_type = 'long' if order_data['side'] == 'buy' else 'short'
@@ -162,14 +180,14 @@ def handle_order_update(message):
                         atr=atr,
                         trade_id=order_data['trade_id']
                     )
-                    logger.info(f"Initialized trailing stop for WebSocket trade {order_data['order_id']} ({order_data['symbol']})")
+                    logger.info(f"Initialized trailing stop for WebSocket trade {order_data['order_id']} ({order_data['symbol']}) 📈")
                 if order_data['is_trailing']:
                     current_price = order_manager.get_current_price(order_data['symbol'])
                     if current_price:
                         ts_manager.update_trailing_stop(order_data['symbol'], current_price, trade_id=order_data['trade_id'])
-                        logger.info(f"Updated trailing stop for {order_data['symbol']} at price {current_price}")
+                        logger.info(f"Updated trailing stop for {order_data['symbol']} at price {current_price:.4f} 🔄")
     except Exception as e:
-        logger.error(f"Error handling WebSocket order update: {str(e)}")
+        logger.error(f"❌ Error handling WebSocket order update: {str(e)}")
 
 def start_websocket():
     ws_client = UMFuturesWebsocketClient()
@@ -178,27 +196,27 @@ def start_websocket():
         id=1,
         callback=handle_order_update
     )
-    logger.info("[WebSocket] WebSocket client initialized.")
+    logger.info("[WebSocket] WebSocket client initialized. 🌐")
     while True:
         eventlet.sleep(3600)
         try:
             client.renew_listen_key(ws_client.listen_key)
-            logger.info("[WebSocket] Listen key renewed.")
+            logger.info("[WebSocket] Listen key renewed. 🔄")
         except Exception as e:
-            logger.error(f"[WebSocket] Failed to renew listen key: {e}")
+            logger.error(f"❌ [WebSocket] Failed to renew listen key: {e}")
 
 websocket_thread = threading.Thread(target=start_websocket, daemon=True)
 websocket_thread.start()
 
 def calculate_indicators(df, symbol):
-    logger.info(f"Calculating indicators for {symbol} DataFrame with {len(df)} rows")
+    logger.info(f"Calculating indicators for {symbol} DataFrame with {len(df)} rows 📊")
     if len(df) < 50:
-        logger.info(f"Skipping indicator calculation for {symbol} due to insufficient data")
+        logger.info(f"⚠️ Skipping indicator calculation for {symbol} due to insufficient data")
         return df
 
     df = df.dropna(subset=['open', 'high', 'low', 'close', 'volume']).copy()
     if len(df) < 50:
-        logger.warning(f"Data cleaned, insufficient rows for {symbol}: {len(df)}")
+        logger.warning(f"⚠️ Data cleaned, insufficient rows for {symbol}: {len(df)}")
         return df
 
     try:
@@ -215,8 +233,8 @@ def calculate_indicators(df, symbol):
 
         # Vérifier si des NaN persistent
         if df[required_cols].isna().any().any():
-            logger.warning(f"[Indicators] NaN values persist in indicators for {symbol} after filling")
-        
+            logger.warning(f"⚠️ [Indicators] NaN values persist in indicators for {symbol} after filling")
+
         metrics = {
             "symbol": symbol,
             "timestamp": int(df.index[-1].timestamp() * 1000),
@@ -228,9 +246,21 @@ def calculate_indicators(df, symbol):
             "atr": float(df['ATR'].iloc[-1])
         }
         insert_metrics(symbol, metrics)
-        logger.info(f"[Metrics] Inserted metrics for {symbol}: {metrics}")
+
+        # Create a table for indicators
+        table = Table(title=f"Technical Indicators for {symbol}")
+        table.add_column("Indicator", style="cyan")
+        table.add_column("Value", style="magenta")
+        table.add_row("RSI", f"{metrics['rsi']:.2f}")
+        table.add_row("MACD", f"{metrics['macd']:.4f}")
+        table.add_row("ADX", f"{metrics['adx']:.2f}")
+        table.add_row("EMA20", f"{metrics['ema20']:.4f}")
+        table.add_row("EMA50", f"{metrics['ema50']:.4f}")
+        table.add_row("ATR", f"{metrics['atr']:.4f}")
+        console.log(table)
+
     except Exception as e:
-        logger.error(f"[Indicators] Error calculating indicators for {symbol}: {e}")
+        logger.error(f"❌ [Indicators] Error calculating indicators for {symbol}: {e}")
         import traceback
         logger.error(traceback.format_exc())
 
@@ -250,26 +280,26 @@ async def main():
     last_metrics_update = {symbol: 0 for symbol in SYMBOLS}
 
     try:
-        logger.info("[Main] Creating database tables")
+        logger.info("[Main] Creating database tables 🛠️")
         schema_path = os.path.join(project_root, 'src', 'database', 'schema.sql')
         if not os.path.exists(schema_path):
-            logger.error(f"[Config Error] Database schema file not found: {schema_path}")
+            logger.error(f"❌ [Config Error] Database schema file not found: {schema_path}")
             raise FileNotFoundError(f"Database schema file not found: {schema_path}")
         create_tables()
-        logger.info("[Main] Database tables created successfully")
+        logger.info("[Main] Database tables created successfully ✅")
     except Exception as e:
-        logger.error(f"[Main] Error creating database tables: {e}")
+        logger.error(f"❌ [Main] Error creating database tables: {e}")
         raise
 
     try:
         client.time()
-        logger.info("[Binance Client] API connectivity confirmed")
+        logger.info("[Binance Client] API connectivity confirmed 🌐")
     except Exception as e:
-        logger.error(f"[API Connectivity] Failed: {e}")
+        logger.error(f"❌ [API Connectivity] Failed: {e}")
         raise Exception("API connectivity test failed")
 
     for symbol in SYMBOLS:
-        logger.info(f"[Main] Fetching historical data for {symbol} with timeframe {TIMEFRAME}")
+        logger.info(f"[Main] Fetching historical data for {symbol} with timeframe {TIMEFRAME} 📈")
         klines = []
         limit = 1500
         start_time = None
@@ -280,14 +310,14 @@ async def main():
                     break
                 klines.extend(new_klines)
                 start_time = int(new_klines[-1][0]) + 1
-                logger.info(f"[Data Fetch] Fetched {len(new_klines)} klines for {symbol}, total: {len(klines)}")
+                logger.info(f"[Data Fetch] Fetched {len(new_klines)} klines for {symbol}, total: {len(klines)} 📊")
             except Exception as e:
-                logger.error(f"[Data Fetch] Failed for {symbol} with limit={limit}: {e}")
+                logger.error(f"❌ [Data Fetch] Failed for {symbol} with limit={limit}: {e}")
                 limit = max(500, limit - 100)
                 if limit < 500:
                     raise ValueError(f"Unable to fetch sufficient historical data for {symbol}")
         if len(klines) < 101:
-            logger.error(f"[Data] Insufficient historical data fetched for {symbol}: {len(klines)} rows")
+            logger.error(f"❌ [Data] Insufficient historical data fetched for {symbol}: {len(klines)} rows")
             raise ValueError(f"Insufficient historical data for {symbol}")
         data_hist = pd.DataFrame(klines, columns=["open_time", "open", "high", "low", "close", "volume",
                                                 "close_time", "quote_asset_vol", "num_trades", "taker_buy_base_vol",
@@ -299,10 +329,10 @@ async def main():
         dataframes[symbol] = dataframes[symbol].tail(500)
         dataframes[symbol] = calculate_indicators(dataframes[symbol], symbol)
 
-        logger.info(f"[Main] Training or loading LSTM model for {symbol}")
+        logger.info(f"[Main] Training or loading LSTM model for {symbol} 🤖")
         models[symbol] = train_or_load_model(dataframes[symbol])
         if models[symbol] is None:
-            logger.warning(f"[Model] Using mock model for {symbol} due to failure")
+            logger.warning(f"⚠️ [Model] Using mock model for {symbol} due to failure")
             class MockModel:
                 def predict(self, x, verbose=0):
                     return np.array([[0.5]])
@@ -311,9 +341,9 @@ async def main():
     topics = [f"{symbol}_candle" for symbol in SYMBOLS]
     try:
         consumer.subscribe(topics)
-        logger.info(f"[Kafka] Subscribed to topics: {topics}")
+        logger.info(f"[Kafka] Subscribed to topics: {topics} 📡")
     except Exception as e:
-        logger.error(f"[Kafka] Failed to subscribe to topics: {e}")
+        logger.error(f"❌ [Kafka] Failed to subscribe to topics: {e}")
         raise
 
     last_log_time = time.time()
@@ -322,25 +352,25 @@ async def main():
         while True:
             current_time = time.time()
             if current_time - last_sync_time >= sync_interval:
-                logger.info("[MainBot] Running periodic trade sync...")
+                logger.info("[MainBot] Running periodic trade sync... 🚀")
                 sync_binance_trades_with_postgres(client, SYMBOLS, ts_manager)
                 last_sync_time = current_time
 
             if iteration_count % 10 == 0:
-                logger.info("[Main Loop] Starting iteration")
+                logger.info("[Main Loop] Starting iteration 🔄")
             iteration_count += 1
             msg = consumer.poll(1.0)
 
             if msg is None:
                 if current_time - last_log_time >= 5:
-                    logger.info("[Main Loop] Running, awaiting data")
+                    logger.info("[Main Loop] Running, awaiting data ⏳")
                     last_log_time = current_time
                 for symbol in SYMBOLS:
                     if current_time - last_model_updates[symbol] >= MODEL_UPDATE_INTERVAL and len(dataframes[symbol]) >= 101:
-                        logger.info(f"[Main] Updating LSTM model for {symbol} with new data")
+                        logger.info(f"[Main] Updating LSTM model for {symbol} with new data 🤖")
                         models[symbol] = train_or_load_model(dataframes[symbol])
                         if models[symbol] is None:
-                            logger.error(f"[Model] No valid model available for {symbol}, using mock prediction")
+                            logger.error(f"❌ [Model] No valid model available for {symbol}, using mock prediction")
                             class MockModel:
                                 def predict(self, x, verbose=0):
                                     return np.array([[0.5]])
@@ -349,40 +379,40 @@ async def main():
                         send_telegram_alert(f"Bingo ! Model updated successfully for {symbol}.")
                         lstm_input = prepare_lstm_input(dataframes[symbol])
                         pred = models[symbol].predict(lstm_input, verbose=0)[0][0]
-                        logger.info(f"[Look] Prediction after update: {pred}")
-                        send_telegram_alert(f"[Look] Prediction after update: {pred}")
+                        logger.info(f"[Look] Prediction after update: {pred:.4f} 📈")
+                        send_telegram_alert(f"[Look] Prediction after update: {pred:.4f}")
 
                 await asyncio.sleep(0.1)
                 continue
 
             if msg.error():
-                logger.error(f"[Kafka] Consumer error: {msg.error()}")
+                logger.error(f"❌ [Kafka] Consumer error: {msg.error()}")
                 continue
 
             try:
                 candle_data = json.loads(msg.value().decode("utf-8")) if msg.value() else None
                 if not candle_data or not isinstance(candle_data, dict):
-                    logger.error(f"[Kafka] Invalid candle data for topic {msg.topic()}: {candle_data}")
+                    logger.error(f"❌ [Kafka] Invalid candle data for topic {msg.topic()}: {candle_data}")
                     continue
                 topic = msg.topic()
                 symbol = next((s for s in SYMBOLS if f"{s}_candle" in topic), None)
                 if not symbol or symbol not in dataframes:
-                    logger.error(f"[Kafka] Invalid symbol for topic {topic}")
+                    logger.error(f"❌ [Kafka] Invalid symbol for topic {topic}")
                     continue
 
                 # Validation des clés Kafka
                 required_keys = ['T', 'o', 'h', 'l', 'c', 'v']
                 alt_required_keys = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
                 if not all(key in candle_data for key in required_keys) and not all(key in candle_data for key in alt_required_keys):
-                    logger.error(f"[Kafka] Missing required keys in candle data for {symbol}: {candle_data}")
+                    logger.error(f"❌ [Kafka] Missing required keys in candle data for {symbol}: {candle_data}")
                     continue
 
                 candle_df = format_candle(candle_data, symbol)
                 if candle_df.empty or "close" not in candle_df.columns:
-                    logger.error(f"[Kafka] Invalid or empty candle data for {symbol}: {candle_data}")
+                    logger.error(f"❌ [Kafka] Invalid or empty candle data for {symbol}: {candle_data}")
                     continue
                 if not isinstance(candle_df.index, pd.DatetimeIndex):
-                    logger.error(f"[Kafka] candle_df index is not a DatetimeIndex for {symbol}: {type(candle_df.index)}")
+                    logger.error(f"❌ [Kafka] candle_df index is not a DatetimeIndex for {symbol}: {type(candle_df.index)}")
                     continue
                 insert_price_data(candle_df, symbol)
                 dataframes[symbol] = pd.concat([dataframes[symbol], candle_df], ignore_index=False)
@@ -402,7 +432,7 @@ async def main():
                         last_action_sent[symbol]
                     )
                     if action == last_action_sent.get(symbol):
-                        logger.info(f"[Signal] Ignored repeated action for {symbol}: {action}")
+                        logger.info(f"[Signal] Ignored repeated action for {symbol}: {action} 🔄")
                         continue
                     last_action_sent[symbol] = action
 
@@ -435,7 +465,15 @@ async def main():
                         timestamp = int(candle_df.index[-1].timestamp() * 1000)
                         trade_id = str(int(timestamp))
                         insert_signal(symbol, action, timestamp, confidence)
-                        logger.info(f"[Signal] Stored signal for {symbol}: {action} at {timestamp} with confidence {confidence:.2f}")
+
+                        # Create a table for the signal
+                        table = Table(title=f"Signal Generated for {symbol}")
+                        table.add_column("Field", style="cyan")
+                        table.add_column("Value", style="magenta")
+                        table.add_row("Action", action)
+                        table.add_row("Timestamp", str(timestamp))
+                        table.add_row("Confidence", f"{confidence:.2f}")
+                        console.log(table)
 
                         if action in ["buy", "sell"]:
                             try:
@@ -446,7 +484,7 @@ async def main():
                                     insert_trade(order_details[symbol])
                                     last_order_details[symbol] = order_details[symbol]
                                     record_trade_metric(order_details[symbol])
-                                    send_telegram_alert(f"Trade executed: {action.upper()} {symbol} at {price}")
+                                    send_telegram_alert(f"Trade executed: {action.upper()} {symbol} at {price} 💰")
                                     current_positions[symbol] = new_position
                                     current_market_price = float(candle_df["close"].iloc[-1])
                                     last_sl_order_ids[symbol] = update_trailing_stop(
@@ -459,10 +497,20 @@ async def main():
                                         existing_sl_order_id=last_sl_order_ids[symbol],
                                         trade_id=trade_id
                                     )
+
+                                    # Create a table for the order
+                                    table = Table(title=f"Order Placed for {symbol}")
+                                    table.add_column("Field", style="cyan")
+                                    table.add_column("Value", style="magenta")
+                                    table.add_row("Order ID", order_details[symbol].get("order_id", "N/A"))
+                                    table.add_row("Side", order_details[symbol].get("side", "N/A"))
+                                    table.add_row("Quantity", f"{order_details[symbol].get('quantity', 0):.2f}")
+                                    table.add_row("Price", f"{order_details[symbol].get('price', 0):.4f}")
+                                    console.log(table)
                                 else:
-                                    logger.error(f"[Order] Failed to place {action} order for {symbol}")
+                                    logger.error(f"❌ [Order] Failed to place {action} order for {symbol}")
                             except (TypeError, ValueError, IndexError) as e:
-                                logger.error(f"[Order] Error placing {action} order for {symbol}: {e}")
+                                logger.error(f"❌ [Order] Error placing {action} order for {symbol}: {e}")
                         elif action in ["close_buy", "close_sell"]:
                             try:
                                 close_side = "sell" if action == "close_buy" else "buy"
@@ -482,21 +530,32 @@ async def main():
                                     insert_trade(order_details[symbol])
                                     last_order_details[symbol] = order_details[symbol]
                                     record_trade_metric(order_details[symbol])
-                                    send_telegram_alert(f"Trade closed: {action.upper()} {symbol} at {price}, PNL: {order_details[symbol]['pnl']}")
+                                    send_telegram_alert(f"Trade closed: {action.upper()} {symbol} at {price}, PNL: {order_details[symbol]['pnl']} 💸")
                                     current_positions[symbol] = None
                                     last_sl_order_ids[symbol] = None
+
+                                    # Create a table for the closed trade
+                                    table = Table(title=f"Trade Closed for {symbol}")
+                                    table.add_column("Field", style="cyan")
+                                    table.add_column("Value", style="magenta")
+                                    table.add_row("Order ID", order_details[symbol].get("order_id", "N/A"))
+                                    table.add_row("Side", close_side)
+                                    table.add_row("Quantity", f"{order_details[symbol].get('quantity', 0):.2f}")
+                                    table.add_row("Price", f"{order_details[symbol].get('price', 0):.4f}")
+                                    table.add_row("PNL", f"{order_details[symbol].get('pnl', 0):.2f}")
+                                    console.log(table)
                             except (TypeError, ValueError, IndexError) as e:
-                                logger.error(f"[Order] Error closing {action} order for {symbol}: {e}")
+                                logger.error(f"❌ [Order] Error closing {action} order for {symbol}: {e}")
             except Exception as e:
-                logger.error(f"[Kafka] Exception while processing candle for {symbol}: {e}")
+                logger.error(f"❌ [Kafka] Exception while processing candle for {symbol}: {e}")
                 continue
             await asyncio.sleep(0.1)
 
     except Exception as e:
-        logger.error(f"[Main] Bot error: {e}")
+        logger.error(f"❌ [Main] Bot error: {e}")
         send_telegram_alert(f"Bot error: {str(e)}")
     finally:
-        logger.info("[Main] Closing Kafka consumer")
+        logger.info("[Main] Closing Kafka consumer 🛑")
         consumer.close()
 
 if platform.system() == "Emscripten":
