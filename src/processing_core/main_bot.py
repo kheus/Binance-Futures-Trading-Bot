@@ -94,16 +94,14 @@ METRICS_UPDATE_INTERVAL = 300  # 5 minutes
 
 # Initialize Binance client
 try:
-    from src.trade_execution.binance_client import init_binance_client
-except ImportError as e:
-    logger.error(f"❌ [Import Error] Failed to import binance_client: {e}")
+    client = UMFutures(
+        key=binance_config["api_key"],
+        secret=binance_config["api_secret"],
+        base_url=binance_config["base_url"]
+    )
+except Exception as e:
+    logger.error(f"❌ [Binance Client] Failed to initialize client: {e}")
     raise
-
-client = UMFutures(
-    key="f52c3046240c9514626cf7619ea6bb93f329e2ad39dac256291f48655e750545",
-    secret="20fe2ccf55a7114e576e5830e6ebadbdfdb66df849a326d50ebfb2ca394ce7ec",
-    base_url="https://testnet.binancefuture.com"
-)
 
 # Initialize trailing stop manager and order manager
 ts_manager = init_trailing_stop_manager(client)
@@ -199,20 +197,39 @@ def handle_order_update(message):
         logger.error(f"❌ Error handling WebSocket order update: {str(e)}")
 
 def start_websocket():
-    ws_client = UMFuturesWebsocketClient()
-    ws_client.user_data(
-        listen_key=client.new_listen_key()['listenKey'],
-        id=1,
-        callback=handle_order_update
-    )
-    logger.info("[WebSocket] WebSocket client initialized. 🌐")
+    max_retries = 5
+    retry_delay = 5  # Initial delay in seconds
     while True:
-        eventlet.sleep(3600)
         try:
-            client.renew_listen_key(ws_client.listen_key)
-            logger.info("[WebSocket] Listen key renewed. 🔄")
+            ws_client = UMFuturesWebsocketClient()
+            listen_key = client.new_listen_key()['listenKey']
+            ws_client.user_data(
+                listen_key=listen_key,
+                id=1,
+                callback=handle_order_update
+            )
+            logger.info("[WebSocket] WebSocket client initialized. 🌐")
+            while True:
+                eventlet.sleep(3600)
+                try:
+                    client.renew_listen_key(listen_key)
+                    logger.info("[WebSocket] Listen key renewed. 🔄")
+                except Exception as e:
+                    logger.error(f"❌ [WebSocket] Failed to renew listen key: {e}")
+                    send_telegram_alert(f"Failed to renew WebSocket listen key: {str(e)}")
+                    break  # Retry initializing WebSocket
         except Exception as e:
-            logger.error(f"❌ [WebSocket] Failed to renew listen key: {e}")
+            logger.error(f"❌ [WebSocket] Failed to initialize WebSocket: {e}")
+            send_telegram_alert(f"WebSocket initialization failed: {str(e)}")
+            if max_retries > 0:
+                logger.info(f"[WebSocket] Retrying in {retry_delay} seconds... (Attempts left: {max_retries})")
+                time.sleep(retry_delay)
+                max_retries -= 1
+                retry_delay *= 2  # Exponential backoff
+            else:
+                logger.error("[WebSocket] Max retries reached. WebSocket will not be initialized.")
+                send_telegram_alert("WebSocket failed after maximum retries. Please check connectivity.")
+                break
 
 websocket_thread = threading.Thread(target=start_websocket, daemon=True)
 websocket_thread.start()
@@ -235,9 +252,10 @@ def calculate_indicators(df, symbol):
         df['EMA20'] = talib.EMA(df['close'], timeperiod=20)
         df['EMA50'] = talib.EMA(df['close'], timeperiod=50)
         df['ATR'] = talib.ATR(df['high'], df['low'], df['close'], timeperiod=14)
+        df['ROC'] = talib.ROC(df['close'], timeperiod=5)  # Ajout de ROC
 
         # Remplir les NaN avec la méthode forward fill, puis backward fill
-        required_cols = ['RSI', 'MACD', 'MACD_signal', 'MACD_hist', 'ADX', 'EMA20', 'EMA50', 'ATR']
+        required_cols = ['RSI', 'MACD', 'MACD_signal', 'MACD_hist', 'ADX', 'EMA20', 'EMA50', 'ATR', 'ROC']
         df[required_cols] = df[required_cols].ffill().bfill()
 
         # Vérifier si des NaN persistent
@@ -252,7 +270,8 @@ def calculate_indicators(df, symbol):
             "adx": float(df['ADX'].iloc[-1]),
             "ema20": float(df['EMA20'].iloc[-1]),
             "ema50": float(df['EMA50'].iloc[-1]),
-            "atr": float(df['ATR'].iloc[-1])
+            "atr": float(df['ATR'].iloc[-1]),
+            "roc": float(df['ROC'].iloc[-1])
         }
         insert_metrics(symbol, metrics)
 
@@ -266,6 +285,7 @@ def calculate_indicators(df, symbol):
         table.add_row("EMA20", f"{metrics['ema20']:.4f}")
         table.add_row("EMA50", f"{metrics['ema50']:.4f}")
         table.add_row("ATR", f"{metrics['atr']:.4f}")
+        table.add_row("ROC", f"{metrics['roc']:.4f}")
         console.log(table)
 
     except Exception as e:
@@ -281,9 +301,10 @@ async def main():
     current_positions = {symbol: None for symbol in SYMBOLS}
     last_order_details = {symbol: None for symbol in SYMBOLS}
     last_model_updates = {symbol: time.time() for symbol in SYMBOLS}
-    last_action_sent = {symbol: None for symbol in SYMBOLS}
+    last_action_sent = {symbol: (None, 0) for symbol in SYMBOLS}  # Store (action, timestamp)
     last_sl_order_ids = {symbol: None for symbol in SYMBOLS}
     models = {symbol: None for symbol in SYMBOLS}
+    scalers = {symbol: None for symbol in SYMBOLS}
     last_sync_time = time.time()
     sync_interval = 300  # 5 minutes
     last_metrics_update = {symbol: 0 for symbol in SYMBOLS}
@@ -343,13 +364,14 @@ async def main():
         dataframes[symbol] = calculate_indicators(dataframes[symbol], symbol)
 
         logger.info(f"[Main] Training or loading LSTM model for {symbol} 🤖")
-        models[symbol] = train_or_load_model(dataframes[symbol])
-        if models[symbol] is None:
+        models[symbol], scalers[symbol] = train_or_load_model(dataframes[symbol], symbol)
+        if models[symbol] is None or scalers[symbol] is None:
             logger.warning(f"⚠️ [Model] Using mock model for {symbol} due to failure")
             class MockModel:
                 def predict(self, x, verbose=0):
                     return np.array([[0.5]])
             models[symbol] = MockModel()
+            scalers[symbol] = None
 
     topics = [f"{symbol}_candle" for symbol in SYMBOLS]
     try:
@@ -385,19 +407,21 @@ async def main():
                 for symbol in SYMBOLS:
                     if current_time - last_model_updates[symbol] >= MODEL_UPDATE_INTERVAL and len(dataframes[symbol]) >= 101:
                         logger.info(f"[Main] Updating LSTM model for {symbol} with new data 🤖")
-                        models[symbol] = train_or_load_model(dataframes[symbol])
-                        if models[symbol] is None:
+                        models[symbol], scalers[symbol] = train_or_load_model(dataframes[symbol], symbol)
+                        if models[symbol] is None or scalers[symbol] is None:
                             logger.error(f"❌ [Model] No valid model available for {symbol}, using mock prediction")
                             class MockModel:
                                 def predict(self, x, verbose=0):
                                     return np.array([[0.5]])
                             models[symbol] = MockModel()
+                            scalers[symbol] = None
                         last_model_updates[symbol] = current_time
                         send_telegram_alert(f"Bingo ! Model updated successfully for {symbol}.")
-                        lstm_input = prepare_lstm_input(dataframes[symbol])
-                        pred = models[symbol].predict(lstm_input, verbose=0)[0][0]
-                        logger.info(f"[Look] Prediction after update: {pred:.4f} 📈")
-                        send_telegram_alert(f"[Look] Prediction after update: {pred:.4f}")
+                        if scalers[symbol]:
+                            lstm_input = prepare_lstm_input(dataframes[symbol])
+                            pred = models[symbol].predict(lstm_input, verbose=0)[0][0]
+                            logger.info(f"[Look] Prediction after update: {pred:.4f} 📈")
+                            send_telegram_alert(f"[Look] Prediction after update: {pred:.4f}")
 
                 await asyncio.sleep(0.1)
                 continue
@@ -409,7 +433,7 @@ async def main():
             try:
                 candle_data = json.loads(msg.value().decode("utf-8")) if msg.value() else None
                 if not candle_data or not isinstance(candle_data, dict):
-                    logger.error(f"❌ [Kafka] Invalid candle data for topic {msg.topic()}: {candle_data}")
+                    logger.error,f("[Kafka] Invalid candle data for topic {msg.topic()}: {candle_data}")
                     continue
                 topic = msg.topic()
                 symbol = next((s for s in SYMBOLS if f"{s}_candle" in topic), None)
@@ -440,18 +464,19 @@ async def main():
                     last_metrics_update[symbol] = current_time
 
                 if len(dataframes[symbol]) >= 101:
-                    action, new_position = check_signal(
+                    action, confidence = check_signal(
+                        symbol,
                         dataframes[symbol],
                         models[symbol],
-                        current_positions[symbol],
-                        last_order_details[symbol],
-                        symbol,
-                        last_action_sent[symbol]
+                        scalers[symbol],
+                        last_action_sent[symbol][1],  # Use stored timestamp
+                        last_action_sent[symbol][0]   # Use stored action
                     )
-                    if action == last_action_sent.get(symbol):
+                    if action == last_action_sent[symbol][0]:
                         logger.info(f"[Signal] Ignored repeated action for {symbol}: {action} 🔄")
                         continue
-                    last_action_sent[symbol] = action
+                    timestamp = int(candle_df.index[-1].timestamp() * 1000)
+                    last_action_sent[symbol] = (action, timestamp)  # Update with action and timestamp
 
                     if action in ["buy", "sell", "close_buy", "close_sell"]:
                         # Calculer la confiance
@@ -462,7 +487,7 @@ async def main():
                         ema50 = dataframes[symbol]['EMA50'].iloc[-1]
                         atr = dataframes[symbol]['ATR'].iloc[-1]
                         close = dataframes[symbol]['close'].iloc[-1]
-                        roc = talib.ROC(dataframes[symbol]['close'], timeperiod=5).iloc[-1] * 100
+                        roc = talib.ROC(dataframes[symbol]['close'], timeperiod=5).iloc[-1]
                         lstm_input = prepare_lstm_input(dataframes[symbol])
                         prediction = models[symbol].predict(lstm_input, verbose=0)[0][0]
                         trend_up = ema20 > ema50
@@ -479,10 +504,9 @@ async def main():
                         ] if f]) / 6.0
                         
                         # Insérer le signal
-                        timestamp = int(candle_df.index[-1].timestamp() * 1000)
-                        trade_id = str(int(timestamp))
                         try:
                             insert_signal(symbol, action, timestamp, confidence)
+                            logger.info(f"[Signal] Generated signal {action} for {symbol} with confidence {confidence:.2f}")
                         except psycopg2.pool.PoolError as e:
                             logger.error(f"❌ [Signal] Failed to insert signal for {symbol} due to connection pool exhaustion: {e}")
                             send_telegram_alert(f"Failed to insert signal for {symbol}: connection pool exhausted")
@@ -495,13 +519,13 @@ async def main():
                                 if atr <= 0:
                                     logger.error(f"❌ [Order] Invalid ATR for {symbol}: {atr}")
                                     continue
-                                order_details[symbol] = order_manager.place_enhanced_order(action, symbol, CAPITAL, LEVERAGE, trade_id)
+                                order_details[symbol] = order_manager.place_enhanced_order(action, symbol, CAPITAL, LEVERAGE, trade_id=str(timestamp))
                                 if order_details[symbol]:
                                     insert_trade(order_details[symbol])
                                     last_order_details[symbol] = order_details[symbol]
                                     record_trade_metric(order_details[symbol])
                                     send_telegram_alert(f"Trade executed: {action.upper()} {symbol} at {price} 💰")
-                                    current_positions[symbol] = new_position
+                                    current_positions[symbol] = action
                                     current_market_price = float(candle_df["close"].iloc[-1])
                                     last_sl_order_ids[symbol] = update_trailing_stop(
                                         client=client,
@@ -511,7 +535,7 @@ async def main():
                                         atr=atr,
                                         base_qty=float(order_details[symbol]["quantity"]),
                                         existing_sl_order_id=last_sl_order_ids[symbol],
-                                        trade_id=trade_id
+                                        trade_id=str(timestamp)
                                     )
 
                                     # Create a table for the order
@@ -536,7 +560,7 @@ async def main():
                                 if atr <= 0:
                                     logger.error(f"❌ [Order] Invalid ATR for {symbol}: {atr}")
                                     continue
-                                order_details[symbol] = order_manager.place_enhanced_order(close_side, symbol, CAPITAL, LEVERAGE, trade_id)
+                                order_details[symbol] = order_manager.place_enhanced_order(close_side, symbol, CAPITAL, LEVERAGE, trade_id=str(timestamp))
                                 if order_details[symbol]:
                                     if last_order_details[symbol] and last_order_details[symbol].get("price"):
                                         open_price = float(last_order_details[symbol]["price"])
@@ -545,16 +569,7 @@ async def main():
                                         qty = float(last_order_details[symbol]["quantity"])
                                         pnl = (close_price - open_price) * qty if side == "buy" else (open_price - close_price) * qty
                                         order_details[symbol]["pnl"] = pnl
-                                    else:
-                                        order_details[symbol]["pnl"] = 0.0
-                                    insert_trade(order_details[symbol])
-                                    last_order_details[symbol] = order_details[symbol]
-                                    record_trade_metric(order_details[symbol])
-                                    send_telegram_alert(f"Trade closed: {action.upper()} {symbol} at {price}, PNL: {order_details[symbol]['pnl']} 💸")
-                                    current_positions[symbol] = None
-                                    last_sl_order_ids[symbol] = None
-
-                                    # Create a table for the closed trade
+                                    # Create a table for the order
                                     table = Table(title=f"Trade Closed for {symbol}")
                                     table.add_column("Field", style="cyan")
                                     table.add_column("Value", style="magenta")
@@ -564,6 +579,9 @@ async def main():
                                     table.add_row("Price", f"{order_details[symbol].get('price', 0):.4f}")
                                     table.add_row("PNL", f"{order_details[symbol].get('pnl', 0):.2f}")
                                     console.log(table)
+                            except (TypeError, ValueError, IndexError, psycopg2.pool.PoolError) as e:
+                                logger.error(f"❌ [Order] Error closing {action} order for {symbol}: {e}")
+                                send_telegram_alert(f"Error closing {action} order for {symbol}: {str(e)}")
                             except (TypeError, ValueError, IndexError, psycopg2.pool.PoolError) as e:
                                 logger.error(f"❌ [Order] Error closing {action} order for {symbol}: {e}")
                                 send_telegram_alert(f"Error closing {action} order for {symbol}: {str(e)}")

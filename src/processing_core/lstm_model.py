@@ -21,15 +21,12 @@ with open(CONFIG_PATH, "r", encoding="utf-8-sig") as f:
 
 # Configuration générale
 SEQ_LEN = config["model"]["sequence_length"]
-MODEL_PATH = config["model"]["path"]
-META_PATH = "models/lstm_model_meta.json"  # Ajoute ce chemin si besoin
-
+MODEL_DIR = Path(__file__).parent.parent.parent / "models"
 API_KEY = config["binance"]["api_key"]
 API_SECRET = config["binance"]["api_secret"]
 SYMBOLS = config["binance"]["symbols"]
-SYMBOL = SYMBOLS[0]  # Premier symbole de la liste
 INTERVAL = config["binance"].get("timeframe", "1h")
-LIMIT = 500  # Ou mets une valeur de config si tu veux la rendre dynamique
+LIMIT = config["binance"].get("limit", 500)
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -50,7 +47,7 @@ def fetch_binance_data(symbol, interval, limit):
         logger.info(f"[Data] Fetched {len(df)} {interval} candles for {symbol}")
         return df[['timestamp', 'close', 'volume']]
     except Exception as e:
-        logger.error(f"[Data] Failed to fetch Binance data: {e}")
+        logger.error(f"[Data] Failed to fetch Binance data for {symbol}: {e}")
         return None
 
 def calculate_indicators(df):
@@ -122,35 +119,37 @@ def build_lstm_model(input_shape=(SEQ_LEN, 5)):
     )
     return model
 
-def train_or_load_model(df, symbol=SYMBOL):
-    """Train or load the LSTM model with real data."""
-    os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
+def train_or_load_model(df, symbol):
+    """Train or load the LSTM model with real data for a specific symbol."""
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    model_path = MODEL_DIR / f"lstm_model_{symbol}.keras"
+    meta_path = MODEL_DIR / f"lstm_model_{symbol}_meta.json"
     logger.info(f"[Model] Attempting to train or load model for {symbol} with data shape {df.shape}")
 
     # Load metadata if exists
     meta = {}
-    if os.path.exists(META_PATH):
-        with open(META_PATH, 'r', encoding="utf-8-sig") as f:  # Changed from utf-8
+    if meta_path.exists():
+        with open(meta_path, 'r', encoding="utf-8-sig") as f:
             meta = json.load(f)
 
     try:
-        model = load_model(MODEL_PATH)
-        logger.info(f"[Model] Loaded existing model from {MODEL_PATH}")
+        model = load_model(model_path)
+        logger.info(f"[Model] Loaded existing model from {model_path}")
         last_train_time = meta.get('last_train_time', 0)
         last_train_close = meta.get('last_train_close', 0)
         current_close = df['close'].iloc[-1]
         if last_train_time and abs(current_close - last_train_close) < 1.0:
             logger.info(f"[Model] Data unchanged since {datetime.fromtimestamp(last_train_time).strftime('%Y-%m-%d %H:%M:%S')}, reusing model")
-            return model
+            return model, scaler
         logger.info(f"[Model] Data changed, retraining model")
     except Exception as e:
-        logger.warning(f"[Model] Failed to load model: {e}, training new model")
+        logger.warning(f"[Model] Failed to load model for {symbol}: {e}, training new model")
 
     try:
         X, y, scaler = prepare_lstm_data(df)
         if X is None or len(X) < 10:  # Minimum sequences for training
-            logger.error("[Model] Insufficient valid data for training")
-            return None
+            logger.error(f"[Model] Insufficient valid data for training {symbol}")
+            return None, None
         X, y = augment_data(X, y)
         model = build_lstm_model()
         logger.info(f"[Model] Training with X shape {X.shape}, y shape {y.shape}")
@@ -163,27 +162,27 @@ def train_or_load_model(df, symbol=SYMBOL):
             verbose=1,
             callbacks=[early_stopping]
         )
-        model.save(MODEL_PATH)
+        model.save(model_path)
         current_time = time.time()
         meta = {
             'last_train_time': current_time,
             'last_train_close': float(df['close'].iloc[-1]),
             'symbol': symbol
         }
-        with open(META_PATH, 'w', encoding="utf-8") as f:
+        with open(meta_path, 'w', encoding="utf-8") as f:
             json.dump(meta, f)
         logger.info(f"[Model] Training completed for {symbol} with {len(df)} rows")
-        return model
+        return model, scaler
     except Exception as e:
-        logger.error(f"[Model] Training failed: {e}")
-        return None
+        logger.error(f"[Model] Training failed for {symbol}: {e}")
+        return None, None
 
 if __name__ == "__main__":
-    # Fetch real data from Binance
-    df = fetch_binance_data(SYMBOL, INTERVAL, LIMIT)
+    # Fetch real data from Binance for the first symbol
+    df = fetch_binance_data(SYMBOLS[0], INTERVAL, LIMIT)
     if df is not None:
         df = calculate_indicators(df)
-        model = train_or_load_model(df, symbol=SYMBOL)
+        model, scaler = train_or_load_model(df, symbol=SYMBOLS[0])
         if model:
             logger.info("[Main] Model training or loading successful")
         else:
