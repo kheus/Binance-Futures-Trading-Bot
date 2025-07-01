@@ -107,10 +107,6 @@ def create_tables():
         raise
 
 def insert_or_update_order(order):
-    """
-    Insère ou met à jour un ordre dans la table orders.
-    Gère explicitement les conversions de types pour éviter les erreurs de clé primaire ou de type.
-    """
     query_check = "SELECT order_id FROM orders WHERE order_id = %s"
     query_update = """
         UPDATE orders
@@ -231,19 +227,16 @@ def insert_trade(trade_data):
             trade_data.get('order_id'),
             trade_data.get('symbol'),
             trade_data.get('side'),
-            trade_data.get('quantity'),
-            trade_data.get('price'),
-            trade_data.get('stop_loss'),
-            trade_data.get('take_profit'),
-            trade_data.get('timestamp'),
-            trade_data.get('pnl', 0.0),
+            float(trade_data.get('quantity', 0)),  # Convertir en float
+            float(trade_data.get('price', 0)),     # Convertir en float
+            float(trade_data.get('stop_loss', 0)) if trade_data.get('stop_loss') is not None else None,
+            float(trade_data.get('take_profit', 0)) if trade_data.get('take_profit') is not None else None,
+            int(trade_data.get('timestamp', 0)),   # Convertir en int
+            float(trade_data.get('pnl', 0.0)),
             trade_data.get('is_trailing', False)
         ))
         logger.info(f"Trade inserted for {trade_data.get('symbol')}: {trade_data.get('order_id')}")
         return True
-    except Exception as e:
-        logger.error(f"Error inserting trade for {trade_data.get('order_id')}: {str(e)}")
-        return False
     except Exception as e:
         logger.error(f"Error inserting trade for {trade_data.get('order_id')}: {str(e)}")
         return False
@@ -252,19 +245,25 @@ def insert_metrics(symbol, metrics):
     query = """
     INSERT INTO metrics (symbol, timestamp, rsi, macd, adx, ema20, ema50, atr)
     VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+    ON CONFLICT (symbol, timestamp)
+    DO NOTHING
+    RETURNING symbol
     """
     try:
-        execute_query(query, (
+        result = execute_query(query, (
             symbol,
             metrics.get('timestamp'),
-            metrics.get('rsi'),
-            metrics.get('macd'),
-            metrics.get('adx'),
-            metrics.get('ema20'),
-            metrics.get('ema50'),
-            metrics.get('atr')
-        ))
-        logger.info(f"Metrics inserted for {symbol} at {metrics.get('timestamp')}")
+            float(metrics.get('rsi', 0)),
+            float(metrics.get('macd', 0)),
+            float(metrics.get('adx', 0)),
+            float(metrics.get('ema20', 0)),
+            float(metrics.get('ema50', 0)),
+            float(metrics.get('atr', 0))
+        ), fetch=True)
+        if result:
+            logger.info(f"Metrics inserted for {symbol} at {metrics.get('timestamp')}")
+        else:
+            logger.info(f"Metrics skipped (already exists) for {symbol} at {metrics.get('timestamp')}")
         return True
     except Exception as e:
         logger.error(f"Error inserting metrics for {symbol}: {str(e)}")
@@ -272,14 +271,19 @@ def insert_metrics(symbol, metrics):
 
 def insert_price_data(price_data, symbol):
     query = """
-    INSERT INTO price_history (symbol, price, timestamp)
-    VALUES (%s, %s, %s)
+    INSERT INTO price_data (symbol, timestamp, open, high, low, close, volume)
+    VALUES (%s, to_timestamp(%s / 1000.0), %s, %s, %s, %s, %s)
+    ON CONFLICT (symbol, timestamp) DO NOTHING
     """
     try:
         execute_query(query, (
             symbol,
-            price_data['close'].iloc[-1],
-            int(price_data.index[-1].timestamp() * 1000)
+            int(price_data.index[-1].timestamp() * 1000),
+            float(price_data['open'].iloc[-1]),
+            float(price_data['high'].iloc[-1]),
+            float(price_data['low'].iloc[-1]),
+            float(price_data['close'].iloc[-1]),
+            float(price_data['volume'].iloc[-1])
         ))
         logger.info(f"Price data inserted for {symbol} at {int(price_data.index[-1].timestamp() * 1000)}")
         return True
@@ -466,10 +470,6 @@ def get_latest_prices():
         raise
 
 def insert_order_if_missing(order):
-    """
-    Insère un ordre dans la table orders s'il n'existe pas déjà (par order_id et symbol).
-    Retourne True si inséré, False si déjà présent.
-    """
     query_check = "SELECT 1 FROM orders WHERE order_id = %s AND symbol = %s"
     query_insert = """
     INSERT INTO orders (order_id, symbol, side, quantity, price, timestamp, status)
@@ -487,13 +487,13 @@ def insert_order_if_missing(order):
     )
     try:
         with get_db_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(query_check, params_check)
-                exists = cursor.fetchone()
+            with conn.cursor() as cur:
+                cur.execute(query_check, params_check)
+                exists = cur.fetchone()
                 if exists:
                     logger.info(f"Order {order['order_id']} for {order['symbol']} already exists in DB.")
                     return False
-                cursor.execute(query_insert, params_insert)
+                cur.execute(query_insert, params_insert)
                 conn.commit()
                 logger.info(f"Order {order['order_id']} for {order['symbol']} inserted in DB.")
                 return True
@@ -502,9 +502,6 @@ def insert_order_if_missing(order):
         return False
 
 def sync_orders_with_db(client, symbol_list):
-    """
-    Synchronise les ordres de Binance avec la base de données.
-    """
     try:
         create_tables()
         all_orders = []
@@ -541,10 +538,8 @@ def sync_orders_with_db(client, symbol_list):
         return 0
 
 def _validate_timestamp(ts):
-    """Valide et convertit un timestamp en millisecondes"""
     try:
-        ts = int(float(ts))  # Double conversion pour sécurité
-        # Plage de validation raisonnable (années 2000-2100)
+        ts = int(float(ts))
         if ts < 946684800000 or ts > 4102444800000:
             raise ValueError(f"Timestamp {ts} hors plage valide")
         return ts
