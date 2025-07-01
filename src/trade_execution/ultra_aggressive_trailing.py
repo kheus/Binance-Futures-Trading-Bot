@@ -12,6 +12,7 @@ class UltraAgressiveTrailingStop:
         self.max_retries = max_retries
         self.trailing_stop_order_id = None
         self.entry_price = 0.0
+        self.current_stop_price = 0.0  # Nouvelle variable pour suivre le dernier stop_price
         self.position_type = None
         self.quantity = 0.0
 
@@ -26,7 +27,7 @@ class UltraAgressiveTrailingStop:
 
         if atr <= 0:
             logger.warning(f"[{self.symbol}] ⚠️ ATR invalid ({atr}), using fallback calculation.")
-            atr = self.entry_price * 0.02  # fallback ATR = 2%
+            atr = self.entry_price * 0.02  # Fallback ATR = 2%
 
         try:
             current_price = float(self.client.ticker_price(symbol=self.symbol)['price'])
@@ -56,7 +57,7 @@ class UltraAgressiveTrailingStop:
             logger.warning(f"[{self.symbol}] ⚠️ Could not fetch balance: {e}")
             usdt_balance = 0
 
-        if notional_value > usdt_balance * 50:  # en cross 50x
+        if notional_value > usdt_balance * 50:  # En cross 50x
             logger.warning(f"[{self.symbol}] ❌ Not enough margin (need ≈ {notional_value}, have ≈ {usdt_balance}). Skipping trailing stop.")
             return None
 
@@ -72,6 +73,7 @@ class UltraAgressiveTrailingStop:
                     reduceOnly=reduce_only
                 )
                 self.trailing_stop_order_id = order['orderId']
+                self.current_stop_price = stop_price  # Stocker le stop_price initial
                 logger.info(f"[{self.symbol}] ✅ Trailing stop placed (order {self.trailing_stop_order_id}) at {stop_price} (Qty: {self.quantity})")
                 return self.trailing_stop_order_id
             except Exception as e:
@@ -91,38 +93,39 @@ class UltraAgressiveTrailingStop:
                     logger.error(f"[{self.symbol}] ❌ Invalid current_price: {current_price}")
                     return
 
-                if self.position_type == 'long':
-                    new_stop = format_price(self.symbol, current_price * (1 - self.percentage))
-                    if new_stop > self.entry_price:
-                        self.client.cancel_order(symbol=self.symbol, orderId=self.trailing_stop_order_id)
-                        order = self.client.new_order(
-                            symbol=self.symbol,
-                            side='SELL',
-                            type='STOP_MARKET',
-                            quantity=str(self.quantity),
-                            stopPrice=str(new_stop),
-                            priceProtect=True,
-                            reduceOnly=True
-                        )
-                        self.trailing_stop_order_id = order['orderId']
-                        self.entry_price = new_stop
-                        logger.info(f"[{self.symbol}] 🔄 Trailing stop updated (long) to {new_stop}")
-                elif self.position_type == 'short':
-                    new_stop = format_price(self.symbol, current_price * (1 + self.percentage))
-                    if new_stop < self.entry_price:
-                        self.client.cancel_order(symbol=self.symbol, orderId=self.trailing_stop_order_id)
-                        order = self.client.new_order(
-                            symbol=self.symbol,
-                            side='BUY',
-                            type='STOP_MARKET',
-                            quantity=str(self.quantity),
-                            stopPrice=str(new_stop),
-                            priceProtect=True,
-                            reduceOnly=True
-                        )
-                        self.trailing_stop_order_id = order['orderId']
-                        self.entry_price = new_stop
-                        logger.info(f"[{self.symbol}] 🔄 Trailing stop updated (short) to {new_stop}")
+                new_stop = format_price(self.symbol, current_price * (1 - self.percentage) if self.position_type == 'long' else current_price * (1 + self.percentage))
+                
+                # Ne jamais reculer le stop_price
+                if self.position_type == 'long' and new_stop > self.current_stop_price:
+                    self.client.cancel_order(symbol=self.symbol, orderId=self.trailing_stop_order_id)
+                    order = self.client.new_order(
+                        symbol=self.symbol,
+                        side='SELL',
+                        type='STOP_MARKET',
+                        quantity=str(self.quantity),
+                        stopPrice=str(new_stop),
+                        priceProtect=True,
+                        reduceOnly=True
+                    )
+                    self.trailing_stop_order_id = order['orderId']
+                    self.current_stop_price = new_stop  # Mettre à jour le stop_price
+                    logger.info(f"[{self.symbol}] 🔄 Trailing stop updated (long) to {new_stop}")
+                elif self.position_type == 'short' and new_stop < self.current_stop_price:
+                    self.client.cancel_order(symbol=self.symbol, orderId=self.trailing_stop_order_id)
+                    order = self.client.new_order(
+                        symbol=self.symbol,
+                        side='BUY',
+                        type='STOP_MARKET',
+                        quantity=str(self.quantity),
+                        stopPrice=str(new_stop),
+                        priceProtect=True,
+                        reduceOnly=True
+                    )
+                    self.trailing_stop_order_id = order['orderId']
+                    self.current_stop_price = new_stop  # Mettre à jour le stop_price
+                    logger.info(f"[{self.symbol}] 🔄 Trailing stop updated (short) to {new_stop}")
+                else:
+                    logger.debug(f"[{self.symbol}] No update needed: new_stop={new_stop} not better than current_stop_price={self.current_stop_price}")
             except Exception as e:
                 logger.error(f"[{self.symbol}] ❌ Failed to update trailing stop: {e}")
 
