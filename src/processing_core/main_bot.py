@@ -14,7 +14,7 @@ from src.processing_core.lstm_model import train_or_load_model
 from src.processing_core.signal_generator import check_signal, prepare_lstm_input
 from src.trade_execution.order_manager import place_order, update_trailing_stop, init_trailing_stop_manager, EnhancedOrderManager
 from src.trade_execution.sync_orders import get_current_atr
-from src.database.db_handler import insert_trade, insert_signal, insert_metrics, create_tables, insert_price_data, get_db_connection
+from src.database.db_handler import insert_trade, insert_signal, insert_metrics, create_tables, insert_price_data
 from src.monitoring.metrics import record_trade_metric
 from src.monitoring.alerting import send_telegram_alert
 from src.trade_execution.sync_orders import sync_binance_trades_with_postgres
@@ -34,8 +34,9 @@ sys.stderr.reconfigure(encoding="utf-8-sig")
 
 # Set up logging
 os.makedirs("logs", exist_ok=True)
+log_level = logging.DEBUG if os.getenv("DEBUG_MODE") == "true" else logging.INFO
 logging.basicConfig(
-    level=logging.INFO,
+    level=log_level,
     format='%(asctime)s - %(levelname)s - [%(name)s] %(message)s',
     handlers=[
         RotatingFileHandler('logs/trading_bot.log', maxBytes=1_000_000, backupCount=3, encoding="utf-8-sig"),

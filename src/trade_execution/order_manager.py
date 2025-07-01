@@ -20,6 +20,8 @@ from tabulate import tabulate
 import inspect
 from binance.um_futures import UMFutures
 from src.monitoring.alerting import send_telegram_alert
+import psycopg2
+from psycopg2 import pool
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +41,34 @@ from src.trade_execution.market_crash_protector import MarketCrashProtector
 # Initialize global trailing stop manager and crash protector
 ts_manager = None
 crash_protector = MarketCrashProtector()
+
+# Database configuration
+CONFIG_PATH = Path(__file__).parent.parent.parent / "config" / "db_config.yaml"
+with open(CONFIG_PATH, "r", encoding="utf-8-sig") as f:
+    db_config = yaml.safe_load(f)
+
+DB_CONFIG = db_config["database"]["postgresql"]
+HOST = DB_CONFIG["host"]
+DBNAME = DB_CONFIG["database"]
+USER = DB_CONFIG["user"]
+PASSWORD = DB_CONFIG["password"]
+PORT = DB_CONFIG.get("port", 5432)
+
+# Initialize connection pool
+try:
+    connection_pool = psycopg2.pool.SimpleConnectionPool(
+        minconn=1,
+        maxconn=10,
+        host=HOST,
+        dbname=DBNAME,
+        user=USER,
+        password=PASSWORD,
+        port=PORT
+    )
+    logger.info("[db_handler] Database connection pool initialized.")
+except Exception as e:
+    logger.error(f"[db_handler] Failed to initialize connection pool: {e}")
+    raise
 
 def init_trailing_stop_manager(client):
     global ts_manager
@@ -412,3 +442,56 @@ for symbol in SYMBOLS:
             send_telegram_alert(f"⚠️ CRASH DETECTED - Position closed for {symbol}")
     except Exception as e:
         logger.error(f"[OrderManager] Failed to process {symbol}: {e}")
+
+def get_db_connection():
+    try:
+        conn = connection_pool.getconn()
+        conn.set_client_encoding('UTF8')
+        logger.debug(f"[DEBUG] Client encoding: UTF8")
+        return conn
+    except Exception as e:
+        logger.error(f"[db_handler] Error getting database connection: {e}")
+        raise
+
+def release_db_connection(conn):
+    try:
+        connection_pool.putconn(conn)
+    except Exception as e:
+        logger.error(f"[db_handler] Error releasing database connection: {e}")
+
+def insert_or_update_order(order):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        order_id = str(order.get('orderId') or order.get('order_id'))
+        symbol = order.get('symbol')
+        status = order.get('status')
+        side = order.get('side')
+        quantity = float(order.get('origQty', order.get('quantity', 0)))
+        price = float(order.get('price', 0))
+        timestamp = int(order.get('time', order.get('timestamp', 0)))
+        client_order_id = order.get('clientOrderId', order.get('client_order_id', ''))
+
+        query = """
+        INSERT INTO orders (order_id, symbol, status, side, quantity, price, timestamp, client_order_id)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (order_id) DO UPDATE
+        SET status = EXCLUDED.status,
+            quantity = EXCLUDED.quantity,
+            price = EXCLUDED.price,
+            timestamp = EXCLUDED.timestamp,
+            client_order_id = EXCLUDED.client_order_id;
+        """
+        cursor.execute(query, (order_id, symbol, status, side, quantity, price, timestamp, client_order_id))
+        conn.commit()
+        logger.info(f"Order {order_id} for {symbol} updated in DB.")
+    except Exception as e:
+        logger.error(f"[db_handler] Error updating order {order_id} for {symbol}: {e}")
+        if conn:
+            conn.rollback()
+    finally:
+        if conn:
+            release_db_connection(conn)
+
+# Les autres fonctions d'accès à la base doivent aussi utiliser get_db_connection et release_db_connection.

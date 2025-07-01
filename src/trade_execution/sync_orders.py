@@ -4,15 +4,18 @@ from src.monitoring.metrics import get_current_atr
 from src.trade_execution.ultra_aggressive_trailing import TrailingStopManager
 from src.database.db_handler import insert_or_update_order
 from src.trade_execution.order_manager import check_open_position
+import time
 
 logger = logging.getLogger(__name__)
 
 def sync_binance_trades_with_postgres(client: UMFutures, symbols, ts_manager):
     logger.info("[sync_orders] Syncing Binance trades with PostgreSQL and internal tracker...")
+    # Filtrer les ordres des dernières 24 heures (en millisecondes)
+    start_time = int((time.time() - 24 * 60 * 60) * 1000)
     for symbol in symbols:
         try:
-            # Récupérer tous les ordres (ouverts, partiellement remplis, exécutés)
-            all_orders = client.get_all_orders(symbol=symbol, limit=100)
+            # Récupérer tous les ordres récents
+            all_orders = client.get_all_orders(symbol=symbol, limit=100, startTime=start_time)
             logger.debug(f"Raw all_orders response for {symbol}: {all_orders}")
             if not isinstance(all_orders, list):
                 logger.warning(f"Invalid response format for {symbol}: {all_orders}")
@@ -27,7 +30,6 @@ def sync_binance_trades_with_postgres(client: UMFutures, symbols, ts_manager):
                     continue
                 order_id = str(order['orderId'])
                 insert_or_update_order(order)
-                logger.info(f"Order {order_id} for {symbol} inserted/updated in DB.")
 
                 # Récupérer les trades exécutés uniquement pour les ordres remplis
                 if order['status'] == 'FILLED':
