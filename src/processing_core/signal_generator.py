@@ -4,7 +4,7 @@ import pandas as pd
 import talib
 import time
 from datetime import datetime, timedelta
-from src.database.db_handler import DBHandler
+from src.database.db_handler import insert_signal, insert_training_data, get_future_prices, get_training_data_count
 from src.monitoring.alerting import send_telegram_alert
 
 logger = logging.getLogger(__name__)
@@ -38,7 +38,7 @@ def select_strategy_mode(adx, rsi, atr):
 
 def calculate_market_direction(symbol, signal_timestamp):
     try:
-        future_df = DBHandler().get_future_prices(symbol, signal_timestamp, candle_count=5)
+        future_df = get_future_prices(symbol, signal_timestamp, candle_count=5)
         if len(future_df) < 5:
             return None, None
         start_price = future_df.iloc[0]['close']
@@ -54,7 +54,7 @@ def calculate_market_direction(symbol, signal_timestamp):
 def should_retrain_model():
     if datetime.now().weekday() == 0:
         return True
-    new_data_count = DBHandler().get_training_data_count(since_last_train=True)
+    new_data_count = get_training_data_count(since_last_train=True)
     if new_data_count >= 100:
         return True
     return False
@@ -169,7 +169,7 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
                 }
             }
             training_record["check_timestamp"] = int((datetime.now() + timedelta(minutes=5)).timestamp() * 1000)
-            DBHandler().insert_training_data(training_record)
+            insert_training_data(training_record)
             logger.info(f"[Performance Tracking] Stored training data for {symbol} signal")
             check_time = datetime.now() + timedelta(minutes=5)
             logger.info(f"[Performance Tracking] Will verify market direction at {check_time.strftime('%H:%M')}")
@@ -191,7 +191,7 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
                 "strategy": strategy_mode
             }
         }
-        DBHandler().insert_signal(signal_details)
+        insert_signal(signal_details)
         logger.info(f"[Signal Stored] {action} at {close} for {symbol}")
 
     confidence_factors = []

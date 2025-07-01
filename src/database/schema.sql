@@ -1,4 +1,4 @@
-﻿-- Suppression et recréation de la table metrics (supprimer la version redondante)
+﻿-- Suppression et recréation de la table metrics
 DROP TABLE IF EXISTS metrics;
 CREATE TABLE metrics (
     symbol TEXT NOT NULL,
@@ -12,7 +12,7 @@ CREATE TABLE metrics (
     PRIMARY KEY (symbol, timestamp)
 );
 
--- Autres tables
+-- Autres tables (exemples, à adapter selon votre schéma)
 CREATE TABLE IF NOT EXISTS orders (
     order_id VARCHAR(64) PRIMARY KEY,
     symbol VARCHAR(20),
@@ -22,7 +22,6 @@ CREATE TABLE IF NOT EXISTS orders (
     status VARCHAR(20),
     timestamp TIMESTAMP
 );
-
 CREATE TABLE IF NOT EXISTS trades (
     id SERIAL PRIMARY KEY,
     order_id VARCHAR(64),
@@ -36,7 +35,6 @@ CREATE TABLE IF NOT EXISTS trades (
     pnl DECIMAL,
     is_trailing BOOLEAN
 );
-
 CREATE TABLE IF NOT EXISTS price_data (
     id SERIAL PRIMARY KEY,
     symbol VARCHAR(20),
@@ -48,7 +46,17 @@ CREATE TABLE IF NOT EXISTS price_data (
     volume DECIMAL,
     UNIQUE (symbol, timestamp)
 );
-
+CREATE TABLE IF NOT EXISTS metrics (
+    id SERIAL PRIMARY KEY,
+    symbol VARCHAR(20),
+    timestamp BIGINT,
+    rsi DECIMAL,
+    macd DECIMAL,
+    adx DECIMAL,
+    ema20 DECIMAL,
+    ema50 DECIMAL,
+    atr DECIMAL
+);
 CREATE TABLE IF NOT EXISTS signals (
     id SERIAL PRIMARY KEY,
     symbol VARCHAR(20),
@@ -57,7 +65,6 @@ CREATE TABLE IF NOT EXISTS signals (
     quantity DECIMAL,
     timestamp BIGINT
 );
-
 CREATE TABLE IF NOT EXISTS training_data (
     id SERIAL PRIMARY KEY,
     symbol VARCHAR(20),
