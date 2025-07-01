@@ -16,7 +16,7 @@ from src.trade_execution.order_manager import place_order, update_trailing_stop,
 from src.trade_execution.sync_orders import get_current_atr
 from src.database.db_handler import insert_trade, insert_signal, insert_metrics, create_tables, insert_price_data, get_db_connection
 from src.monitoring.metrics import record_trade_metric
-from monitoring.alerting import send_telegram_alert
+from src.monitoring.alerting import send_telegram_alert
 from src.trade_execution.sync_orders import sync_binance_trades_with_postgres
 from src.performance.tracker import performance_tracker_loop
 import sys
@@ -131,7 +131,8 @@ def handle_order_update(message):
                 'price': float(order['ap'] or order['p']),
                 'timestamp': order['T'],
                 'status': order['X'].lower(),
-                'is_trailing': order['o'] == 'TRAILING_STOP_MARKET'
+                'is_trailing': order['o'] == 'TRAILING_STOP_MARKET',
+                'trade_id': order.get('c', str(int(order['T'])))
             }
             if order_data['status'] == 'filled':
                 trade_data = {
@@ -144,7 +145,8 @@ def handle_order_update(message):
                     'take_profit': None,
                     'timestamp': order_data['timestamp'],
                     'pnl': 0.0,
-                    'is_trailing': order_data['is_trailing']
+                    'is_trailing': order_data['is_trailing'],
+                    'trade_id': order_data['trade_id']
                 }
                 insert_trade(trade_data)
                 logger.info(f"Inserted WebSocket-triggered trade for {order_data['symbol']}: {order_data['order_id']}")
@@ -156,13 +158,14 @@ def handle_order_update(message):
                         entry_price=order_data['price'],
                         position_type=position_type,
                         quantity=order_data['quantity'],
-                        atr=atr
+                        atr=atr,
+                        trade_id=order_data['trade_id']
                     )
                     logger.info(f"Initialized trailing stop for WebSocket trade {order_data['order_id']} ({order_data['symbol']})")
                 if order_data['is_trailing']:
                     current_price = order_manager.get_current_price(order_data['symbol'])
                     if current_price:
-                        ts_manager.update_trailing_stop(order_data['symbol'], current_price)
+                        ts_manager.update_trailing_stop(order_data['symbol'], current_price, trade_id=order_data['trade_id'])
                         logger.info(f"Updated trailing stop for {order_data['symbol']} at price {current_price}")
     except Exception as e:
         logger.error(f"Error handling WebSocket order update: {str(e)}")
@@ -358,13 +361,13 @@ async def main():
             try:
                 candle_data = json.loads(msg.value().decode("utf-8")) if msg.value() else None
                 if not candle_data or not isinstance(candle_data, dict):
-                   logger.error(f"[Kafka] Invalid candle data for topic {msg.topic()}: {candle_data}")
-                   continue
+                    logger.error(f"[Kafka] Invalid candle data for topic {msg.topic()}: {candle_data}")
+                    continue
                 topic = msg.topic()
                 symbol = next((s for s in SYMBOLS if f"{s}_candle" in topic), None)
                 if not symbol or symbol not in dataframes:
-                   logger.error(f"[Kafka] Invalid symbol for topic {topic}")
-                   continue
+                    logger.error(f"[Kafka] Invalid symbol for topic {topic}")
+                    continue
 
                 # Validation des clés Kafka
                 required_keys = ['T', 'o', 'h', 'l', 'c', 'v']
@@ -403,7 +406,7 @@ async def main():
                     last_action_sent[symbol] = action
 
                     if action in ["buy", "sell", "close_buy", "close_sell"]:
-                        # Calculer la confiance (similaire à signal_generator.py)
+                        # Calculer la confiance
                         rsi = dataframes[symbol]['RSI'].iloc[-1]
                         macd = dataframes[symbol]['MACD'].iloc[-1]
                         signal_line = dataframes[symbol]['MACD_signal'].iloc[-1]
@@ -429,6 +432,7 @@ async def main():
                         
                         # Insérer le signal
                         timestamp = int(candle_df.index[-1].timestamp() * 1000)
+                        trade_id = str(int(timestamp))
                         insert_signal(symbol, action, timestamp, confidence)
                         logger.info(f"[Signal] Stored signal for {symbol}: {action} at {timestamp} with confidence {confidence:.2f}")
 
@@ -436,7 +440,7 @@ async def main():
                             try:
                                 price = float(candle_df["close"].iloc[-1])
                                 atr = float(dataframes[symbol]["ATR"].iloc[-1]) if 'ATR' in dataframes[symbol].columns and not np.isnan(dataframes[symbol]["ATR"].iloc[-1]) else 0
-                                order_details[symbol] = place_order(action, price, atr, client, symbol, CAPITAL, LEVERAGE)
+                                order_details[symbol] = order_manager.place_enhanced_order(action, symbol, CAPITAL, LEVERAGE, trade_id)
                                 if order_details[symbol]:
                                     insert_trade(order_details[symbol])
                                     last_order_details[symbol] = order_details[symbol]
@@ -451,7 +455,8 @@ async def main():
                                         current_price=current_market_price,
                                         atr=atr,
                                         base_qty=float(order_details[symbol]["quantity"]),
-                                        existing_sl_order_id=None
+                                        existing_sl_order_id=last_sl_order_ids[symbol],
+                                        trade_id=trade_id
                                     )
                                 else:
                                     logger.error(f"[Order] Failed to place {action} order for {symbol}")
@@ -462,7 +467,7 @@ async def main():
                                 close_side = "sell" if action == "close_buy" else "buy"
                                 price = float(candle_df["close"].iloc[-1])
                                 atr = float(dataframes[symbol]["ATR"].iloc[-1]) if 'ATR' in dataframes[symbol].columns and not np.isnan(dataframes[symbol]["ATR"].iloc[-1]) else 0
-                                order_details[symbol] = place_order(close_side, price, atr, client, symbol, CAPITAL, LEVERAGE)
+                                order_details[symbol] = order_manager.place_enhanced_order(close_side, symbol, CAPITAL, LEVERAGE, trade_id)
                                 if order_details[symbol]:
                                     if last_order_details[symbol] and last_order_details[symbol].get("price"):
                                         open_price = float(last_order_details[symbol]["price"])

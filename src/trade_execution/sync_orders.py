@@ -3,6 +3,7 @@ from binance.um_futures import UMFutures
 from src.monitoring.metrics import get_current_atr
 from src.trade_execution.ultra_aggressive_trailing import TrailingStopManager
 from src.database.db_handler import insert_or_update_order
+from src.trade_execution.order_manager import check_open_position
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +25,7 @@ def sync_binance_trades_with_postgres(client: UMFutures, symbols, ts_manager):
                 if not isinstance(order, dict) or not order.get('orderId'):
                     logger.warning(f"Skipping invalid order for {symbol}: {order}")
                     continue
-                order_id = str(order['orderId'])  # Conversion explicite en chaîne
+                order_id = str(order['orderId'])
                 insert_or_update_order(order)
                 logger.info(f"Order {order_id} for {symbol} inserted/updated in DB.")
 
@@ -40,8 +41,30 @@ def sync_binance_trades_with_postgres(client: UMFutures, symbols, ts_manager):
                                 entry_price = float(ticker['price'])
                             quantity = float(trade['qty'])
                             position_type = "long" if order['side'] == 'BUY' else "short"
+                            trade_id = order.get('clientOrderId', str(int(trade['time'])))
+                            
+                            # Vérifier si une position est ouverte
+                            has_position, position_qty = check_open_position(client, symbol, order['side'])
+                            if not has_position:
+                                logger.info(f"[sync_orders] No open position for {symbol} on side {order['side']}. Skipping trailing stop.")
+                                continue
+
+                            # Vérifier si un trailing stop existe déjà
+                            open_orders = client.get_open_orders(symbol=symbol)
+                            for open_order in open_orders:
+                                if open_order['clientOrderId'].startswith(f"trailing_stop_{symbol}_{trade_id}"):
+                                    logger.info(f"[sync_orders] Trailing stop already exists for {symbol} trade {trade_id}. Skipping.")
+                                    continue
+
                             atr = get_current_atr(client, symbol)
-                            ts_manager.initialize_trailing_stop(symbol, entry_price, position_type, quantity, atr)
+                            ts_manager.initialize_trailing_stop(
+                                symbol=symbol,
+                                entry_price=entry_price,
+                                position_type=position_type,
+                                quantity=quantity,
+                                atr=atr,
+                                trade_id=trade_id
+                            )
                             logger.info(f"Initialized trailing stop for recovered trade {order_id} ({symbol})")
         except Exception as e:
             logger.error(f"[sync_orders] Error syncing trades for {symbol}: {str(e)}")
