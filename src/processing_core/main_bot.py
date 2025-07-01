@@ -12,8 +12,8 @@ from confluent_kafka import Consumer
 from src.data_ingestion.data_formatter import format_candle
 from src.processing_core.lstm_model import train_or_load_model
 from src.processing_core.signal_generator import check_signal, prepare_lstm_input
-from src.trade_execution.order_manager import place_order, update_trailing_stop, init_trailing_stop_manager
-from src.trade_execution.sync_orders import get_current_atr, get_current_price
+from src.trade_execution.order_manager import place_order, update_trailing_stop, init_trailing_stop_manager, EnhancedOrderManager
+from src.trade_execution.sync_orders import get_current_atr
 from src.database.db_handler import insert_trade, insert_signal, insert_metrics, create_tables, insert_price_data, get_db_connection
 from src.monitoring.metrics import record_trade_metric
 from monitoring.alerting import send_telegram_alert
@@ -49,7 +49,6 @@ project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..
 config_path = os.path.join(project_root, 'config', 'config.yaml')
 kafka_config_path = os.path.join(project_root, 'config', 'kafka_config_local.yaml')
 
-# Validate configuration files
 for config_file in [config_path, kafka_config_path]:
     if not os.path.exists(config_file):
         logger.error(f"[Config Error] Configuration file not found: {config_file}")
@@ -64,7 +63,6 @@ except Exception as e:
     logger.error(f"[Config Error] Failed to load configuration files: {e}")
     raise
 
-# Validate configuration
 required_top_level_keys = ["binance"]
 for key in required_top_level_keys:
     if key not in config or not config[key]:
@@ -86,11 +84,8 @@ KAFKA_BOOTSTRAP = kafka_config["kafka"]["bootstrap_servers"]
 MODEL_UPDATE_INTERVAL = 900  # 15 minutes
 
 # Initialize Binance client
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-logger.info(f"[Debug] sys.path: {sys.path}")
 try:
     from src.trade_execution.binance_client import init_binance_client
-    logger.info("[Debug] binance_client module imported successfully")
 except ImportError as e:
     logger.error(f"[Import Error] Failed to import binance_client: {e}")
     raise
@@ -101,8 +96,9 @@ client = UMFutures(
     base_url="https://testnet.binancefuture.com"
 )
 
-# Initialize trailing stop manager
+# Initialize trailing stop manager and order manager
 ts_manager = init_trailing_stop_manager(client)
+order_manager = EnhancedOrderManager(client, SYMBOLS)
 
 # Synchronisation initiale des trades
 logger.info("[MainBot] Syncing Binance trades with PostgreSQL and internal tracker...")
@@ -122,9 +118,7 @@ except Exception as e:
     logger.error(f"[Kafka] Failed to initialize consumer: {e}")
     raise
 
-# Initialize WebSocket client
 def handle_order_update(message):
-    """Gère les mises à jour des ordres via WebSocket."""
     try:
         if 'e' in message and message['e'] == 'ORDER_TRADE_UPDATE':
             order = message['o']
@@ -139,37 +133,33 @@ def handle_order_update(message):
                 'is_trailing': order['o'] == 'TRAILING_STOP_MARKET'
             }
             if order_data['status'] == 'filled':
-                query = "SELECT order_id, symbol FROM trades WHERE order_id = %s AND symbol = %s"
-                with get_db_connection() as conn:
-                    existing = pd.read_sql_query(query, conn, params=(order_data['order_id'], order_data['symbol']))
-                if existing.empty:
-                    trade_data = {
-                        'order_id': order_data['order_id'],
-                        'symbol': order_data['symbol'],
-                        'side': order_data['side'],
-                        'quantity': order_data['quantity'],
-                        'price': order_data['price'],
-                        'stop_loss': None,
-                        'take_profit': None,
-                        'timestamp': order_data['timestamp'],
-                        'pnl': 0.0,
-                        'is_trailing': order_data['is_trailing']
-                    }
-                    insert_trade(trade_data)
-                    logger.info(f"Inserted WebSocket-triggered trade for {order_data['symbol']}: {order_data['order_id']}")
-                    if not order_data['is_trailing']:
-                        atr = get_current_atr(client, order_data['symbol'])
-                        position_type = 'long' if order_data['side'] == 'buy' else 'short'
-                        ts_manager.initialize_trailing_stop(
-                            symbol=order_data['symbol'],
-                            entry_price=order_data['price'],
-                            position_type=position_type,
-                            quantity=order_data['quantity'],
-                            atr=atr
-                        )
-                        logger.info(f"Initialized trailing stop for WebSocket trade {order_data['order_id']} ({order_data['symbol']})")
+                trade_data = {
+                    'order_id': order_data['order_id'],
+                    'symbol': order_data['symbol'],
+                    'side': order_data['side'],
+                    'quantity': order_data['quantity'],
+                    'price': order_data['price'],
+                    'stop_loss': None,
+                    'take_profit': None,
+                    'timestamp': order_data['timestamp'],
+                    'pnl': 0.0,
+                    'is_trailing': order_data['is_trailing']
+                }
+                insert_trade(trade_data)
+                logger.info(f"Inserted WebSocket-triggered trade for {order_data['symbol']}: {order_data['order_id']}")
+                if not order_data['is_trailing']:
+                    atr = get_current_atr(client, order_data['symbol'])
+                    position_type = 'long' if order_data['side'] == 'buy' else 'short'
+                    ts_manager.initialize_trailing_stop(
+                        symbol=order_data['symbol'],
+                        entry_price=order_data['price'],
+                        position_type=position_type,
+                        quantity=order_data['quantity'],
+                        atr=atr
+                    )
+                    logger.info(f"Initialized trailing stop for WebSocket trade {order_data['order_id']} ({order_data['symbol']})")
                 if order_data['is_trailing']:
-                    current_price = get_current_price(client, order_data['symbol'])
+                    current_price = order_manager.get_current_price(order_data['symbol'])
                     if current_price:
                         ts_manager.update_trailing_stop(order_data['symbol'], current_price)
                         logger.info(f"Updated trailing stop for {order_data['symbol']} at price {current_price}")
@@ -177,7 +167,6 @@ def handle_order_update(message):
         logger.error(f"Error handling WebSocket order update: {str(e)}")
 
 def start_websocket():
-    """Démarre le client WebSocket et maintient la connexion."""
     ws_client = UMFuturesWebsocketClient()
     ws_client.user_data(
         listen_key=client.new_listen_key()['listenKey'],
@@ -186,14 +175,13 @@ def start_websocket():
     )
     logger.info("[WebSocket] WebSocket client initialized.")
     while True:
-        eventlet.sleep(3600)  # Garde la connexion ouverte, rafraîchit le listen_key toutes les heures
+        eventlet.sleep(3600)
         try:
             client.renew_listen_key(ws_client.listen_key)
             logger.info("[WebSocket] Listen key renewed.")
         except Exception as e:
             logger.error(f"[WebSocket] Failed to renew listen key: {e}")
 
-# Lancer le WebSocket dans un thread séparé
 websocket_thread = threading.Thread(target=start_websocket, daemon=True)
 websocket_thread.start()
 
@@ -201,6 +189,11 @@ def calculate_indicators(df, symbol):
     logger.info(f"Calculating indicators for {symbol} DataFrame with {len(df)} rows")
     if len(df) < 50:
         logger.info(f"Skipping indicator calculation for {symbol} due to insufficient data")
+        return df
+
+    df = df.dropna(subset=['open', 'high', 'low', 'close', 'volume'])
+    if len(df) < 50:
+        logger.warning(f"Data cleaned, insufficient rows for {symbol}: {len(df)}")
         return df
 
     try:
@@ -214,14 +207,6 @@ def calculate_indicators(df, symbol):
         required_cols = ['RSI', 'MACD', 'MACD_signal', 'MACD_hist', 'ADX', 'EMA20', 'EMA50', 'ATR']
         df[required_cols] = df[required_cols].ffill().bfill().interpolate()
 
-        try:
-            last_row = df[required_cols].iloc[-1].to_dict()
-            logger.info(f"[Debug] Indicators after update for {symbol}: {last_row}")
-        except Exception as e:
-            logger.warning(f"[Indicators] Failed to extract debug indicators for {symbol}: {e}")
-
-        logger.info(f"After filling NaN, {symbol} DataFrame has {len(df)} rows")
-
         metrics = {
             "symbol": symbol,
             "timestamp": int(df.index[-1].timestamp() * 1000),
@@ -232,15 +217,8 @@ def calculate_indicators(df, symbol):
             "ema50": float(df['EMA50'].iloc[-1]),
             "atr": float(df['ATR'].iloc[-1])
         }
-
-        if not hasattr(calculate_indicators, "last_metrics"):
-            calculate_indicators.last_metrics = []
-
-        if not any(m["timestamp"] == metrics["timestamp"] for m in calculate_indicators.last_metrics):
-            insert_metrics(symbol, metrics)
-            calculate_indicators.last_metrics.append(metrics)
-            logger.info(f"[Metrics] Inserted metrics for {symbol}: {metrics}")
-
+        insert_metrics(symbol, metrics)
+        logger.info(f"[Metrics] Inserted metrics for {symbol}: {metrics}")
     except Exception as e:
         logger.error(f"[Indicators] Error calculating indicators for {symbol}: {e}")
         import traceback
@@ -257,8 +235,10 @@ async def main():
     last_action_sent = {symbol: None for symbol in SYMBOLS}
     last_sl_order_ids = {symbol: None for symbol in SYMBOLS}
     models = {symbol: None for symbol in SYMBOLS}
-    last_sync_time = time.time()  # Initialisation pour la synchronisation périodique
-    sync_interval = 300  # 5 minutes en secondes
+    last_sync_time = time.time()
+    sync_interval = 300  # 5 minutes
+    last_metrics_update = {symbol: 0 for symbol in SYMBOLS}
+    metrics_update_interval = 300  # 5 minutes
 
     try:
         logger.info("[Main] Creating database tables")
@@ -266,8 +246,6 @@ async def main():
         if not os.path.exists(schema_path):
             logger.error(f"[Config Error] Database schema file not found: {schema_path}")
             raise FileNotFoundError(f"Database schema file not found: {schema_path}")
-        with open(schema_path, "r", encoding="utf-8-sig") as file:
-            schema_content = file.read()
         create_tables()
         logger.info("[Main] Database tables created successfully")
     except Exception as e:
@@ -286,7 +264,7 @@ async def main():
         klines = []
         limit = 1500
         start_time = None
-        while len(klines) < 2000:
+        while len(klines) < 500:
             try:
                 new_klines = client.klines(symbol=symbol, interval=TIMEFRAME, limit=limit, startTime=start_time)
                 if not new_klines or len(new_klines) == 0:
@@ -309,7 +287,7 @@ async def main():
         dataframes[symbol] = data_hist.rename(columns={"open_time": "timestamp"})
         dataframes[symbol]["timestamp"] = pd.to_datetime(dataframes[symbol]["timestamp"], unit="ms")
         dataframes[symbol].set_index("timestamp", inplace=True)
-        dataframes[symbol] = dataframes[symbol].tail(200)
+        dataframes[symbol] = dataframes[symbol].tail(500)
         dataframes[symbol] = calculate_indicators(dataframes[symbol], symbol)
 
         logger.info(f"[Main] Training or loading LSTM model for {symbol}")
@@ -338,6 +316,10 @@ async def main():
                 logger.info("[MainBot] Running periodic trade sync...")
                 sync_binance_trades_with_postgres(client, SYMBOLS, ts_manager)
                 last_sync_time = current_time
+
+            if current_time - last_metrics_update[symbol] >= metrics_update_interval:
+                dataframes[symbol] = calculate_indicators(dataframes[symbol], symbol)
+                last_metrics_update[symbol] = current_time
 
             if iteration_count % 10 == 0:
                 logger.info("[Main Loop] Starting iteration")
@@ -388,9 +370,7 @@ async def main():
                     logger.error(f"[Kafka] Invalid or empty candle data for {symbol}: {candle_data}")
                     continue
 
-                # On garde la colonne 'timestamp' pour l'insertion
                 insert_price_data(candle_df, symbol)
-                # On définit l'index après l'insertion pour la suite du traitement
                 candle_df.set_index("timestamp", inplace=True)
                 dataframes[symbol] = pd.concat([dataframes[symbol], candle_df], ignore_index=False)
                 dataframes[symbol] = calculate_indicators(dataframes[symbol], symbol)
@@ -400,7 +380,8 @@ async def main():
                         models[symbol],
                         current_positions[symbol],
                         last_order_details[symbol],
-                        symbol
+                        symbol,
+                        last_action_sent[symbol]
                     )
                     if action == last_action_sent.get(symbol):
                         logger.info(f"[Signal] Ignored repeated action for {symbol}: {action}")
@@ -414,11 +395,7 @@ async def main():
                             "price": float(candle_df["close"].iloc[-1]),
                             "timestamp": int(candle_df.index[-1].timestamp() * 1000)
                         }
-                        if not any(s["timestamp"] == signal_details["timestamp"] for s in getattr(main, "last_signals", [])):
-                            insert_signal(signal_details)
-                            if not hasattr(main, "last_signals"):
-                                main.last_signals = []
-                            main.last_signals.append(signal_details)
+                        insert_signal(signal_details)
                         logger.info(f"[Signal] Stored signal details for {symbol}: {signal_details}")
 
                         if action in ["buy", "sell"]:
@@ -486,9 +463,6 @@ if platform.system() == "Emscripten":
     asyncio.ensure_future(main())
 else:
     if __name__ == "__main__":
-        # Start performance tracker in a separate thread
         performance_thread = threading.Thread(target=performance_tracker_loop, args=(client, SYMBOLS), daemon=True)
         performance_thread.start()
-        
-        # Run main loop
         asyncio.run(main())

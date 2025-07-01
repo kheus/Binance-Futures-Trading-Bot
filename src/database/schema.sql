@@ -1,93 +1,90 @@
-﻿-- Table des transactions exécutées
+﻿-- Suppression et recréation de la table metrics
+DROP TABLE IF EXISTS metrics;
+CREATE TABLE metrics (
+    symbol TEXT NOT NULL,
+    timestamp BIGINT NOT NULL,
+    rsi DOUBLE PRECISION,
+    macd DOUBLE PRECISION,
+    adx DOUBLE PRECISION,
+    ema20 DOUBLE PRECISION,
+    ema50 DOUBLE PRECISION,
+    atr DOUBLE PRECISION,
+    PRIMARY KEY (symbol, timestamp)
+);
+
+-- Autres tables (exemples, à adapter selon votre schéma)
+CREATE TABLE IF NOT EXISTS orders (
+    order_id VARCHAR(64) PRIMARY KEY,
+    symbol VARCHAR(20),
+    side VARCHAR(10),
+    quantity DECIMAL,
+    price DECIMAL,
+    status VARCHAR(20),
+    timestamp TIMESTAMP
+);
 CREATE TABLE IF NOT EXISTS trades (
-    trade_id SERIAL PRIMARY KEY,
-    order_id TEXT NOT NULL,
-    symbol TEXT NOT NULL,
-    side TEXT NOT NULL CHECK (side IN ('buy', 'sell')),
-    quantity NUMERIC NOT NULL CHECK (quantity > 0),
-    price NUMERIC NOT NULL CHECK (price > 0),
-    stop_loss VARCHAR(20),
-    take_profit NUMERIC,
-    timestamp BIGINT NOT NULL,
-    pnl NUMERIC DEFAULT 0.0,
-    is_trailing BOOLEAN DEFAULT FALSE,
-    UNIQUE(order_id, symbol)
+    id SERIAL PRIMARY KEY,
+    order_id VARCHAR(64),
+    symbol VARCHAR(20),
+    side VARCHAR(10),
+    quantity DECIMAL,
+    price DECIMAL,
+    stop_loss DECIMAL,
+    take_profit DECIMAL,
+    timestamp BIGINT,
+    pnl DECIMAL,
+    is_trailing BOOLEAN
 );
-
--- Table des signaux de trading
-CREATE TABLE IF NOT EXISTS signals (
-    signal_id SERIAL PRIMARY KEY,
-    symbol TEXT NOT NULL,
-    signal_type TEXT NOT NULL CHECK (signal_type IN ('buy', 'sell', 'close_buy', 'close_sell')),
-    price NUMERIC NOT NULL CHECK (price > 0),
-    quantity NUMERIC,
-    timestamp BIGINT NOT NULL
+CREATE TABLE IF NOT EXISTS price_data (
+    id SERIAL PRIMARY KEY,
+    symbol VARCHAR(20),
+    timestamp TIMESTAMP,
+    open DECIMAL,
+    high DECIMAL,
+    low DECIMAL,
+    close DECIMAL,
+    volume DECIMAL,
+    UNIQUE (symbol, timestamp)
 );
-
--- Table des indicateurs techniques calculés
 CREATE TABLE IF NOT EXISTS metrics (
-    metric_id SERIAL PRIMARY KEY,
-    symbol TEXT NOT NULL,
-    timestamp BIGINT NOT NULL,
-    rsi NUMERIC,
-    macd NUMERIC,
-    adx NUMERIC,
-    ema20 NUMERIC,
-    ema50 NUMERIC,
-    atr NUMERIC
+    id SERIAL PRIMARY KEY,
+    symbol VARCHAR(20),
+    timestamp BIGINT,
+    rsi DECIMAL,
+    macd DECIMAL,
+    adx DECIMAL,
+    ema20 DECIMAL,
+    ema50 DECIMAL,
+    atr DECIMAL
 );
-
--- Table des données de training pour le modèle LSTM
+CREATE TABLE IF NOT EXISTS signals (
+    id SERIAL PRIMARY KEY,
+    symbol VARCHAR(20),
+    signal_type VARCHAR(20),
+    price DECIMAL,
+    quantity DECIMAL,
+    timestamp BIGINT
+);
 CREATE TABLE IF NOT EXISTS training_data (
     id SERIAL PRIMARY KEY,
-    symbol TEXT NOT NULL,
-    timestamp BIGINT NOT NULL,
-    prediction NUMERIC,
-    action TEXT,
-    price NUMERIC,
+    symbol VARCHAR(20),
+    timestamp BIGINT,
+    prediction DECIMAL,
+    action VARCHAR(20),
+    price DECIMAL,
     indicators JSONB,
     market_context JSONB,
     market_direction INTEGER,
-    price_change_pct NUMERIC,
-    prediction_correct INTEGER,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    price_change_pct DECIMAL,
+    prediction_correct BOOLEAN,
+    updated_at TIMESTAMP
 );
 
--- Table des bougies (candlestick data)
-CREATE TABLE IF NOT EXISTS price_data (
+CREATE TABLE IF NOT EXISTS price_history (
     id SERIAL PRIMARY KEY,
-    symbol TEXT NOT NULL,
-    timestamp TIMESTAMP NOT NULL,
-    open NUMERIC NOT NULL,
-    high NUMERIC NOT NULL,
-    low NUMERIC NOT NULL,
-    close NUMERIC NOT NULL,
-    volume NUMERIC NOT NULL,
-    UNIQUE(symbol, timestamp)
-);
-
-CREATE TABLE IF NOT EXISTS daily_reports (
-    report_date VARCHAR(10),
-    total_trades INTEGER,
-    win_rate FLOAT,
-    total_pnl FLOAT,
-    avg_duration FLOAT,
-    symbol_summary TEXT
-);
-
-CREATE TABLE IF NOT EXISTS orders (
-    id SERIAL PRIMARY KEY,
-    order_id VARCHAR(50) NOT NULL,
-    symbol VARCHAR(20) NOT NULL,
-    side VARCHAR(10) NOT NULL,
-    quantity DECIMAL(20, 8) NOT NULL,
-    price DECIMAL(20, 8) NOT NULL,
-    status VARCHAR(20) NOT NULL,
-    timestamp TIMESTAMP NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(order_id, symbol)
+    symbol VARCHAR(20),
+    price DECIMAL,
+    timestamp BIGINT
 );
 
 CREATE INDEX IF NOT EXISTS idx_orders_order_id ON orders(order_id);

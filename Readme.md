@@ -63,8 +63,11 @@ git add C:\Users\Cheikh\binance-trading-bot\src\processing_core\lstm_model.py
 git add C:\Users\Cheikh\binance-trading-bot\src\processing_core\signal_generator.py
 git add C:\Users\Cheikh\binance-trading-bot\src\trade_execution\order_manager.py
 git add C:\Users\Cheikh\binance-trading-bot\src\trade_execution\sync_orders.py
+git add C:\Users\Cheikh\binance-trading-bot\src\trade_execution\ultra_aggressive_trailing.py
+git add C:\Users\Cheikh\binance-trading-bot\Readme.md
 git commit -m "Updates"
+git push -u origin master
 git commit -m "Premier push du bot de trading"
 
 git branch -M main
-git push -u origin main
+

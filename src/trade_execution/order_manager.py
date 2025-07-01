@@ -1,10 +1,10 @@
 ﻿try:
-   # Dans order_manager.py
-   from src.trade_execution.order_utils import get_open_orders   
-   from binance.enums import SIDE_BUY, SIDE_SELL, ORDER_TYPE_MARKET
-   from src.trade_execution.correlation_monitor import CorrelationMonitor
-   from src.trade_execution.trade_analyzer import TradeAnalyzer
-   from src.trade_execution.ultra_aggressive_trailing import UltraAgressiveTrailingStop, get_average_fill_price
+    # Dans order_manager.py
+    from src.trade_execution.order_utils import get_open_orders   
+    from binance.enums import SIDE_BUY, SIDE_SELL, ORDER_TYPE_MARKET
+    from src.trade_execution.correlation_monitor import CorrelationMonitor
+    from src.trade_execution.trade_analyzer import TradeAnalyzer
+    from src.trade_execution.ultra_aggressive_trailing import TrailingStopManager, get_average_fill_price
 except ImportError:
     SIDE_BUY = 'BUY'
     SIDE_SELL = 'SELL'
@@ -15,6 +15,7 @@ import logging
 import yaml
 import talib
 import numpy as np
+import pandas as pd
 from pathlib import Path
 from tabulate import tabulate
 import inspect
@@ -41,7 +42,7 @@ crash_protector = MarketCrashProtector()
 
 def init_trailing_stop_manager(client):
     global ts_manager
-    ts_manager = UltraAgressiveTrailingStop(client)
+    ts_manager = TrailingStopManager(client)  # Utiliser TrailingStopManager au lieu de UltraAgressiveTrailingStop
     return ts_manager
 
 def get_tick_info(client, symbol):
@@ -228,7 +229,7 @@ def track_order_locally(order):
 class EnhancedOrderManager:
     def __init__(self, client, symbols):
         self.client = client
-        self.ts_manager = UltraAgressiveTrailingStop(client)
+        self.ts_manager = TrailingStopManager(client)  # Utiliser TrailingStopManager
         self.crash_protector = MarketCrashProtector()
         self.correlation_monitor = CorrelationMonitor(symbols)
         self.trade_analyzer = TradeAnalyzer()
@@ -241,7 +242,6 @@ class EnhancedOrderManager:
         except Exception as e:
             logger.error(f"[EnhancedOrderManager] Failed to get current price for {symbol}: {e}")
             return None
-
 
     def is_overexposed(self, symbol, corr_matrix):
         try:
@@ -297,6 +297,22 @@ class EnhancedOrderManager:
             logger.error(f"[EnhancedOrderManager] Error placing enhanced order for {symbol}: {e}")
             return None
 
+    def get_current_atr(self, symbol):
+        try:
+            klines = self.client.klines(symbol=symbol, interval='1h', limit=14)
+            if len(klines) < 14:
+                logger.warning(f"Insufficient data for ATR calculation for {symbol}: {len(klines)}")
+                return 0.0
+            df = pd.DataFrame(klines, columns=["open_time", "open", "high", "low", "close", "volume",
+                                              "close_time", "quote_asset_vol", "num_trades", "taker_buy_base_vol",
+                                              "taker_buy_quote_vol", "ignore"])
+            df = df[["high", "low", "close"]].astype(float)
+            atr = talib.ATR(df["high"], df["low"], df["close"], timeperiod=14)[-1]
+            return float(atr) if not pd.isna(atr) else 0.0
+        except Exception as e:
+            logger.error(f"[EnhancedOrderManager] Failed to calculate ATR for {symbol}: {e}")
+            return 0.0
+
 def wait_until_order_finalized(client, symbol, order_id, max_retries=5, sleep_seconds=1):
     """
     Attend que l'ordre soit dans un état final (FILLED, PARTIALLY_FILLED, REJECTED, CANCELED).
@@ -321,7 +337,7 @@ def monitor_and_update_trailing_stop(client, symbol, order_id, ts_manager):
         logger.info(f"[OrderManager] Order {order_id} status: {status}")
         if status == "FILLED":
             current_price = float(client.ticker_price(symbol=symbol)['price'])
-            # Exemple : appliquer le trailing stop
+            # Exemple : appliquer le trailing stop
             ts_manager.update_trailing_stop(symbol, current_price)
             logger.info(f"[OrderManager] Trailing stop updated for {symbol} at price {current_price}")
         return status
@@ -384,4 +400,3 @@ for symbol in SYMBOLS:
             send_telegram_alert(f"⚠️ CRASH DETECTED - Position closed for {symbol}")
     except Exception as e:
         logger.error(f"[OrderManager] Failed to process {symbol}: {e}")
-

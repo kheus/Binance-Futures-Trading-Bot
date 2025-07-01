@@ -1,6 +1,7 @@
-﻿import yaml
-import logging
+﻿import logging
 import psycopg2
+import yaml
+from pathlib import Path
 from psycopg2.extras import RealDictCursor
 from contextlib import contextmanager
 import json
@@ -70,7 +71,7 @@ def get_db_connection():
 
 def execute_query(query, params=None, fetch=False):
     with get_db_connection() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        with conn.cursor(cursor_factory=RealDictCursor) if fetch else conn.cursor() as cur:
             try:
                 logger.debug(f"[execute_query] Executing query: {query[:100]}... with params: {params}")
                 cur.execute(query, params)
@@ -105,96 +106,147 @@ def create_tables():
         logger.error(f"Error reading or executing schema.sql: {e}")
         raise
 
-def insert_trade(trade):
+def insert_or_update_order(order):
+    """
+    Insère ou met à jour un ordre dans la table orders.
+    Gère explicitement les conversions de types pour éviter les erreurs de clé primaire ou de type.
+    """
+    query_check = "SELECT order_id FROM orders WHERE order_id = %s"
+    query_update = """
+        UPDATE orders
+        SET symbol = %s, side = %s, quantity = %s, price = %s, status = %s, timestamp = to_timestamp(%s / 1000.0)
+        WHERE order_id = %s
+    """
+    query_insert = """
+        INSERT INTO orders (order_id, symbol, side, quantity, price, status, timestamp)
+        VALUES (%s, %s, %s, %s, %s, %s, to_timestamp(%s / 1000.0))
+    """
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            try:
+                order_id_str = str(order['orderId']) if 'orderId' in order else str(order['order_id'])
+                cur.execute(query_check, (order_id_str,))
+                exists = cur.fetchone()
+
+                symbol = order.get('symbol')
+                side = order.get('side')
+                quantity = float(order.get('origQty', order.get('quantity', 0)))
+                price = float(order.get('price'))
+                status = order.get('status')
+                timestamp = int(order.get('time', order.get('timestamp', 0)))
+
+                if exists:
+                    cur.execute(
+                        query_update,
+                        (
+                            symbol,
+                            side,
+                            quantity,
+                            price,
+                            status,
+                            timestamp,
+                            order_id_str
+                        )
+                    )
+                    logger.info(f"Order {order_id_str} for {symbol} updated in DB.")
+                else:
+                    cur.execute(
+                        query_insert,
+                        (
+                            order_id_str,
+                            symbol,
+                            side,
+                            quantity,
+                            price,
+                            status,
+                            timestamp
+                        )
+                    )
+                    logger.info(f"Order {order_id_str} for {symbol} inserted in DB.")
+                conn.commit()
+                return True
+            except Exception as e:
+                logger.error(f"Error inserting/updating order {order_id_str}: {str(e)}")
+                conn.rollback()
+                return False
+
+def insert_signal(symbol, signal_type, timestamp, confidence):
+    query = """
+    INSERT INTO signals (symbol, signal_type, timestamp, confidence)
+    VALUES (%s, %s, %s, %s)
+    """
+    try:
+        execute_query(query, (symbol, signal_type, timestamp, confidence))
+        logger.info(f"Signal inserted for {symbol}: {signal_type} at {timestamp} with confidence {confidence}")
+        return True
+    except Exception as e:
+        logger.error(f"Error inserting signal for {symbol}: {str(e)}")
+        return False
+
+def insert_training_data(symbol, data, timestamp):
+    query = """
+    INSERT INTO training_data (symbol, data, timestamp)
+    VALUES (%s, %s, %s)
+    """
+    try:
+        execute_query(query, (symbol, str(data), timestamp))
+        logger.info(f"Training data inserted for {symbol} at {timestamp}")
+        return True
+    except Exception as e:
+        logger.error(f"Error inserting training data for {symbol}: {str(e)}")
+        return False
+
+def get_future_prices(symbol, limit=10):
+    query = """
+    SELECT price, timestamp FROM price_history
+    WHERE symbol = %s
+    ORDER BY timestamp DESC
+    LIMIT %s
+    """
+    try:
+        return execute_query(query, (symbol, limit), fetch=True)
+    except Exception as e:
+        logger.error(f"Error fetching future prices for {symbol}: {str(e)}")
+        return []
+
+def get_training_data_count(symbol):
+    query = """
+    SELECT COUNT(*) FROM training_data
+    WHERE symbol = %s
+    """
+    try:
+        result = execute_query(query, (symbol,), fetch=True)
+        return result[0][0] if result else 0
+    except Exception as e:
+        logger.error(f"Error fetching training data count for {symbol}: {str(e)}")
+        return 0
+
+def insert_trade(trade_data):
     query = """
     INSERT INTO trades (order_id, symbol, side, quantity, price, stop_loss, take_profit, timestamp, pnl, is_trailing)
     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-    ON CONFLICT (order_id, symbol) DO UPDATE
-    SET side = EXCLUDED.side,
-        quantity = EXCLUDED.quantity,
-        price = EXCLUDED.price,
-        stop_loss = EXCLUDED.stop_loss,
-        take_profit = EXCLUDED.take_profit,
-        timestamp = EXCLUDED.timestamp,
-        pnl = EXCLUDED.pnl,
-        is_trailing = EXCLUDED.is_trailing
     """
     try:
-        stop_loss = None if trade.get("is_trailing") else trade.get("stop_loss")
-        params = (
-            str(trade["order_id"]),
-            str(trade["symbol"]),
-            str(trade["side"]),
-            float(trade["quantity"]),
-            float(trade["price"]),
-            str(stop_loss) if stop_loss is not None else None,
-            float(trade.get("take_profit")) if trade.get("take_profit") is not None else None,
-            int(trade["timestamp"]),
-            float(trade.get("pnl", 0.0)),
-            bool(trade.get("is_trailing", False))
-        )
-        execute_query(query, params)
-        logger.info(f"Trade inséré/mis à jour: order_id={trade['order_id']}, symbol={trade['symbol']}")
+        execute_query(query, (
+            trade_data.get('order_id'),
+            trade_data.get('symbol'),
+            trade_data.get('side'),
+            trade_data.get('quantity'),
+            trade_data.get('price'),
+            trade_data.get('stop_loss'),
+            trade_data.get('take_profit'),
+            trade_data.get('timestamp'),
+            trade_data.get('pnl', 0.0),
+            trade_data.get('is_trailing', False)
+        ))
+        logger.info(f"Trade inserted for {trade_data.get('symbol')}: {trade_data.get('order_id')}")
+        return True
     except Exception as e:
-        logger.error(f"Failed to insert/update trade {trade.get('order_id', 'unknown')} for {trade.get('symbol', 'unknown')}: {e}")
-        raise
-
-def insert_price_data(df, symbol):
-    query = """
-    INSERT INTO price_data (symbol, timestamp, open, high, low, close, volume)
-    VALUES (%s, %s, %s, %s, %s, %s, %s)
-    ON CONFLICT (symbol, timestamp) DO NOTHING
-    """
-    try:
-        logger.info(f"[insert_price_data] DataFrame for {symbol}: {df.to_dict()}")
-        with get_db_connection() as conn:
-            with conn.cursor() as cur:
-                for _, row in df.iterrows():
-                    if not isinstance(row['timestamp'], pd.Timestamp):
-                        logger.error(f"[insert_price_data] Invalid timestamp format for {symbol}: {row['timestamp']} (type: {type(row['timestamp'])})")
-                        continue
-                    params = (
-                        symbol,
-                        row['timestamp'],
-                        float(row['open']),
-                        float(row['high']),
-                        float(row['low']),
-                        float(row['close']),
-                        float(row['volume'])
-                    )
-                    try:
-                        cur.execute(query, params)
-                    except psycopg2.Error as e:
-                        logger.error(f"[insert_price_data] PostgreSQL error for {symbol}: {e.pgerror}, code: {e.pgcode}")
-                        raise
-                conn.commit()
-                logger.info(f"Inserted price data for {symbol}")
+        logger.error(f"Error inserting trade for {trade_data.get('order_id')}: {str(e)}")
+        return False
     except Exception as e:
-        logger.error(f"Failed to insert price data for {symbol}: {str(e)}, type: {type(e).__name__}")
-        raise
-
-def insert_signal(signal):
-    if signal.get("signal_type") not in {'buy', 'sell', 'close_buy', 'close_sell'}:
-        logger.error(f"Signal type invalide: {signal}")
-        return
-
-    query = """
-    INSERT INTO signals (symbol, signal_type, price, quantity, timestamp)
-    VALUES (%s, %s, %s, %s, %s)
-    """
-    try:
-        params = (
-            str(signal["symbol"]),
-            str(signal["signal_type"]),
-            float(signal["price"]),
-            float(signal.get("quantity", 0)),
-            int(signal["timestamp"])
-        )
-        execute_query(query, params)
-        logger.info(f"Signal inséré: {signal}")
-    except Exception as e:
-        logger.error(f"Failed to insert signal for {signal.get('symbol', 'unknown')}: {e}")
-        raise
+        logger.error(f"Error inserting trade for {trade_data.get('order_id')}: {str(e)}")
+        return False
 
 def insert_metrics(symbol, metrics):
     query = """
@@ -202,42 +254,38 @@ def insert_metrics(symbol, metrics):
     VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
     """
     try:
-        params = (
-            str(symbol),
-            int(metrics["timestamp"]),
-            float(metrics.get("rsi", 0)),
-            float(metrics.get("macd", 0)),
-            float(metrics.get("adx", 0)),
-            float(metrics.get("ema20", 0)),
-            float(metrics.get("ema50", 0)),
-            float(metrics.get("atr", 0))
-        )
-        execute_query(query, params)
-        logger.info(f"Inserted metrics for {symbol}: {metrics}")
+        execute_query(query, (
+            symbol,
+            metrics.get('timestamp'),
+            metrics.get('rsi'),
+            metrics.get('macd'),
+            metrics.get('adx'),
+            metrics.get('ema20'),
+            metrics.get('ema50'),
+            metrics.get('atr')
+        ))
+        logger.info(f"Metrics inserted for {symbol} at {metrics.get('timestamp')}")
+        return True
     except Exception as e:
-        logger.error(f"Failed to insert metrics for {symbol}: {e}")
-        raise
+        logger.error(f"Error inserting metrics for {symbol}: {str(e)}")
+        return False
 
-def insert_training_data(record):
+def insert_price_data(price_data, symbol):
     query = """
-    INSERT INTO training_data (symbol, timestamp, prediction, action, price, indicators, market_context)
-    VALUES (%s, %s, %s, %s, %s, %s, %s)
+    INSERT INTO price_history (symbol, price, timestamp)
+    VALUES (%s, %s, %s)
     """
     try:
-        params = (
-            str(record['symbol']),
-            int(record['timestamp']),
-            float(record.get('prediction')) if record.get('prediction') is not None else None,
-            str(record.get('action')) if record.get('action') is not None else None,
-            float(record.get('price')) if record.get('price') is not None else None,
-            json.dumps(record.get('indicators', {})),
-            json.dumps(record.get('market_context', {}))
-        )
-        execute_query(query, params)
-        logger.info(f"Training data inserted: {record}")
+        execute_query(query, (
+            symbol,
+            price_data['close'].iloc[-1],
+            int(price_data.index[-1].timestamp() * 1000)
+        ))
+        logger.info(f"Price data inserted for {symbol} at {int(price_data.index[-1].timestamp() * 1000)}")
+        return True
     except Exception as e:
-        logger.error(f"Failed to insert training data for {record.get('symbol', 'unknown')}: {e}")
-        raise
+        logger.error(f"Error inserting price data for {symbol}: {str(e)}")
+        return False
 
 def get_trades():
     query = "SELECT * FROM trades ORDER BY timestamp DESC"
@@ -503,7 +551,3 @@ def _validate_timestamp(ts):
     except (TypeError, ValueError) as e:
         logger.error(f"Timestamp invalide: {ts} - {str(e)}")
         raise ValueError(f"Format de timestamp invalide: {ts}") from e
-
-if __name__ == "__main__":
-    create_tables()
-    test_connection()

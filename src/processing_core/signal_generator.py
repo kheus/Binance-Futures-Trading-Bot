@@ -1,5 +1,4 @@
-﻿# Signal Generator Module - Enhanced with Performance Tracking
-import logging
+﻿import logging
 import numpy as np
 import pandas as pd
 import talib
@@ -17,7 +16,6 @@ def prepare_lstm_input(df):
         logger.warning("[Debug] NaN values detected in LSTM input, filling with forward fill")
         df_filled = df[required_cols].ffill().values[-100:]
         data = df_filled.astype(float)
-    logger.info(f"[Debug] LSTM input shape: {data.shape}, contains nan: {np.isnan(data).any()}")
     return data.reshape(1, 100, len(required_cols))
 
 def calculate_dynamic_thresholds(adx, strategy="trend"):
@@ -36,10 +34,9 @@ def select_strategy_mode(adx, rsi, atr):
         return "trend"
     elif adx < 15 and 40 < rsi < 60 and atr < 30:
         return "range"
-    return "scalp"  # Default to scalp if conditions
+    return "scalp"
 
 def calculate_market_direction(symbol, signal_timestamp):
-    """Calculate actual market movement after a trade signal"""
     try:
         future_df = get_future_prices(symbol, signal_timestamp, candle_count=5)
         if len(future_df) < 5:
@@ -55,7 +52,6 @@ def calculate_market_direction(symbol, signal_timestamp):
         return None, None
 
 def should_retrain_model():
-    """Check if model should be retrained based on collected data"""
     if datetime.now().weekday() == 0:
         return True
     new_data_count = get_training_data_count(since_last_train=True)
@@ -64,16 +60,9 @@ def should_retrain_model():
     return False
 
 def check_signal(df, model, current_position, last_order_details, symbol, last_action_sent=None):
-    if not hasattr(check_signal, 'last_df') or check_signal.last_df is not df:
-        # Recalculate indicators if the DataFrame reference has changed
-        check_signal.last_df = df
-    # Use pre-calculated indicators
-
-    logger.info(f"[Debug] Using model with last_train_time: {getattr(model, 'last_train_time', 'N/A')} for {symbol}")
     if len(df) < 100:
         return "None", None
 
-    # --- Indicators ---
     rsi = df['RSI'].iloc[-1]
     macd = df['MACD'].iloc[-1]
     signal_line = df['MACD_signal'].iloc[-1]
@@ -87,75 +76,72 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
     strategy_mode = select_strategy_mode(adx, rsi, atr)
     logger.info(f"[Strategy] Switched to {strategy_mode}, ADX: {adx:.2f}, RSI: {rsi:.2f}, ATR: {atr:.2f}, Roc: {roc:.2f} for {symbol}")
 
-
     lstm_input = prepare_lstm_input(df)
     try:
         prediction = model.predict(lstm_input, verbose=0)[0][0]
     except Exception as e:
         logger.error(f"[Prediction Error] {e} for {symbol}")
-        return
+        return "None", current_position
 
     dynamic_up, dynamic_down = calculate_dynamic_thresholds(adx, strategy_mode)
     trend_up = ema20 > ema50
     trend_down = ema20 < ema50
     macd_bullish = macd > signal_line
-    rsi_strong = (trend_up and rsi > 55) or (trend_down and rsi < 40) or (abs(rsi - 50) > 20)
+    rsi_strong = (trend_up and rsi > 50) or (trend_down and rsi < 50) or (abs(rsi - 50) > 15)
     rolling_high = df['high'].rolling(window=20).max()
     rolling_low = df['low'].rolling(window=20).min()
-    breakout_up = close > (rolling_high.iloc[-1] - 0.3 * atr) if len(df) >= 20 else False
-    breakout_down = close < (rolling_low.iloc[-1] + 0.3 * atr) if len(df) >= 20 else False
+    breakout_up = close > (rolling_high.iloc[-1] - 0.2 * atr) if len(df) >= 20 else False
+    breakout_down = close < (rolling_low.iloc[-1] + 0.2 * atr) if len(df) >= 20 else False
     bullish_divergence = (df['close'].iloc[-1] < df['close'].iloc[-3] and df['RSI'].iloc[-1] > df['RSI'].iloc[-3])
     bearish_divergence = (df['close'].iloc[-1] > df['close'].iloc[-3] and df['RSI'].iloc[-1] < df['RSI'].iloc[-3])
 
     action = "None"
     new_position = None
     signal_timestamp = int(time.time() * 1000)
-    logger.debug(f"Processing signal for {symbol} at timestamp {signal_timestamp}") 
-    # --- Signal logic (same as previous, can be customized) ---
+    logger.debug(f"Processing signal for {symbol} at timestamp {signal_timestamp}")
+
     if strategy_mode == "scalp" and rsi_strong:
-        if prediction > dynamic_up + 0.1 and roc > 1.0:  # Higher confidence
-            action = "Sell"
+        if prediction > dynamic_up and roc > 0.5:
+            action = "sell"
             new_position = "short"
-        elif prediction < dynamic_down - 0.1 and roc < -1.0:
+        elif prediction < dynamic_down and roc < -0.5:
             action = "buy"
             new_position = "long"
     elif strategy_mode == "trend":
-        if (trend_up and macd_bullish and rsi_strong and prediction > dynamic_up and breakout_up and roc > 0.5):
+        if (trend_up and macd_bullish and rsi_strong and prediction > dynamic_up and breakout_up):
             action = "sell"
             new_position = "short"
-        elif (trend_down and not macd_bullish and rsi_strong and prediction < dynamic_down and breakout_down and roc < -0.5):
+        elif (trend_down and not macd_bullish and rsi_strong and prediction < dynamic_down and breakout_down):
             action = "buy"
             new_position = "long"
     elif strategy_mode == "range":
         range_high = rolling_high.iloc[-1]
         range_low = rolling_low.iloc[-1]
-        if close <= (range_low + 0.2 * atr) and prediction > dynamic_up and roc > 0.5:
+        if close <= (range_low + 0.1 * atr) and prediction > dynamic_up:
             action = "buy"
             new_position = "long"
-        elif close >= (range_high - 0.2 * atr) and prediction < dynamic_down and roc < -0.5:
+        elif close >= (range_high - 0.1 * atr) and prediction < dynamic_down:
             action = "sell"
             new_position = "short"
 
-    if bullish_divergence and prediction > 0.6 and roc > 1.5:
+    if bullish_divergence and prediction > 0.55 and roc > 1.0:
         action = "buy"
         new_position = "long"
-    elif bearish_divergence and prediction < 0.4 and roc < -1.5:
+    elif bearish_divergence and prediction < 0.45 and roc < -1.0:
         action = "sell"
         new_position = "short"
 
-    if current_position == "long" and (trend_down or not macd_bullish or roc < -1.0):
+    if current_position == "long" and (trend_down or not macd_bullish or roc < -0.5):
         action = "close_buy"
         new_position = None
-    elif current_position == "short" and (trend_up or macd_bullish or roc > 1.0):
+    elif current_position == "short" and (trend_up or macd_bullish or roc > 0.5):
         action = "close_sell"
         new_position = None
 
-    # Anti-redundancy
     if action == last_action_sent:
         logger.info(f"[Anti-Repeat] Signal {action} ignored for {symbol} as it was sent previously.")
         return "None", current_position
 
-    # Store signal and training data for model improvement
     if action in ("buy", "sell"):
         try:
             training_record = {
@@ -193,7 +179,7 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
     if action != "None":
         signal_details = {
             "symbol": symbol,
-            "signal_type": action.lower() if isinstance(action, str) else action,
+            "signal_type": action.lower(),
             "price": float(close),
             "timestamp": signal_timestamp,
             "quantity": 0.0,
@@ -207,21 +193,17 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
         }
         insert_signal(signal_details)
         logger.info(f"[Signal Stored] {action} at {close} for {symbol}")
-    else:
-        logger.info(f"[No Signal] Conditions not met for {symbol}")
 
-    # --- Confidence Score ---
     confidence_factors = []
-
-    if prediction > 0.6 or prediction < 0.4:
+    if prediction > 0.55 or prediction < 0.45:
         confidence_factors.append("LSTM strong")
     if (trend_up and macd > signal_line) or (trend_down and macd < signal_line):
         confidence_factors.append("MACD aligned")
-    if rsi > 55 or rsi < 45:
+    if rsi > 50 or rsi < 50:
         confidence_factors.append("RSI strong")
     if (trend_up and ema20 > ema50) or (trend_down and ema20 < ema50):
         confidence_factors.append("EMA trend")
-    if abs(roc) > 1.0:
+    if abs(roc) > 0.5:
         confidence_factors.append("ROC momentum")
     if breakout_up or breakout_down:
         confidence_factors.append("Breakout detected")
