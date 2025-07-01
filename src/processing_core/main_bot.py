@@ -13,8 +13,8 @@ from src.data_ingestion.data_formatter import format_candle
 from src.processing_core.lstm_model import train_or_load_model
 from src.processing_core.signal_generator import check_signal, prepare_lstm_input
 from src.trade_execution.order_manager import place_order, update_trailing_stop, init_trailing_stop_manager, EnhancedOrderManager
-from src.trade_execution.sync_orders import get_current_atr
-from src.database.db_handler import insert_trade, insert_signal, insert_metrics, create_tables, insert_price_data, get_db_connection
+from src.monitoring.metrics import get_current_atr
+from src.database.db_handler import DBHandler
 from src.monitoring.metrics import record_trade_metric
 from monitoring.alerting import send_telegram_alert
 from src.trade_execution.sync_orders import sync_binance_trades_with_postgres
@@ -145,7 +145,7 @@ def handle_order_update(message):
                     'pnl': 0.0,
                     'is_trailing': order_data['is_trailing']
                 }
-                insert_trade(trade_data)
+                DBHandler().insert_trade(trade_data)
                 logger.info(f"Inserted WebSocket-triggered trade for {order_data['symbol']}: {order_data['order_id']}")
                 if not order_data['is_trailing']:
                     atr = get_current_atr(client, order_data['symbol'])
@@ -217,7 +217,7 @@ def calculate_indicators(df, symbol):
             "ema50": float(df['EMA50'].iloc[-1]),
             "atr": float(df['ATR'].iloc[-1])
         }
-        insert_metrics(symbol, metrics)
+        DBHandler().insert_metrics(symbol, metrics)
         logger.info(f"[Metrics] Inserted metrics for {symbol}: {metrics}")
     except Exception as e:
         logger.error(f"[Indicators] Error calculating indicators for {symbol}: {e}")
@@ -246,7 +246,7 @@ async def main():
         if not os.path.exists(schema_path):
             logger.error(f"[Config Error] Database schema file not found: {schema_path}")
             raise FileNotFoundError(f"Database schema file not found: {schema_path}")
-        create_tables()
+        DBHandler().create_tables()
         logger.info("[Main] Database tables created successfully")
     except Exception as e:
         logger.error(f"[Main] Error creating database tables: {e}")
@@ -370,7 +370,7 @@ async def main():
                     logger.error(f"[Kafka] Invalid or empty candle data for {symbol}: {candle_data}")
                     continue
 
-                insert_price_data(candle_df, symbol)
+                DBHandler().insert_price_data(candle_df, symbol)
                 candle_df.set_index("timestamp", inplace=True)
                 dataframes[symbol] = pd.concat([dataframes[symbol], candle_df], ignore_index=False)
                 dataframes[symbol] = calculate_indicators(dataframes[symbol], symbol)
@@ -395,7 +395,7 @@ async def main():
                             "price": float(candle_df["close"].iloc[-1]),
                             "timestamp": int(candle_df.index[-1].timestamp() * 1000)
                         }
-                        insert_signal(signal_details)
+                        DBHandler().insert_signal(signal_details)
                         logger.info(f"[Signal] Stored signal details for {symbol}: {signal_details}")
 
                         if action in ["buy", "sell"]:
@@ -404,7 +404,7 @@ async def main():
                                 atr = float(dataframes[symbol]["ATR"].iloc[-1]) if 'ATR' in dataframes[symbol].columns and not np.isnan(dataframes[symbol]["ATR"].iloc[-1]) else 0
                                 order_details[symbol] = place_order(action, price, atr, client, symbol, CAPITAL, LEVERAGE)
                                 if order_details[symbol]:
-                                    insert_trade(order_details[symbol])
+                                    DBHandler().insert_trade(order_details[symbol])
                                     last_order_details[symbol] = order_details[symbol]
                                     record_trade_metric(order_details[symbol])
                                     send_telegram_alert(f"Trade executed: {action.upper()} {symbol} at {price}")
@@ -439,7 +439,7 @@ async def main():
                                         order_details[symbol]["pnl"] = pnl
                                     else:
                                         order_details[symbol]["pnl"] = 0.0
-                                    insert_trade(order_details[symbol])
+                                    DBHandler().insert_trade(order_details[symbol])
                                     last_order_details[symbol] = order_details[symbol]
                                     record_trade_metric(order_details[symbol])
                                     send_telegram_alert(f"Trade closed: {action.upper()} {symbol} at {price}, PNL: {order_details[symbol]['pnl']}")

@@ -5,14 +5,14 @@ from binance.um_futures import UMFutures
 logger = logging.getLogger(__name__)
 
 class UltraAgressiveTrailingStop:
-    def __init__(self, client, symbol, initial_percentage=2.0, max_retries=3):
+    def __init__(self, client, symbol, trailing_distance=0.01):  # Augmenté à 1%
         self.client = client
         self.symbol = symbol
-        self.percentage = initial_percentage / 100
-        self.max_retries = max_retries
+        self.trailing_distance = trailing_distance
+        self.max_retries = 3
         self.trailing_stop_order_id = None
         self.entry_price = 0.0
-        self.current_stop_price = 0.0  # Nouvelle variable pour suivre le dernier stop_price
+        self.current_stop_price = 0.0
         self.position_type = None
         self.quantity = 0.0
 
@@ -25,10 +25,6 @@ class UltraAgressiveTrailingStop:
             logger.error(f"[{self.symbol}] ❌ Invalid entry_price: {self.entry_price}")
             return None
 
-        if atr <= 0:
-            logger.warning(f"[{self.symbol}] ⚠️ ATR invalid ({atr}), using fallback calculation.")
-            atr = self.entry_price * 0.02  # Fallback ATR = 2%
-
         try:
             current_price = float(self.client.ticker_price(symbol=self.symbol)['price'])
         except Exception as e:
@@ -39,15 +35,18 @@ class UltraAgressiveTrailingStop:
             logger.error(f"[{self.symbol}] ❌ Invalid current_price: {current_price}")
             return None
 
-        price_adjustment = max(atr * (self.percentage * 10), 0.1 * current_price)
-        stop_price = format_price(self.symbol, self.entry_price - price_adjustment if position_type == 'long' else self.entry_price + price_adjustment)
+        # Calculer le stop-loss initial avec un buffer
+        stop_price = format_price(self.symbol, 
+            self.entry_price * (1 - self.trailing_distance) if position_type == 'long' 
+            else self.entry_price * (1 + self.trailing_distance))
 
-        if stop_price <= 0:
-            logger.error(f"[{self.symbol}] ❌ stop_price={stop_price} invalid.")
+        # Vérifier si le stop-price est valide
+        if position_type == 'long' and stop_price >= current_price:
+            logger.error(f"[{self.symbol}] ❌ Stop price {stop_price} would immediately trigger (current price: {current_price})")
             return None
-
-        notional_value = stop_price * self.quantity
-        reduce_only = notional_value < 100
+        if position_type == 'short' and stop_price <= current_price:
+            logger.error(f"[{self.symbol}] ❌ Stop price {stop_price} would immediately trigger (current price: {current_price})")
+            return None
 
         # Vérification du solde disponible
         try:
@@ -57,8 +56,9 @@ class UltraAgressiveTrailingStop:
             logger.warning(f"[{self.symbol}] ⚠️ Could not fetch balance: {e}")
             usdt_balance = 0
 
-        if notional_value > usdt_balance * 50:  # En cross 50x
-            logger.warning(f"[{self.symbol}] ❌ Not enough margin (need ≈ {notional_value}, have ≈ {usdt_balance}). Skipping trailing stop.")
+        notional_value = stop_price * self.quantity
+        if notional_value > usdt_balance * 50:
+            logger.warning(f"[{self.symbol}] ❌ Not enough margin (need ≈ {notional_value}, have ≈ {usdt_balance}).")
             return None
 
         for attempt in range(self.max_retries):
@@ -70,64 +70,104 @@ class UltraAgressiveTrailingStop:
                     quantity=str(self.quantity),
                     stopPrice=str(stop_price),
                     priceProtect=True,
-                    reduceOnly=reduce_only
+                    reduceOnly=True
                 )
                 self.trailing_stop_order_id = order['orderId']
-                self.current_stop_price = stop_price  # Stocker le stop_price initial
+                self.current_stop_price = stop_price
                 logger.info(f"[{self.symbol}] ✅ Trailing stop placed (order {self.trailing_stop_order_id}) at {stop_price} (Qty: {self.quantity})")
                 return self.trailing_stop_order_id
             except Exception as e:
                 msg = str(e)
+                if "Order would immediately trigger" in msg:
+                    logger.error(f"[{self.symbol}] ❌ Stop price {stop_price} would immediately trigger. Aborting.")
+                    return None
                 if "Margin is insufficient" in msg:
-                    logger.error(f"[{self.symbol}] ❌ Margin insuffisante. Annulation du trailing stop.")
+                    logger.error(f"[{self.symbol}] ❌ Margin insuffisante. Annulation.")
                     return None
                 logger.error(f"[{self.symbol}] Retry {attempt+1}/{self.max_retries} failed: {e}")
                 time.sleep(1 + attempt)
         return None
 
     def update_trailing_stop(self, current_price):
-        if self.trailing_stop_order_id and self.entry_price:
-            try:
-                current_price = float(current_price)
-                if current_price <= 0:
-                    logger.error(f"[{self.symbol}] ❌ Invalid current_price: {current_price}")
+        if not self.trailing_stop_order_id or not self.entry_price:
+            logger.error(f"[{self.symbol}] ❌ No trailing stop active or invalid entry_price")
+            return
+
+        try:
+            current_price = float(current_price)
+            if current_price <= 0:
+                logger.error(f"[{self.symbol}] ❌ Invalid current_price: {current_price}")
+                return
+
+            # Calculer le nouveau stop-loss
+            new_stop = format_price(self.symbol, 
+                current_price * (1 - self.trailing_distance) if self.position_type == 'long' 
+                else current_price * (1 + self.trailing_distance))
+
+            # Vérifier si le nouveau stop est plus favorable
+            should_update = (self.position_type == 'long' and new_stop > self.current_stop_price) or \
+                           (self.position_type == 'short' and new_stop < self.current_stop_price)
+
+            if should_update:
+                # Vérifier si le nouveau stop-price est valide
+                if self.position_type == 'long' and new_stop >= current_price:
+                    logger.error(f"[{self.symbol}] ❌ New stop price {new_stop} would immediately trigger (current price: {current_price})")
+                    return
+                if self.position_type == 'short' and new_stop <= current_price:
+                    logger.error(f"[{self.symbol}] ❌ New stop price {new_stop} would immediately trigger (current price: {current_price})")
                     return
 
-                new_stop = format_price(self.symbol, current_price * (1 - self.percentage) if self.position_type == 'long' else current_price * (1 + self.percentage))
-                
-                # Ne jamais reculer le stop_price
-                if self.position_type == 'long' and new_stop > self.current_stop_price:
-                    self.client.cancel_order(symbol=self.symbol, orderId=self.trailing_stop_order_id)
-                    order = self.client.new_order(
-                        symbol=self.symbol,
-                        side='SELL',
-                        type='STOP_MARKET',
-                        quantity=str(self.quantity),
-                        stopPrice=str(new_stop),
-                        priceProtect=True,
-                        reduceOnly=True
-                    )
-                    self.trailing_stop_order_id = order['orderId']
-                    self.current_stop_price = new_stop  # Mettre à jour le stop_price
-                    logger.info(f"[{self.symbol}] 🔄 Trailing stop updated (long) to {new_stop}")
-                elif self.position_type == 'short' and new_stop < self.current_stop_price:
-                    self.client.cancel_order(symbol=self.symbol, orderId=self.trailing_stop_order_id)
-                    order = self.client.new_order(
-                        symbol=self.symbol,
-                        side='BUY',
-                        type='STOP_MARKET',
-                        quantity=str(self.quantity),
-                        stopPrice=str(new_stop),
-                        priceProtect=True,
-                        reduceOnly=True
-                    )
-                    self.trailing_stop_order_id = order['orderId']
-                    self.current_stop_price = new_stop  # Mettre à jour le stop_price
-                    logger.info(f"[{self.symbol}] 🔄 Trailing stop updated (short) to {new_stop}")
-                else:
-                    logger.debug(f"[{self.symbol}] No update needed: new_stop={new_stop} not better than current_stop_price={self.current_stop_price}")
-            except Exception as e:
-                logger.error(f"[{self.symbol}] ❌ Failed to update trailing stop: {e}")
+                for attempt in range(self.max_retries):
+                    try:
+                        order = self.client.modify_order(
+                            symbol=self.symbol,
+                            orderId=self.trailing_stop_order_id,
+                            side='SELL' if self.position_type == 'long' else 'BUY',
+                            type='STOP_MARKET',
+                            quantity=str(self.quantity),
+                            stopPrice=str(new_stop),
+                            priceProtect=True,
+                            reduceOnly=True
+                        )
+                        self.current_stop_price = new_stop
+                        logger.info(f"[{self.symbol}] 🔄 Trailing stop modified (order {self.trailing_stop_order_id}) to {new_stop} (Qty: {self.quantity})")
+                        return
+                    except Exception as e:
+                        msg = str(e)
+                        if "Order would immediately trigger" in msg:
+                            logger.error(f"[{self.symbol}] ❌ New stop price {new_stop} would immediately trigger. Aborting.")
+                            return
+                        if "Order does not exist" in msg or "Unknown order" in msg:
+                            logger.error(f"[{self.symbol}] ❌ Order {self.trailing_stop_order_id} not found. Resetting.")
+                            self.trailing_stop_order_id = None
+                            self.current_stop_price = 0.0
+                            return
+                        logger.error(f"[{self.symbol}] Retry {attempt+1}/{self.max_retries} failed: {e}")
+                        time.sleep(1 + attempt)
+                logger.error(f"[{self.symbol}] ❌ Failed to modify trailing stop after {self.max_retries} retries.")
+            else:
+                logger.debug(f"[{self.symbol}] No update needed: new_stop={new_stop} not better than current_stop_price={self.current_stop_price}")
+        except Exception as e:
+            logger.error(f"[{self.symbol}] ❌ Failed to update trailing stop: {e}")
+
+    def verify_order_execution(self):
+        try:
+            order = self.client.query_order(symbol=self.symbol, orderId=self.trailing_stop_order_id)
+            status = order.get('status')
+            if status == 'FILLED':
+                logger.info(f"[{self.symbol}] ✅ Trailing stop order {self.trailing_stop_order_id} executed at {self.current_stop_price}")
+                self.trailing_stop_order_id = None
+                self.current_stop_price = 0.0
+                return True
+            elif status in ['CANCELED', 'REJECTED', 'EXPIRED']:
+                logger.warning(f"[{self.symbol}] ⚠️ Trailing stop order {self.trailing_stop_order_id} {status.lower()}")
+                self.trailing_stop_order_id = None
+                self.current_stop_price = 0.0
+                return False
+            return False
+        except Exception as e:
+            logger.error(f"[{self.symbol}] ❌ Failed to verify order execution: {e}")
+            return False
 
 class TrailingStopManager:
     def __init__(self, client):
@@ -145,15 +185,19 @@ class TrailingStopManager:
     def update_trailing_stop(self, symbol, current_price):
         if symbol in self.stops:
             self.stops[symbol].update_trailing_stop(current_price)
+            if self.stops[symbol].verify_order_execution():
+                self.close_position(symbol)
 
     def close_position(self, symbol):
         if symbol in self.stops:
             try:
-                self.client.cancel_order(symbol=symbol, orderId=self.stops[symbol].trailing_stop_order_id)
+                if self.stops[symbol].trailing_stop_order_id:
+                    self.client.cancel_order(symbol=symbol, orderId=self.stops[symbol].trailing_stop_order_id)
+                    logger.info(f"[{symbol}] ✅ Trailing stop order canceled")
             except Exception as e:
                 logger.error(f"[{symbol}] ❌ Failed to cancel trailing stop: {e}")
             del self.stops[symbol]
-            logger.info(f"[{symbol}] ✅ Trailing stop closed.")
+            logger.info(f"[{symbol}] ✅ Position closed")
 
 def init_trailing_stop_manager(client):
     return TrailingStopManager(client)
@@ -161,9 +205,13 @@ def init_trailing_stop_manager(client):
 def format_price(symbol, price):
     if symbol in ['BTCUSDT', 'ETHUSDT']:
         return round(float(price), 2)
+    elif symbol in ['XRPUSDT']:
+        return round(float(price), 4)
     return round(float(price), 4)
 
 def format_quantity(symbol, quantity):
     if symbol in ['BTCUSDT', 'ETHUSDT']:
         return round(float(quantity), 3)
+    elif symbol in ['XRPUSDT']:
+        return round(float(quantity), 1)
     return round(float(quantity), 2)
