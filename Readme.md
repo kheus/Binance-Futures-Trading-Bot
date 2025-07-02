@@ -122,7 +122,7 @@ python src/data_ingestion/kafka_consumer.py
 ```bash
 .\venv\Scripts\Activate.ps1
 $env:PYTHONUTF8=1
-$env:PYTHONPATH="C:\Users\Cheikh\Binance-Futures-Trading-Bot"
+$env:PYTHONPATH = "C:\Users\Cheikh\binance-trading-bot"
 $env:TF_ENABLE_ONEDNN_OPTS=0
 python src/processing_core/main_bot.py
 ```
@@ -130,6 +130,8 @@ python src/processing_core/main_bot.py
 ### 3. Launch the Dashboard
 
 ```bash
+.\venv\Scripts\Activate.ps1
+$env:PYTHONPATH = "C:\Users\Cheikh\binance-trading-bot"
 python dashboard.py
 python app.py
 npm run watch
