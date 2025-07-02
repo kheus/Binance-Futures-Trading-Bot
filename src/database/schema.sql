@@ -66,8 +66,8 @@ CREATE TABLE IF NOT EXISTS signals (
     signal_type VARCHAR(50),
     price DECIMAL,
     quantity DECIMAL,
-    type VARCHAR(20),
-    timestamp BIGINT,
+    strategy_mode VARCHAR(20),
+    timestamp timestamp with time zone,
     confidence DOUBLE PRECISION
 );
 
