@@ -112,12 +112,18 @@ kafka-server-start.bat ./config/server.properties
 ### 1. Start Kafka Consumer
 
 ```bash
+.\venv\Scripts\Activate.ps1
+$env:TF_ENABLE_ONEDNN_OPTS=0
 python src/data_ingestion/kafka_consumer.py
 ```
 
 ### 2. Run the Main Bot
 
 ```bash
+.\venv\Scripts\Activate.ps1
+$env:PYTHONUTF8=1
+$env:PYTHONPATH="C:\Users\Cheikh\Binance-Futures-Trading-Bot"
+$env:TF_ENABLE_ONEDNN_OPTS=0
 python src/processing_core/main_bot.py
 ```
 
