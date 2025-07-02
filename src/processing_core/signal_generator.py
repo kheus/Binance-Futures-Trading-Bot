@@ -1,4 +1,5 @@
-﻿import logging
+﻿# File: src/processing_core/signal_generator.py
+import logging
 import numpy as np
 import pandas as pd
 import talib
@@ -62,6 +63,7 @@ def should_retrain_model():
 
 def check_signal(df, model, current_position, last_order_details, symbol, last_action_sent=None):
     if len(df) < 100:
+        logger.debug(f"[check_signal] Not enough data for {symbol}: {len(df)} rows")
         return "None", None
 
     rsi = df['RSI'].iloc[-1]
@@ -100,6 +102,14 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
     new_position = None
     signal_timestamp = int(time.time() * 1000)
     logger.debug(f"Processing signal for {symbol} at timestamp {signal_timestamp}")
+
+    # Calcul de la quantité
+    from config import config
+    capital = config["trading"].get("capital", 1000.0)
+    leverage = config["trading"].get("leverage", 1.0)
+    quantity = (capital * leverage) / close if close > 0 else 0.0
+
+    # ... logique de stratégie inchangée ...
 
     if strategy_mode == "scalp" and rsi_strong:
         if prediction > dynamic_up and roc > 0.5:
@@ -151,6 +161,7 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
                 "prediction": float(prediction),
                 "action": action,
                 "price": float(close),
+                "quantity": float(quantity),
                 "indicators": {
                     "rsi": round(rsi, 2),
                     "macd": round(macd, 4),
@@ -186,8 +197,8 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
             abs(roc) > 0.5,
             breakout_up or breakout_down
         ] if f]) / 6.0
-        insert_signal(symbol, action.lower(), signal_timestamp, confidence)
-        logger.info(f"[Signal Stored] {action} at {close} for {symbol} with confidence {confidence:.2f}")
+        insert_signal(symbol, action.lower(), close, quantity, strategy_mode, signal_timestamp, confidence)
+        logger.info(f"[Signal Stored] {action} at {close} for {symbol} with quantity {quantity} and confidence {confidence:.2f}")
 
     confidence_factors = []
     if prediction > 0.55 or prediction < 0.45:

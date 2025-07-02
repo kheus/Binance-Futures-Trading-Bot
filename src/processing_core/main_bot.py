@@ -14,7 +14,7 @@ from src.processing_core.lstm_model import train_or_load_model
 from src.processing_core.signal_generator import check_signal, prepare_lstm_input
 from src.trade_execution.order_manager import place_order, update_trailing_stop, init_trailing_stop_manager, EnhancedOrderManager
 from src.trade_execution.sync_orders import get_current_atr
-from src.database.db_handler import insert_trade, insert_signal, insert_metrics, create_tables, insert_price_data
+from src.database.db_handler import insert_trade, insert_signal, insert_metrics, create_tables, insert_price_data, clean_old_data
 from src.monitoring.metrics import record_trade_metric
 from src.monitoring.alerting import send_telegram_alert
 from src.trade_execution.sync_orders import sync_binance_trades_with_postgres
@@ -27,6 +27,7 @@ import threading
 import io
 import platform
 import json
+from datetime import datetime
 from rich.console import Console
 from rich.table import Table
 from rich.logging import RichHandler
@@ -464,13 +465,14 @@ async def main():
                     last_metrics_update[symbol] = current_time
 
                 if len(dataframes[symbol]) >= 101:
+                    logger.debug(f"[main_bot] Calling check_signal for {symbol} with dataframe length {len(dataframes[symbol])}")
                     action, confidence = check_signal(
                         symbol,
                         dataframes[symbol],
                         models[symbol],
                         scalers[symbol],
-                        last_action_sent[symbol][1],  # Use stored timestamp
-                        last_action_sent[symbol][0]   # Use stored action
+                        last_action_sent[symbol][1],  # timestamp
+                        last_action_sent[symbol][0]   # action
                     )
                     if action == last_action_sent[symbol][0]:
                         logger.info(f"[Signal] Ignored repeated action for {symbol}: {action} 🔄")
@@ -596,6 +598,20 @@ async def main():
     finally:
         logger.info("[Main] Closing Kafka consumer 🛑")
         consumer.close()
+
+def tracker_loop():
+    last_cleanup_date = None
+    while True:
+        try:
+            now = datetime.now()
+            # Nettoyer une fois par jour à minuit
+            if now.hour == 0 and (last_cleanup_date is None or last_cleanup_date != now.date()):
+                clean_old_data()
+                last_cleanup_date = now.date()
+            # Autres tâches de suivi/performance ici...
+            time.sleep(60)  # Attendre 1 minute avant la prochaine vérification
+        except Exception as e:
+            logger.error(f"[Tracker] Error in tracker loop: {e}", exc_info=True)
 
 if platform.system() == "Emscripten":
     asyncio.ensure_future(main())

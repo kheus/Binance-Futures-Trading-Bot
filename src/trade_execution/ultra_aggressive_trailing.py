@@ -92,22 +92,27 @@ class UltraAgressiveTrailingStop:
                 logger.error(f"[{self.symbol}] ❌ Invalid current_price: {current_price}")
                 return
 
-            # Calculer le nouveau stop-loss
-            new_stop = format_price(self.symbol, 
-                current_price * (1 - self.trailing_distance) if self.position_type == 'long' 
-                else current_price * (1 + self.trailing_distance))
+            new_stop = format_price(
+                self.symbol,
+                current_price * (1 - self.trailing_distance) if self.position_type == 'long'
+                else current_price * (1 + self.trailing_distance)
+            )
 
-            # Vérifier si le nouveau stop est plus favorable
-            should_update = (self.position_type == 'long' and new_stop > self.current_stop_price) or \
-                           (self.position_type == 'short' and new_stop < self.current_stop_price)
+            should_update = (
+                (self.position_type == 'long' and new_stop > self.current_stop_price) or
+                (self.position_type == 'short' and new_stop < self.current_stop_price)
+            )
 
             if should_update:
                 for attempt in range(self.max_retries):
                     try:
-                        # Modifier l'ordre existant
-                        order = self.client.modify_order(
+                        # ❌ D'abord annuler l'ancien ordre
+                        self.client.cancel_order(symbol=self.symbol, orderId=self.trailing_stop_order_id)
+                        logger.info(f"[{self.symbol}] ❌ Old trailing stop order {self.trailing_stop_order_id} canceled.")
+
+                        # ✅ Puis créer un nouveau STOP_MARKET
+                        order = self.client.new_order(
                             symbol=self.symbol,
-                            orderId=self.trailing_stop_order_id,
                             side='SELL' if self.position_type == 'long' else 'BUY',
                             type='STOP_MARKET',
                             quantity=str(self.quantity),
@@ -115,19 +120,13 @@ class UltraAgressiveTrailingStop:
                             priceProtect=True,
                             reduceOnly=True
                         )
+                        self.trailing_stop_order_id = order['orderId']
                         self.current_stop_price = new_stop
-                        logger.info(f"[{self.symbol}] 🔄 Trailing stop modified (order {self.trailing_stop_order_id}) to {new_stop} (Qty: {self.quantity})")
+                        logger.info(f"[{self.symbol}] 🔄 Trailing stop updated to {new_stop} (order {self.trailing_stop_order_id})")
                         return
                     except Exception as e:
-                        msg = str(e)
-                        if "Order does not exist" in msg or "Unknown order" in msg:
-                            logger.error(f"[{self.symbol}] ❌ Order {self.trailing_stop_order_id} not found. Resetting.")
-                            self.trailing_stop_order_id = None
-                            self.current_stop_price = 0.0
-                            return
-                        logger.error(f"[{self.symbol}] Retry {attempt+1}/{self.max_retries} failed: {e}")
+                        logger.error(f"[{self.symbol}] Retry {attempt + 1}/{self.max_retries} failed to update trailing stop: {e}")
                         time.sleep(1 + attempt)
-                logger.error(f"[{self.symbol}] ❌ Failed to modify trailing stop after {self.max_retries} retries.")
             else:
                 logger.debug(f"[{self.symbol}] No update needed: new_stop={new_stop} not better than current_stop_price={self.current_stop_price}")
         except Exception as e:

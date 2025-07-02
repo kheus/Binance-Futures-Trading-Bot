@@ -8,6 +8,7 @@ import pandas as pd
 import time
 import os
 import decimal
+from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
@@ -185,19 +186,37 @@ def insert_trade(trade_data):
         logger.error(f"[db_handler] Error inserting trade for {trade_data['symbol']}: {e}")
         raise
 
-def insert_signal(symbol, action, timestamp, confidence):
-    query = """
-    INSERT INTO signals (symbol, action, timestamp, confidence)
-    VALUES (%s, %s, %s, %s)
-    ON CONFLICT (symbol, timestamp) DO UPDATE
-    SET action = EXCLUDED.action, confidence = EXCLUDED.confidence;
+def insert_signal(symbol, signal_type, price, quantity, strategy_mode, timestamp, confidence):
     """
+    Insère un signal dans la table signals avec les nouvelles colonnes.
+    """
+    query = """
+    INSERT INTO signals (symbol, signal_type, price, quantity, strategy_mode, timestamp, confidence)
+    VALUES (%s, %s, %s, %s, %s, %s, %s)
+    ON CONFLICT (symbol, timestamp) DO UPDATE
+    SET signal_type = EXCLUDED.signal_type,
+        price = EXCLUDED.price,
+        quantity = EXCLUDED.quantity,
+        strategy_mode = EXCLUDED.strategy_mode,
+        confidence = EXCLUDED.confidence;
+    """
+    conn = None
     try:
-        execute_query(query, (symbol, action, timestamp, confidence))
-        logger.info(f"[db_handler] Signal inserted for {symbol}: {action} at {timestamp} with confidence {confidence:.2f}")
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            cursor.execute(
+                query,
+                (symbol, signal_type, price, quantity, strategy_mode, timestamp, confidence)
+            )
+            conn.commit()
+            logger.info(f"[insert_signal] Inserted signal for {symbol}: action={signal_type}, timestamp={timestamp}, confidence={confidence}")
     except Exception as e:
-        logger.error(f"[db_handler] Error inserting signal for {symbol}: {e}")
-        raise
+        logger.error(f"[insert_signal] Error inserting signal: {e}", exc_info=True)
+        if conn:
+            conn.rollback()
+    finally:
+        if conn:
+            release_db_connection(conn)
 
 def insert_training_data(symbol, data, timestamp):
     query = """
@@ -431,41 +450,32 @@ def get_price_history(symbol, timeframe='1h'):
         logger.error(f"Failed to fetch price history for {symbol}: {e}")
         raise
 
-def clean_old_data(retention_days=30, trades_retention_days=90):
-    current_time = int(time.time() * 1000)
-    retention_ms = retention_days * 24 * 3600 * 1000
-    trades_retention_ms = trades_retention_days * 24 * 3600 * 1000
-    tables = ["price_data", "metrics", "signals", "training_data"]
-    timestamp_is_bigint = {
-        "metrics": True,
-        "signals": True,
-        "training_data": True,
-        "trades": True,
-        "price_data": False
-    }
-    conn = None
+def clean_old_data(retention_days=7, trades_retention_days=None):
+    """
+    Supprime les anciennes données des tables metrics et price_data selon la période de rétention.
+    trades_retention_days est ignoré si non utilisé.
+    """
+    # Utilise retention_days pour metrics/price_data, trades_retention_days pour trades si besoin
     try:
         conn = get_db_connection()
-        with conn.cursor() as cur:
-            for table in tables:
-                if timestamp_is_bigint.get(table, True):
-                    query = f"DELETE FROM {table} WHERE timestamp < %s"
-                else:
-                    query = f"DELETE FROM {table} WHERE timestamp < to_timestamp(%s / 1000.0)"
-                cur.execute(query, (current_time - retention_ms,))
-                logger.info(f"[DB Cleanup] Deleted rows from {table}")
-            query = "DELETE FROM trades WHERE timestamp < %s"
-            cur.execute(query, (current_time - trades_retention_ms,))
-            deleted = cur.rowcount
-            logger.info(f"[DB Cleanup] {deleted} rows deleted from trades")
-            conn.commit()
+        conn.autocommit = True  # Activer autocommit pour éviter les transactions longues
+        cursor = conn.cursor()
+        threshold = int((datetime.now() - timedelta(days=retention_days)).timestamp() * 1000)
+
+        # Supprimer les anciennes données avec une requête optimisée
+        cursor.execute("DELETE FROM metrics WHERE timestamp < %s", (threshold,))
+        deleted_metrics = cursor.rowcount
+        logger.info(f"[DB Cleanup] Deleted {deleted_metrics} rows from metrics")
+
+        cursor.execute("DELETE FROM price_data WHERE timestamp < %s", (threshold,))
+        deleted_price_data = cursor.rowcount
+        logger.info(f"[DB Cleanup] Deleted {deleted_price_data} rows from price_data")
+
+        cursor.close()
+        release_db_connection(conn)
     except Exception as e:
-        logger.error(f"Failed to clean old data: {e}")
-        if conn:
-            conn.rollback()
-        raise
-    finally:
-        if conn:
+        logger.error(f"Failed to clean old data: {e}", exc_info=True)
+        if 'conn' in locals() and conn:
             release_db_connection(conn)
 
 def test_connection():
