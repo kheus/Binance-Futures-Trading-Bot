@@ -1,4 +1,4 @@
-﻿Adaptive Trend Rider
+Adaptive Trend Rider
 
 A powerful trading bot for Binance Futures, leveraging technical analysis (TA), LSTM models for signal generation, Kafka for real-time data ingestion, PostgreSQL for data storage, and Prometheus/Grafana/Telegram for monitoring and alerting. Designed for both simulated and live trading, this bot is built for performance and scalability.
 
@@ -182,7 +182,6 @@ git add .
 git commit -m "Your commit message"
 git push -u origin main
 
-Note:
 git add C:\Users\Cheikh\binance-trading-bot\src\database\db_handler.py 
 git add C:\Users\Cheikh\binance-trading-bot\src\database\schema.sql 
 git add C:\Users\Cheikh\binance-trading-bot\src\performance\tracker.py 
