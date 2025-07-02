@@ -1,4 +1,5 @@
 ﻿import os
+import logging
 import numpy as np
 import pandas as pd
 from binance.client import Client
@@ -6,13 +7,12 @@ from tensorflow.keras.models import Sequential, load_model
 from tensorflow.keras.layers import LSTM, Dense, Input
 from tensorflow.keras.callbacks import EarlyStopping
 from sklearn.preprocessing import MinMaxScaler
-import logging
-import time
-from datetime import datetime
 import json
 import tensorflow as tf
 import yaml
 from pathlib import Path
+from datetime import datetime
+import time
 
 # Charger la configuration YAML
 CONFIG_PATH = Path(__file__).parent.parent.parent / "config" / "config.yaml"
@@ -129,19 +129,27 @@ def train_or_load_model(df, symbol):
     # Load metadata if exists
     meta = {}
     if meta_path.exists():
-        with open(meta_path, 'r', encoding="utf-8-sig") as f:
-            meta = json.load(f)
+        try:
+            with open(meta_path, 'r', encoding="utf-8-sig") as f:
+                meta = json.load(f)
+        except Exception as e:
+            logger.warning(f"[Model] Failed to load metadata for {symbol}: {e}, will train new model")
 
     try:
-        model = load_model(model_path)
-        logger.info(f"[Model] Loaded existing model from {model_path}")
-        last_train_time = meta.get('last_train_time', 0)
-        last_train_close = meta.get('last_train_close', 0)
-        current_close = df['close'].iloc[-1]
-        if last_train_time and abs(current_close - last_train_close) < 1.0:
-            logger.info(f"[Model] Data unchanged since {datetime.fromtimestamp(last_train_time).strftime('%Y-%m-%d %H:%M:%S')}, reusing model")
-            return model, scaler
-        logger.info(f"[Model] Data changed, retraining model")
+        if model_path.exists() and meta.get('scaler', {}).get('scale_') and meta.get('scaler', {}).get('min_'):
+            model = load_model(model_path)
+            scaler = MinMaxScaler()
+            scaler.scale_ = np.array(meta['scaler']['scale_'])
+            scaler.min_ = np.array(meta['scaler']['min_'])
+            last_train_time = meta.get('last_train_time', 0)
+            last_train_close = meta.get('last_train_close', 0)
+            current_close = df['close'].iloc[-1]
+            if last_train_time and abs(current_close - last_train_close) < 1.0:
+                logger.info(f"[Model] Data unchanged since {datetime.fromtimestamp(last_train_time).strftime('%Y-%m-%d %H:%M:%S')}, reusing model")
+                return model, scaler
+            logger.info(f"[Model] Data changed, retraining model")
+        else:
+            logger.info(f"[Model] No valid model or metadata found for {symbol}, training new model")
     except Exception as e:
         logger.warning(f"[Model] Failed to load model for {symbol}: {e}, training new model")
 
@@ -167,7 +175,11 @@ def train_or_load_model(df, symbol):
         meta = {
             'last_train_time': current_time,
             'last_train_close': float(df['close'].iloc[-1]),
-            'symbol': symbol
+            'symbol': symbol,
+            'scaler': {
+                'scale_': scaler.scale_.tolist(),
+                'min_': scaler.min_.tolist()
+            }
         }
         with open(meta_path, 'w', encoding="utf-8") as f:
             json.dump(meta, f)
