@@ -1,4 +1,4 @@
-Adaptive Trend Rider
+﻿⚡ Adaptive Trend Rider - Binance Futures Trading Bot
 
 A powerful trading bot for Binance Futures, leveraging technical analysis (TA), LSTM models for signal generation, Kafka for real-time data ingestion, PostgreSQL for data storage, and Prometheus/Grafana/Telegram for monitoring and alerting. Designed for both simulated and live trading, this bot is built for performance and scalability.
 

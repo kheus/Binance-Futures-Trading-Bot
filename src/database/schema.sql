@@ -1,13 +1,4 @@
-﻿-- Suppression sécurisée des tables existantes
-DROP TABLE IF EXISTS orders CASCADE;
-DROP TABLE IF EXISTS trades CASCADE;
-DROP TABLE IF EXISTS price_data CASCADE;
-DROP TABLE IF EXISTS metrics CASCADE;
-DROP TABLE IF EXISTS signals CASCADE;
-DROP TABLE IF EXISTS training_data CASCADE;
-DROP TABLE IF EXISTS price_history CASCADE;
-
--- TABLE : orders
+﻿-- TABLE : orders
 CREATE TABLE IF NOT EXISTS orders (
     order_id VARCHAR(64) PRIMARY KEY,
     symbol VARCHAR(20),
@@ -15,7 +6,7 @@ CREATE TABLE IF NOT EXISTS orders (
     quantity DECIMAL,
     price DECIMAL,
     status VARCHAR(20),
-    timestamp timestamp with time zone  -- En millisecondes
+    timestamp timestamp with time zone
 );
 
 -- TABLE : trades
@@ -96,12 +87,12 @@ CREATE TABLE IF NOT EXISTS price_history (
 );
 
 -- Indexes recommandés
-CREATE INDEX idx_orders_symbol ON orders(symbol);
-CREATE INDEX idx_price_data_symbol_timestamp ON price_data(symbol, timestamp);
-CREATE INDEX idx_trades_timestamp ON trades(timestamp);
-CREATE INDEX idx_signals_timestamp ON signals(timestamp);
-CREATE INDEX idx_metrics_timestamp ON metrics(timestamp);
-CREATE INDEX idx_training_timestamp ON training_data(timestamp);
-CREATE INDEX idx_signals_symbol ON signals(symbol);
-CREATE INDEX idx_metrics_symbol ON metrics(symbol);
-CREATE INDEX idx_training_symbol ON training_data(symbol);
+CREATE INDEX IF NOT EXISTS idx_orders_symbol ON orders(symbol);
+CREATE INDEX IF NOT EXISTS idx_price_data_symbol_timestamp ON price_data(symbol, timestamp);
+CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp);
+CREATE INDEX IF NOT EXISTS idx_signals_timestamp ON signals(timestamp);
+CREATE INDEX IF NOT EXISTS idx_metrics_timestamp ON metrics(timestamp);
+CREATE INDEX IF NOT EXISTS idx_training_timestamp ON training_data(timestamp);
+CREATE INDEX IF NOT EXISTS idx_signals_symbol ON signals(symbol);
+CREATE INDEX IF NOT EXISTS idx_metrics_symbol ON metrics(symbol);
+CREATE INDEX IF NOT EXISTS idx_training_symbol ON training_data(symbol);

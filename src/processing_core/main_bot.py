@@ -13,11 +13,10 @@ from src.data_ingestion.data_formatter import format_candle
 from src.processing_core.lstm_model import train_or_load_model
 from src.processing_core.signal_generator import check_signal, prepare_lstm_input
 from src.trade_execution.order_manager import place_order, update_trailing_stop, init_trailing_stop_manager, EnhancedOrderManager
-from src.trade_execution.sync_orders import get_current_atr
+from src.trade_execution.sync_orders import get_current_atr, sync_binance_trades_with_postgres
 from src.database.db_handler import insert_trade, insert_signal, insert_metrics, create_tables, insert_price_data, clean_old_data
 from src.monitoring.metrics import record_trade_metric
 from src.monitoring.alerting import send_telegram_alert
-from src.trade_execution.sync_orders import sync_binance_trades_with_postgres
 from src.performance.tracker import performance_tracker_loop
 import sys
 import os
@@ -64,9 +63,9 @@ for config_file in [config_path, kafka_config_path]:
         raise FileNotFoundError(f"Configuration file not found: {config_file}")
 
 try:
-    with open(config_path, 'r', encoding='utf-8-sig') as f:
+    with open(config_path, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
-    with open(kafka_config_path, 'r', encoding='utf-8-sig') as f:
+    with open(kafka_config_path, 'r', encoding='utf-8') as f:
         kafka_config = yaml.safe_load(f)
 except Exception as e:
     logger.error(f"❌ [Config Error] Failed to load configuration files: {e}")
@@ -253,7 +252,7 @@ def calculate_indicators(df, symbol):
         df['EMA20'] = talib.EMA(df['close'], timeperiod=20)
         df['EMA50'] = talib.EMA(df['close'], timeperiod=50)
         df['ATR'] = talib.ATR(df['high'], df['low'], df['close'], timeperiod=14)
-        df['ROC'] = talib.ROC(df['close'], timeperiod=5)  # Ajout de ROC
+        df['ROC'] = talib.ROC(df['close'], timeperiod=5)
 
         # Remplir les NaN avec la méthode forward fill, puis backward fill
         required_cols = ['RSI', 'MACD', 'MACD_signal', 'MACD_hist', 'ADX', 'EMA20', 'EMA50', 'ATR', 'ROC']
@@ -434,7 +433,7 @@ async def main():
             try:
                 candle_data = json.loads(msg.value().decode("utf-8")) if msg.value() else None
                 if not candle_data or not isinstance(candle_data, dict):
-                    logger.error,f("[Kafka] Invalid candle data for topic {msg.topic()}: {candle_data}")
+                    logger.error(f"[Kafka] Invalid candle data for topic {msg.topic()}: {candle_data}")
                     continue
                 topic = msg.topic()
                 symbol = next((s for s in SYMBOLS if f"{s}_candle" in topic), None)
@@ -466,13 +465,14 @@ async def main():
 
                 if len(dataframes[symbol]) >= 101:
                     logger.debug(f"[main_bot] Calling check_signal for {symbol} with dataframe length {len(dataframes[symbol])}")
-                    action, confidence = check_signal(
-                        symbol,
-                        dataframes[symbol],
-                        models[symbol],
-                        scalers[symbol],
-                        last_action_sent[symbol][1],  # timestamp
-                        last_action_sent[symbol][0]   # action
+                    action, new_position, confidence, confidence_factors = check_signal(
+                        df=dataframes[symbol],
+                        model=models[symbol],
+                        current_position=current_positions[symbol],
+                        last_order_details=last_order_details[symbol],
+                        symbol=symbol,
+                        last_action_sent=last_action_sent[symbol][0],
+                        config=config
                     )
                     if action == last_action_sent[symbol][0]:
                         logger.info(f"[Signal] Ignored repeated action for {symbol}: {action} 🔄")
@@ -481,33 +481,20 @@ async def main():
                     last_action_sent[symbol] = (action, timestamp)  # Update with action and timestamp
 
                     if action in ["buy", "sell", "close_buy", "close_sell"]:
-                        # Calculer la confiance
-                        rsi = dataframes[symbol]['RSI'].iloc[-1]
-                        macd = dataframes[symbol]['MACD'].iloc[-1]
-                        signal_line = dataframes[symbol]['MACD_signal'].iloc[-1]
-                        ema20 = dataframes[symbol]['EMA20'].iloc[-1]
-                        ema50 = dataframes[symbol]['EMA50'].iloc[-1]
-                        atr = dataframes[symbol]['ATR'].iloc[-1]
-                        close = dataframes[symbol]['close'].iloc[-1]
-                        roc = talib.ROC(dataframes[symbol]['close'], timeperiod=5).iloc[-1]
-                        lstm_input = prepare_lstm_input(dataframes[symbol])
-                        prediction = models[symbol].predict(lstm_input, verbose=0)[0][0]
-                        trend_up = ema20 > ema50
-                        trend_down = ema20 < ema50
-                        breakout_up = close > (dataframes[symbol]['high'].rolling(window=20).max().iloc[-1] - 0.2 * atr) if len(dataframes[symbol]) >= 20 else False
-                        breakout_down = close < (dataframes[symbol]['low'].rolling(window=20).min().iloc[-1] + 0.2 * atr) if len(dataframes[symbol]) >= 20 else False
-                        confidence = len([f for f in [
-                            prediction > 0.55 or prediction < 0.45,
-                            (trend_up and macd > signal_line) or (trend_down and macd < signal_line),
-                            rsi > 50 or rsi < 50,
-                            (trend_up and ema20 > ema50) or (trend_down and ema20 < ema50),
-                            abs(roc) > 0.5,
-                            breakout_up or breakout_down
-                        ] if f]) / 6.0
-                        
+                        # Create a table for the signal
+                        signal_table = Table(title=f"Signal Generated for {symbol}")
+                        signal_table.add_column("Field", style="cyan")
+                        signal_table.add_column("Value", style="magenta")
+                        signal_table.add_row("Action", action)
+                        signal_table.add_row("Symbol", symbol)
+                        signal_table.add_row("Timestamp", str(timestamp))
+                        signal_table.add_row("Confidence Score", f"{confidence:.2f}")
+                        signal_table.add_row("Confidence Factors", ", ".join(confidence_factors) if confidence_factors else "None")
+                        console.log(signal_table)
+
                         # Insérer le signal
                         try:
-                            insert_signal(symbol, action, timestamp, confidence)
+                            insert_signal(symbol, action, float(candle_df["close"].iloc[-1]), (CAPITAL * LEVERAGE) / float(candle_df["close"].iloc[-1]), dataframes[symbol]['strategy_mode'].iloc[-1] if 'strategy_mode' in dataframes[symbol].columns else "unknown", timestamp, confidence)
                             logger.info(f"[Signal] Generated signal {action} for {symbol} with confidence {confidence:.2f}")
                         except psycopg2.pool.PoolError as e:
                             logger.error(f"❌ [Signal] Failed to insert signal for {symbol} due to connection pool exhaustion: {e}")
@@ -527,7 +514,7 @@ async def main():
                                     last_order_details[symbol] = order_details[symbol]
                                     record_trade_metric(order_details[symbol])
                                     send_telegram_alert(f"Trade executed: {action.upper()} {symbol} at {price} 💰")
-                                    current_positions[symbol] = action
+                                    current_positions[symbol] = new_position
                                     current_market_price = float(candle_df["close"].iloc[-1])
                                     last_sl_order_ids[symbol] = update_trailing_stop(
                                         client=client,
@@ -548,6 +535,8 @@ async def main():
                                     table.add_row("Side", order_details[symbol].get("side", "N/A"))
                                     table.add_row("Quantity", f"{order_details[symbol].get('quantity', 0):.2f}")
                                     table.add_row("Price", f"{order_details[symbol].get('price', 0):.4f}")
+                                    table.add_row("Confidence Score", f"{confidence:.2f}")
+                                    table.add_row("Confidence Factors", ", ".join(confidence_factors) if confidence_factors else "None")
                                     console.log(table)
                                 else:
                                     logger.error(f"❌ [Order] Failed to place {action} order for {symbol}")
@@ -580,10 +569,10 @@ async def main():
                                     table.add_row("Quantity", f"{order_details[symbol].get('quantity', 0):.2f}")
                                     table.add_row("Price", f"{order_details[symbol].get('price', 0):.4f}")
                                     table.add_row("PNL", f"{order_details[symbol].get('pnl', 0):.2f}")
+                                    table.add_row("Confidence Score", f"{confidence:.2f}")
+                                    table.add_row("Confidence Factors", ", ".join(confidence_factors) if confidence_factors else "None")
                                     console.log(table)
-                            except (TypeError, ValueError, IndexError, psycopg2.pool.PoolError) as e:
-                                logger.error(f"❌ [Order] Error closing {action} order for {symbol}: {e}")
-                                send_telegram_alert(f"Error closing {action} order for {symbol}: {str(e)}")
+                                current_positions[symbol] = None
                             except (TypeError, ValueError, IndexError, psycopg2.pool.PoolError) as e:
                                 logger.error(f"❌ [Order] Error closing {action} order for {symbol}: {e}")
                                 send_telegram_alert(f"Error closing {action} order for {symbol}: {str(e)}")

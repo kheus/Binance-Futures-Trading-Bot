@@ -453,23 +453,25 @@ def get_price_history(symbol, timeframe='1h'):
 def clean_old_data(retention_days=7, trades_retention_days=None):
     """
     Supprime les anciennes données des tables metrics et price_data selon la période de rétention.
-    trades_retention_days est ignoré si non utilisé.
     """
-    # Utilise retention_days pour metrics/price_data, trades_retention_days pour trades si besoin
     try:
         conn = get_db_connection()
-        conn.autocommit = True  # Activer autocommit pour éviter les transactions longues
+        conn.autocommit = True
         cursor = conn.cursor()
-        threshold = int((datetime.now() - timedelta(days=retention_days)).timestamp() * 1000)
 
-        # Supprimer les anciennes données avec une requête optimisée
-        cursor.execute("DELETE FROM metrics WHERE timestamp < %s", (threshold,))
-        deleted_metrics = cursor.rowcount
-        logger.info(f"[DB Cleanup] Deleted {deleted_metrics} rows from metrics")
+        # Millisecondes pour les tables en BIGINT
+        threshold_ms = int((datetime.now() - timedelta(days=retention_days)).timestamp() * 1000)
 
-        cursor.execute("DELETE FROM price_data WHERE timestamp < %s", (threshold,))
-        deleted_price_data = cursor.rowcount
-        logger.info(f"[DB Cleanup] Deleted {deleted_price_data} rows from price_data")
+        # Timestamp pour les colonnes de type "timestamp"
+        threshold_ts = datetime.now() - timedelta(days=retention_days)
+
+        # ✅ Pour metrics (timestamp est BIGINT)
+        cursor.execute("DELETE FROM metrics WHERE timestamp < %s", (threshold_ms,))
+        logger.info(f"[DB Cleanup] Deleted {cursor.rowcount} rows from metrics")
+
+        # ✅ Pour price_data (timestamp est TIMESTAMP)
+        cursor.execute("DELETE FROM price_data WHERE timestamp < %s", (threshold_ts,))
+        logger.info(f"[DB Cleanup] Deleted {cursor.rowcount} rows from price_data")
 
         cursor.close()
         release_db_connection(conn)
@@ -477,6 +479,7 @@ def clean_old_data(retention_days=7, trades_retention_days=None):
         logger.error(f"Failed to clean old data: {e}", exc_info=True)
         if 'conn' in locals() and conn:
             release_db_connection(conn)
+
 
 def test_connection():
     conn = None
