@@ -11,10 +11,11 @@ from binance.websocket.um_futures.websocket_client import UMFuturesWebsocketClie
 from confluent_kafka import Consumer
 from src.data_ingestion.data_formatter import format_candle
 from src.processing_core.lstm_model import train_or_load_model
-from src.processing_core.signal_generator import generate_signal  # or check_signal
+from src.processing_core.signal_generator import check_signal
 from src.trade_execution.order_manager import place_order, update_trailing_stop, init_trailing_stop_manager, EnhancedOrderManager
 from src.trade_execution.sync_orders import get_current_atr, sync_binance_trades_with_postgres
 from src.database.db_handler import insert_trade, insert_signal, insert_metrics, create_tables, insert_price_data, clean_old_data
+from src.processing_core.signal_generator import prepare_lstm_input
 from src.monitoring.metrics import record_trade_metric
 from src.monitoring.alerting import send_telegram_alert
 from src.performance.tracker import performance_tracker_loop
@@ -427,8 +428,15 @@ async def main():
 
                 if len(dataframes[symbol]) >= 101:
                     logger.debug(f"[main_bot] Calling check_signal for {symbol} with dataframe length {len(dataframes[symbol])}")
-                    action, new_position, confidence, confidence_factors = generate_signal(
-                        symbol, dataframes[symbol], market_context={}
+
+                    action, new_position, confidence, confidence_factors = check_signal(
+                        df=dataframes[symbol],
+                        model=models[symbol],
+                        current_position=current_positions.get(symbol),
+                        last_order_details=last_order_details.get(symbol),
+                        symbol=symbol,
+                        last_action_sent=last_action_sent.get(symbol),
+                        config=config  # Assure-toi que ce dictionnaire existe et est chargé plus haut
                     )
                     if action == last_action_sent[symbol][0]:
                         logger.info(f"[Signal] Ignored repeated action for {symbol}: {action} 🔄")

@@ -49,7 +49,13 @@ def calculate_market_direction(symbol, signal_ts):
         """
         recent_prices = execute_query(query, (symbol,), fetch=True)
         logger.debug(f"[Market Direction] Recent prices for {symbol}: {recent_prices}")
-        logger.warning(f"[Market Direction] No future price data for {symbol} at {future_ts} (window: {future_ts} to {window_end_ts})")
+
+        # Only warn if the window is in the past
+        now_ts = int(time.time() * 1000)
+        if future_ts > now_ts:
+            logger.debug(f"[Market Direction] Skipped log for {symbol}: waiting for future data at {future_ts}")
+        else:
+            logger.warning(f"[Market Direction] No future price data for {symbol} at {future_ts} (window: {future_ts} to {window_end_ts})")
         return None, None
     except psycopg2.pool.PoolError as e:
         logger.error(f"[Market Direction] Connection pool exhausted for {symbol} at {signal_ts}: {str(e)}")

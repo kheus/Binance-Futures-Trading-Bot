@@ -164,7 +164,7 @@ def train_or_load_model(df, symbol):
         return None, None
 
     # Fill missing values
-    df = df.fillna(method='ffill').fillna(method='bfill')
+    df = df.ffill().bfill()
     if df.isna().any().any():
         logger.error(f"[Model] Data contains NaN after filling for {symbol}")
         return None, None
