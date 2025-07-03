@@ -13,6 +13,8 @@ import yaml
 from pathlib import Path
 from datetime import datetime
 import time
+from src.processing_core.indicators import calculate_indicators
+from src.database.db_handler import execute_query  # Import to fetch metrics
 
 # Charger la configuration YAML
 CONFIG_PATH = Path(__file__).parent.parent.parent / "config" / "config.yaml"
@@ -43,41 +45,44 @@ def fetch_binance_data(symbol, interval, limit):
         df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'trades', 'taker_buy_base', 'taker_buy_quote', 'ignored'])
         df['close'] = df['close'].astype(float)
         df['volume'] = df['volume'].astype(float)
+        df['open'] = df['open'].astype(float)
+        df['high'] = df['high'].astype(float)
+        df['low'] = df['low'].astype(float)
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df.set_index('timestamp', inplace=True)
         logger.info(f"[Data] Fetched {len(df)} {interval} candles for {symbol}")
-        return df[['timestamp', 'close', 'volume']]
+        return df[['open', 'high', 'low', 'close', 'volume']]
     except Exception as e:
         logger.error(f"[Data] Failed to fetch Binance data for {symbol}: {e}")
         return None
 
-def calculate_indicators(df):
-    """Calculate RSI, MACD, and ADX indicators."""
-    def calculate_rsi(data, period=14):
-        delta = data.diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-        rs = gain / loss
-        return 100 - (100 / (1 + rs))
-
-    def calculate_macd(data, fast=12, slow=26, signal=9):
-        exp1 = data.ewm(span=fast, adjust=False).mean()
-        exp2 = data.ewm(span=slow, adjust=False).mean()
-        macd = exp1 - exp2
-        signal_line = macd.ewm(span=signal, adjust=False).mean()
-        return macd, signal_line
-
-    df['RSI'] = calculate_rsi(df['close'])
-    macd, signal = calculate_macd(df['close'])
-    df['MACD'] = macd
-    df['ADX'] = df['RSI'].rolling(window=14).mean()  # Simplified ADX proxy
-    return df.dropna()
+def fetch_metrics(symbol, timestamps):
+    """Fetch RSI, MACD, ADX from metrics table for given timestamps."""
+    try:
+        timestamps = [int(t) for t in timestamps]
+        query = """
+        SELECT timestamp, rsi, macd, adx
+        FROM metrics
+        WHERE symbol = %s AND timestamp = ANY(%s)
+        """
+        result = execute_query(query, (symbol, timestamps), fetch=True)
+        if result:
+            metrics_df = pd.DataFrame(result, columns=['timestamp', 'rsi', 'macd', 'adx'])
+            metrics_df['timestamp'] = metrics_df['timestamp'].astype(np.int64)
+            logger.info(f"[Model] Fetched {len(metrics_df)} metrics for {symbol}")
+            return metrics_df
+        logger.warning(f"[Model] No metrics found for {symbol} at provided timestamps")
+        return pd.DataFrame(columns=['timestamp', 'rsi', 'macd', 'adx'])
+    except Exception as e:
+        logger.error(f"[Model] Error fetching metrics for {symbol}: {str(e)}")
+        return pd.DataFrame(columns=['timestamp', 'rsi', 'macd', 'adx'])
 
 def prepare_lstm_data(df):
     """Prepare LSTM sequences with refined labeling."""
     logger.info(f"[Model] Preparing LSTM data with shape {df.shape}")
-    required_cols = ["close", "volume", "RSI", "MACD", "ADX"]
+    required_cols = ["close", "volume", "rsi", "macd", "adx"]
     if not all(col in df.columns for col in required_cols):
-        logger.error(f"[Model] Missing columns: {required_cols}")
+        logger.error(f"[Model] Missing columns: {set(required_cols) - set(df.columns)}")
         return None, None, None
     df = df[required_cols].dropna()
     if len(df) <= SEQ_LEN + 5:  # Need extra rows for future labeling
@@ -125,6 +130,44 @@ def train_or_load_model(df, symbol):
     model_path = MODEL_DIR / f"lstm_model_{symbol}.keras"
     meta_path = MODEL_DIR / f"lstm_model_{symbol}_meta.json"
     logger.info(f"[Model] Attempting to train or load model for {symbol} with data shape {df.shape}")
+
+    # Log DataFrame columns for debugging
+    logger.info(f"[Model] DataFrame columns: {df.columns.tolist()}")
+
+    # Add technical indicators by fetching from metrics table
+    try:
+        df = df.copy()
+        # Reset index to avoid timestamp ambiguity
+        df = df.reset_index()
+        df['timestamp'] = (df['timestamp'].astype(np.int64) // 10**6).astype(np.int64)  # Convert to milliseconds
+        metrics_df = fetch_metrics(symbol, df['timestamp'].values)
+        if not metrics_df.empty:
+            df = df.merge(metrics_df, on='timestamp', how='left')
+            df.set_index(pd.to_datetime(df['timestamp'] * 10**6), inplace=True)  # Restore DatetimeIndex
+            df = df.drop(columns=['timestamp'])
+            logger.info(f"[Model] Merged metrics for {symbol}, new columns: {df.columns.tolist()}")
+        else:
+            logger.warning(f"[Model] No metrics found in database for {symbol}, falling back to calculate_indicators")
+            df = calculate_indicators(df.set_index(pd.to_datetime(df['timestamp'] * 10**6)), symbol)
+            if df is None or not all(col in df.columns for col in ['rsi', 'macd', 'adx']):
+                logger.error(f"[Model] Failed to calculate indicators for {symbol}")
+                return None, None
+    except Exception as e:
+        logger.error(f"[Model] Error merging metrics for {symbol}: {str(e)}")
+        return None, None
+
+    # Ensure all required columns are present
+    required_cols = ["close", "volume", "rsi", "macd", "adx"]
+    missing_cols = set(required_cols) - set(df.columns)
+    if missing_cols:
+        logger.error(f"[Model] Missing required columns after processing: {missing_cols}")
+        return None, None
+
+    # Fill missing values
+    df = df.fillna(method='ffill').fillna(method='bfill')
+    if df.isna().any().any():
+        logger.error(f"[Model] Data contains NaN after filling for {symbol}")
+        return None, None
 
     # Load metadata if exists
     meta = {}
@@ -190,11 +233,17 @@ def train_or_load_model(df, symbol):
         return None, None
 
 if __name__ == "__main__":
+    # Vérifier que SYMBOLS est bien défini
+    if not SYMBOLS or not isinstance(SYMBOLS, list) or len(SYMBOLS) == 0:
+        logger.error("[Main] Invalid SYMBOLS configuration")
+        raise ValueError("SYMBOLS is not properly defined in config.yaml")
+    
     # Fetch real data from Binance for the first symbol
-    df = fetch_binance_data(SYMBOLS[0], INTERVAL, LIMIT)
+    symbol = SYMBOLS[0]
+    logger.info(f"[Main] Processing symbol: {symbol}")
+    df = fetch_binance_data(symbol, INTERVAL, LIMIT)
     if df is not None:
-        df = calculate_indicators(df)
-        model, scaler = train_or_load_model(df, symbol=SYMBOLS[0])
+        model, scaler = train_or_load_model(df, symbol=symbol)
         if model:
             logger.info("[Main] Model training or loading successful")
         else:

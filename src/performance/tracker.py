@@ -14,34 +14,42 @@ def calculate_market_direction(symbol, signal_ts):
     Calculate market direction and percentage change after 5 minutes.
     """
     try:
-        future_ts = signal_ts + 5 * 60 * 1000  # 5 minutes après
-        window_end_ts = signal_ts + 10 * 60 * 1000  # Fenêtre de 10 minutes
+        future_ts = signal_ts + 5 * 60 * 1000  # 5 minutes after
+        window_end_ts = signal_ts + 15 * 60 * 1000  # Extended to 15-minute window
         query = """
         SELECT close, timestamp FROM price_data 
-        WHERE symbol = %s AND timestamp >= %s AND timestamp <= %s
+        WHERE symbol = %s 
+        AND timestamp >= to_timestamp(%s::double precision / 1000) 
+        AND timestamp <= to_timestamp(%s::double precision / 1000)
         ORDER BY timestamp ASC LIMIT 1
         """
-        # Exécuter la requête pour obtenir le prix futur
+        # Execute query to get future price
         result = execute_query(query, (symbol, future_ts, window_end_ts), fetch=True)
         if result:
-            future_price, future_ts_found = float(result[0]['close']), result[0]['timestamp']
+            future_price, future_ts_found = float(result[0][0]), result[0][1]
             query = """
             SELECT price FROM signals 
             WHERE symbol = %s AND timestamp = %s
             """
             signal_result = execute_query(query, (symbol, signal_ts), fetch=True)
             if signal_result:
-                signal_price = float(signal_result[0]['price'])
+                signal_price = float(signal_result[0][0])
                 pct_change = ((future_price - signal_price) / signal_price) * 100
                 direction = 1 if future_price > signal_price else 0
                 logger.info(f"[Market Direction] Found price for {symbol} at {future_ts_found}: {future_price}")
                 return direction, pct_change
 
-        # Log des données récentes pour débogage
-        query = "SELECT timestamp, close FROM price_data WHERE symbol = %s ORDER BY timestamp DESC LIMIT 5"
+        # Log recent prices for debugging
+        query = """
+        SELECT timestamp, close 
+        FROM price_data 
+        WHERE symbol = %s 
+        ORDER BY timestamp DESC 
+        LIMIT 5
+        """
         recent_prices = execute_query(query, (symbol,), fetch=True)
         logger.debug(f"[Market Direction] Recent prices for {symbol}: {recent_prices}")
-        logger.warning(f"[Market Direction] No future price data for {symbol} at {future_ts}")
+        logger.warning(f"[Market Direction] No future price data for {symbol} at {future_ts} (window: {future_ts} to {window_end_ts})")
         return None, None
     except psycopg2.pool.PoolError as e:
         logger.error(f"[Market Direction] Connection pool exhausted for {symbol} at {signal_ts}: {str(e)}")
@@ -50,29 +58,60 @@ def calculate_market_direction(symbol, signal_ts):
         logger.error(f"[Market Direction] Error for {symbol} at {signal_ts}: {str(e)}")
         return None, None
 
+def get_action_from_signals(symbol, signal_ts):
+    """
+    Fetch action (signal_type) from signals table for the given symbol and timestamp.
+    """
+    try:
+        query = """
+        SELECT signal_type FROM signals 
+        WHERE symbol = %s AND timestamp = %s
+        """
+        result = execute_query(query, (symbol, signal_ts), fetch=True)
+        if result:
+            logger.debug(f"[Tracker] Found action {result[0][0]} for {symbol} at {signal_ts}")
+            return result[0][0]  # Tuple access
+        logger.debug(f"[Tracker] No signal found for {symbol} at {signal_ts}")
+        return None
+    except Exception as e:
+        logger.error(f"[Tracker] Error fetching action for {symbol} at {signal_ts}: {str(e)}")
+        return None
+
 def should_retrain_model():
     """
-    Determine if the model should be retrained.
+    Determine if the model should be retrained based on recent performance.
     """
-    return False  # À implémenter selon les critères de retraining
+    try:
+        query = """
+        SELECT AVG(CAST(prediction_correct AS INTEGER)) as accuracy 
+        FROM training_data 
+        WHERE updated_at >= %s
+        """
+        result = execute_query(query, (int(time.time() * 1000) - 24 * 3600 * 1000,), fetch=True)
+        accuracy = result[0][0] if result and result[0][0] is not None else 0
+        logger.info(f"[Tracker] Model accuracy over last 24 hours: {accuracy:.2%}")
+        return accuracy < 0.6  # Retrain if accuracy < 60%
+    except Exception as e:
+        logger.error(f"[Tracker] Error checking retrain condition: {str(e)}")
+        return False
 
 def performance_tracker_loop(client, symbols):
     """
     Periodically track performance of signals and clean old data.
     """
     last_cleanup = 0
-    cleanup_interval = 24 * 3600  # 24 heures
+    cleanup_interval = 24 * 3600  # 24 hours
 
-    # Colonnes attendues pour les enregistrements de get_pending_training_data
+    # Expected columns for records from get_pending_training_data
     columns = [
-        'id', 'symbol', 'timestamp', 'prediction', 'action', 'price',
-        'indicators', 'market_context', 'market_direction',
-        'price_change_pct', 'prediction_correct', 'created_at', 'updated_at'
+        'id', 'symbol', 'timestamp', 'indicators', 'market_context',
+        'market_direction', 'price_change_pct', 'prediction_correct',
+        'created_at', 'updated_at'
     ]
 
     while True:
         try:
-            # Nettoyage périodique des données obsolètes
+            # Periodic cleanup of old data
             current_time = time.time()
             if current_time - last_cleanup > cleanup_interval:
                 logger.info("[Tracker] Starting database cleanup")
@@ -83,7 +122,7 @@ def performance_tracker_loop(client, symbols):
                     logger.error(f"[Tracker] Connection pool exhausted during cleanup: {str(e)}")
                 last_cleanup = current_time
 
-            # Récupérer les enregistrements en attente
+            # Retrieve pending records
             pending_records = get_pending_training_data()
             if not pending_records:
                 logger.info("[Tracker] No pending records to process")
@@ -101,10 +140,21 @@ def performance_tracker_loop(client, symbols):
                         logger.debug(f"[Tracker] Skipping record for {symbol} (not in SYMBOLS)")
                         continue
                     signal_ts = record['timestamp']
-                    action = record['action']
                     record_id = record['id']
+                    market_context = record.get('market_context', {})
 
-                    logger.debug(f"[Tracker] Processing record: ID={record_id}, Symbol={symbol}, TS={signal_ts}")
+                    # Infer action from signals table or market_context
+                    action = get_action_from_signals(symbol, signal_ts)
+                    if action is None:
+                        if market_context.get('trend_up') and market_context.get('macd_bullish'):
+                            action = 'buy'
+                        elif market_context.get('trend_down'):
+                            action = 'sell'
+                        else:
+                            action = 'hold'
+                    logger.debug(f"[Tracker] Inferred action for {symbol} (ID={record_id}): {action}")
+
+                    logger.debug(f"[Tracker] Processing record: ID={record_id}, Symbol={symbol}, TS={signal_ts}, Action={action}")
 
                     # Calculate market direction
                     direction, pct_change = calculate_market_direction(symbol, signal_ts)
@@ -125,12 +175,12 @@ def performance_tracker_loop(client, symbols):
                         processed_records += 1
                         total_correct += prediction_correct
                     else:
-                        logger.error(f"[Tracker] Insufficient data for {symbol} at {signal_ts}")
+                        logger.warning(f"[Tracker] Insufficient data for {symbol} at {signal_ts}")
 
-                    # Pause pour réduire la pression sur le pool de connexions
+                    # Pause to reduce pressure on connection pool
                     eventlet.sleep(0.1)
                 except Exception as e:
-                    logger.error(f"[Tracker] Error processing record {record}: {str(e)}")
+                    logger.error(f"[Tracker] Error processing record ID={record.get('id', 'unknown')}: {str(e)}")
                     continue
 
             # Calculate and log accuracy for the batch
@@ -144,13 +194,16 @@ def performance_tracker_loop(client, symbols):
             # Verify if the model should be retrained
             if should_retrain_model():
                 logger.info("[Tracker] Starting model retraining...")
-                # À implémenter : logic for retraining the model
+                # To be implemented: logic for retraining the model
 
             time.sleep(60)  # Wait before next iteration
 
         except psycopg2.pool.PoolError as e:
             logger.error(f"[Tracker] Connection pool exhausted in tracker loop: {str(e)}")
             time.sleep(60)  # Wait before retrying
+        except KeyboardInterrupt:
+            logger.info("[Tracker] Received interrupt signal, shutting down gracefully...")
+            break
         except Exception as e:
             logger.error(f"[Tracker] Error in tracker loop: {str(e)}")
             time.sleep(60)  # Wait before retrying

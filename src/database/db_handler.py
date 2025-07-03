@@ -25,11 +25,11 @@ USER = DB_CONFIG["user"]
 PASSWORD = DB_CONFIG["password"]
 PORT = DB_CONFIG.get("port", 5432)
 
-# Initialize connection pool with increased max connections
+# Initialize connection pool
 try:
     connection_pool = psycopg2.pool.ThreadedConnectionPool(
         minconn=2,
-        maxconn=20,  # Augmenté pour gérer plus de connexions simultanées
+        maxconn=20,
         host=HOST,
         dbname=DBNAME,
         user=USER,
@@ -156,7 +156,7 @@ def insert_or_update_order(order):
 def insert_trade(trade_data):
     query = """
     INSERT INTO trades (order_id, symbol, side, quantity, price, stop_loss, take_profit, timestamp, pnl, is_trailing, trade_id)
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, to_timestamp(%s / 1000.0), %s, %s, %s)
     ON CONFLICT (trade_id) DO UPDATE
     SET order_id = EXCLUDED.order_id,
         side = EXCLUDED.side,
@@ -187,56 +187,33 @@ def insert_trade(trade_data):
         logger.error(f"[db_handler] Error inserting trade for {trade_data['symbol']}: {e}")
         raise
 
-def insert_signal(symbol, signal_type, price, quantity, strategy_mode, timestamp, confidence):
-    query = """
-    INSERT INTO signals (symbol, signal_type, price, quantity, strategy_mode, timestamp, confidence)
-    VALUES (%s, %s, %s, %s, %s, to_timestamp(%s / 1000.0), %s)
-    ON CONFLICT (symbol, timestamp) DO UPDATE
-    SET signal_type = EXCLUDED.signal_type,
-        price = EXCLUDED.price,
-        quantity = EXCLUDED.quantity,
-        strategy_mode = EXCLUDED.strategy_mode,
-        confidence = EXCLUDED.confidence;
+def insert_signal(symbol, timestamp, signal_type, price, confidence_score=None, strategy=None):
     """
-    conn = None
+    Insert a signal into the signals table, skipping duplicates.
+    """
+    query = """
+    INSERT INTO signals (symbol, timestamp, signal_type, price, created_at, confidence_score, strategy)
+    VALUES (%s, %s, %s, %s, %s, %s, %s)
+    ON CONFLICT (symbol, timestamp) DO NOTHING
+    """
     try:
-        if not isinstance(timestamp, (int, float)) or timestamp < 0:
-            raise ValueError(f"Invalid timestamp for {symbol}: {timestamp}")
-        conn = get_db_connection()
-        with conn.cursor() as cursor:
-            cursor.execute(
-                query,
-                (symbol, signal_type, float(price), float(quantity), strategy_mode, float(timestamp), float(confidence))
-            )
-            conn.commit()
-            logger.info(f"[insert_signal] Inserted signal for {symbol}: action={signal_type}, timestamp={timestamp}, confidence={confidence}")
-    except psycopg2.errors.DatatypeMismatch as e:
-        logger.error(f"[insert_signal] Datatype mismatch error: {e}, query: {query[:100]}..., params: {(symbol, signal_type, price, quantity, strategy_mode, timestamp, confidence)}")
-        if conn:
-            conn.rollback()
-        raise
+        created_at = int(time.time() * 1000)
+        execute_query(query, (symbol, timestamp, signal_type, float(price), created_at, confidence_score, strategy), fetch=False)
+        logger.info(f"[insert_signal] Signal inserted or skipped (if duplicate) for {symbol} at {timestamp}")
     except Exception as e:
-        logger.error(f"[insert_signal] Error inserting signal: {e}", exc_info=True)
-        if conn:
-            conn.rollback()
+        logger.error(f"[insert_signal] Error inserting signal: {str(e)}")
         raise
-    finally:
-        if conn:
-            release_db_connection(conn)
 
 def insert_training_data(symbol, indicators, market_context, timestamp):
-    """
-    Insère les données d'entraînement dans la table training_data.
-    """
     query = """
-    INSERT INTO training_data (symbol, indicators, market_context, timestamp)
+    INSERT INTO training_data (symbol, timestamp, indicators, market_context)
     VALUES (%s, %s, %s, %s);
     """
     conn = None
     try:
         conn = get_db_connection()
         with conn.cursor() as cursor:
-            cursor.execute(query, (symbol, indicators, market_context, timestamp))
+            cursor.execute(query, (symbol, timestamp, indicators, market_context))
             conn.commit()
             logger.debug(f"[insert_training_data] Inserted training data for {symbol} at {timestamp}")
     except Exception as e:
@@ -248,19 +225,73 @@ def insert_training_data(symbol, indicators, market_context, timestamp):
         if conn:
             release_db_connection(conn)
 
-def get_future_prices(symbol, limit=10):
+def get_pending_training_data():
+    """
+    Retrieve training data records that are pending processing (market_direction or prediction_correct is NULL).
+    """
+    query = """
+    SELECT id, symbol, timestamp, indicators, market_context, market_direction, 
+           price_change_pct, prediction_correct, created_at, updated_at
+    FROM training_data
+    WHERE market_direction IS NULL OR prediction_correct IS NULL
+    ORDER BY timestamp ASC
+    LIMIT 100
+    """
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            cursor.execute(query)
+            columns = [desc[0] for desc in cursor.description]
+            results = cursor.fetchall()
+            records = [dict(zip(columns, row)) for row in results]
+            logger.info(f"[get_pending_training_data] Fetched {len(records)} pending training data records")
+            return records
+    except Exception as e:
+        logger.error(f"[get_pending_training_data] Error fetching pending training data: {str(e)}")
+        raise
+    finally:
+        if conn:
+            release_db_connection(conn)
+
+def update_training_outcome(record_id, market_direction, price_change_pct, prediction_correct):
+    """
+    Update a training data record with market direction, price change percentage, and prediction outcome.
+    """
+    query = """
+    UPDATE training_data
+    SET market_direction = %s,
+        price_change_pct = %s,
+        prediction_correct = %s,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = %s
+    """
+    try:
+        execute_query(query, (
+            int(market_direction),
+            float(price_change_pct),
+            bool(prediction_correct),
+            int(record_id)
+        ))
+        logger.info(f"[update_training_outcome] Updated training data record ID={record_id}")
+    except Exception as e:
+        logger.error(f"[update_training_outcome] Error updating training data record ID={record_id}: {str(e)}")
+        raise
+
+def get_future_prices(symbol, signal_timestamp, candle_count=5):
     query = """
     SELECT timestamp, open, high, low, close, volume
     FROM price_data
-    WHERE symbol = %s
-    ORDER BY timestamp DESC
+    WHERE symbol = %s AND timestamp > to_timestamp(%s::double precision / 1000)
+    ORDER BY timestamp ASC
     LIMIT %s
     """
+    params = (str(symbol), int(signal_timestamp), int(candle_count))
     try:
-        return execute_query(query, (symbol, limit), fetch=True)
+        with get_db_connection() as conn:
+            return pd.read_sql_query(query, conn, params=params)
     except Exception as e:
-        logger.error(f"Error fetching future prices for {symbol}: {str(e)}")
-        return []
+        logger.error(f"Failed to fetch future prices for {symbol}: {e}")
+        raise
 
 def get_training_data_count(symbol):
     query = """
@@ -298,39 +329,27 @@ def insert_metrics(symbol, metrics):
         return False
 
 def insert_price_data(price_data, symbol):
-    """
-    Insère les données de prix dans la table price_data.
-    Valide que price_data est un DataFrame valide avec les colonnes nécessaires.
-    """
     try:
-        # Vérifier que price_data est un DataFrame
         if not isinstance(price_data, pd.DataFrame):
             logger.error(f"[insert_price_data] price_data is not a DataFrame for {symbol}: {type(price_data)}, data: {price_data}")
             return False
-
-        # Vérifier les colonnes nécessaires
         required_columns = ['open', 'high', 'low', 'close', 'volume']
         if not all(col in price_data.columns for col in required_columns):
             logger.error(f"[insert_price_data] Missing required columns in price_data for {symbol}: {price_data.columns}, data: {price_data}")
             return False
-
-        # Vérifier que l'index est un DatetimeIndex
         if not isinstance(price_data.index, pd.DatetimeIndex):
             logger.error(f"[insert_price_data] price_data index is not a DatetimeIndex for {symbol}: {type(price_data.index)}, data: {price_data}")
             return False
-
-        # Vérifier que le DataFrame n'est pas vide
         if price_data.empty:
             logger.error(f"[insert_price_data] Empty price_data for {symbol}, data: {price_data}")
             return False
-
         query = """
         INSERT INTO price_data (symbol, timestamp, open, high, low, close, volume)
         VALUES (%s, to_timestamp(%s / 1000.0), %s, %s, %s, %s, %s)
         """
         execute_query(query, (
             symbol,
-            int(price_data.index[-1].timestamp() * 1000),  # Timestamp en millisecondes
+            int(price_data.index[-1].timestamp() * 1000),
             float(price_data['open'].iloc[-1]),
             float(price_data['high'].iloc[-1]),
             float(price_data['low'].iloc[-1]),
@@ -368,98 +387,22 @@ def get_metrics():
         logger.error(f"Failed to fetch metrics: {e}")
         raise
 
-def get_training_data_count(since_last_train=False):
-    if since_last_train:
-        last_train_ts = get_last_train_timestamp()
-        query = "SELECT COUNT(*) FROM training_data WHERE timestamp > %s"
-        params = (last_train_ts,)
-    else:
-        query = "SELECT COUNT(*) FROM training_data"
-        params = None
-    try:
-        result = execute_query(query, params, fetch=True)
-        return result[0]['count'] if result else 0
-    except Exception as e:
-        logger.error(f"Failed to get training data count: {e}")
-        raise
-
-def get_future_prices(symbol, signal_timestamp, candle_count=5):
-    query = """
-    SELECT timestamp, open, high, low, close, volume
-    FROM price_data
-    WHERE symbol = %s AND timestamp > %s
-    ORDER BY timestamp ASC
-    LIMIT %s
-    """
-    params = (str(symbol), int(signal_timestamp), int(candle_count))
-    try:
-        with get_db_connection() as conn:
-            return pd.read_sql_query(query, conn, params=params)
-    except Exception as e:
-        logger.error(f"Failed to fetch future prices for {symbol}: {e}")
-        raise
-
-def get_pending_training_data():
-    five_min_ago = int(time.time() * 1000) - 300000
-    query = """
-    SELECT * FROM training_data
-    WHERE market_direction IS NULL
-    AND timestamp < %s
-    """
-    try:
-        return execute_query(query, (five_min_ago,), fetch=True)
-    except Exception as e:
-        logger.error(f"Failed to fetch pending training data: {e}")
-        raise
-
-def update_training_outcome(record_id, market_direction, price_change_pct, prediction_correct):
-    query = """
-    UPDATE training_data
-    SET market_direction = %s,
-        price_change_pct = %s,
-        prediction_correct = %s,
-        updated_at = CURRENT_TIMESTAMP
-    WHERE id = %s
-    """
-    try:
-        params = (
-            int(market_direction) if market_direction is not None else None,
-            float(price_change_pct) if price_change_pct is not None else None,
-            bool(prediction_correct) if prediction_correct is not None else None,
-            int(record_id)
-        )
-        execute_query(query, params)
-        logger.info(f"Updated training outcome for record_id={record_id}")
-    except Exception as e:
-        logger.error(f"Failed to update training outcome for record_id={record_id}: {e}")
-        raise
-
-def get_last_train_timestamp():
-    query = "SELECT MAX(timestamp) AS max_ts FROM training_data"
-    try:
-        result = execute_query(query, fetch=True)
-        return result[0]['max_ts'] if result and result[0]['max_ts'] is not None else 0
-    except Exception as e:
-        logger.error(f"Failed to get last train timestamp: {e}")
-        raise
-
-def get_price_history(symbol, timeframe='1h'):
+def get_price_history(symbol, timeframe='1h', start_timestamp=None):
     timeframe_to_limit = {
-        '5m': 288,
-        '15m': 96,
-        '1h': 168,
-        '4h': 84,
-        '1d': 30
+        '5m': 288, '15m': 96, '1h': 168, '4h': 84, '1d': 30
     }
     limit = timeframe_to_limit.get(timeframe, 100)
     query = """
     SELECT timestamp, open, high, low, close, volume
     FROM price_data
     WHERE symbol = %s
-    ORDER BY timestamp DESC
-    LIMIT %s
     """
-    params = (str(symbol), int(limit))
+    params = [str(symbol)]
+    if start_timestamp is not None:
+        query += " AND timestamp >= to_timestamp(%s::double precision / 1000)"
+        params.append(int(start_timestamp))
+    query += " ORDER BY timestamp DESC LIMIT %s"
+    params.append(int(limit))
     try:
         with get_db_connection() as conn:
             return pd.read_sql_query(query, conn, params=params).sort_values('timestamp').to_dict(orient='records')
@@ -468,35 +411,22 @@ def get_price_history(symbol, timeframe='1h'):
         raise
 
 def clean_old_data(retention_days=7, trades_retention_days=None):
-    """
-    Supprime les anciennes données des tables metrics et price_data selon la période de rétention.
-    """
     try:
         conn = get_db_connection()
         conn.autocommit = True
         cursor = conn.cursor()
-
-        # Millisecondes pour les tables en BIGINT
         threshold_ms = int((datetime.now() - timedelta(days=retention_days)).timestamp() * 1000)
-
-        # Timestamp pour les colonnes de type "timestamp"
         threshold_ts = datetime.now() - timedelta(days=retention_days)
-
-        # ✅ Pour metrics (timestamp est BIGINT)
         cursor.execute("DELETE FROM metrics WHERE timestamp < %s", (threshold_ms,))
         logger.info(f"[DB Cleanup] Deleted {cursor.rowcount} rows from metrics")
-
-        # ✅ Pour price_data (timestamp est TIMESTAMP)
         cursor.execute("DELETE FROM price_data WHERE timestamp < %s", (threshold_ts,))
         logger.info(f"[DB Cleanup] Deleted {cursor.rowcount} rows from price_data")
-
         cursor.close()
         release_db_connection(conn)
     except Exception as e:
         logger.error(f"Failed to clean old data: {e}", exc_info=True)
         if 'conn' in locals() and conn:
             release_db_connection(conn)
-
 
 def test_connection():
     conn = None
@@ -585,12 +515,10 @@ def sync_orders_with_db(client, symbol_list):
                     all_orders.append(order_data)
             except Exception as e:
                 logger.error(f"Error processing {symbol}: {str(e)}")
-
         synced_count = 0
         for order in all_orders:
             if insert_order_if_missing(order):
                 synced_count += 1
-
         logger.info(f"Orders sync completed. Total: {len(all_orders)}, New: {synced_count}")
         return synced_count
     except Exception as e:

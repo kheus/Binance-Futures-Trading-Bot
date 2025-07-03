@@ -285,3 +285,24 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
     logger.info(f"[Confidence Score] {symbol} → {len(confidence_factors)}/6 | Factors: {', '.join(confidence_factors) if confidence_factors else 'None'}")
 
     return action, new_position, confidence, confidence_factors
+
+def generate_signal(symbol, data, market_context, lstm_prediction_available=True, lstm_prediction=None):
+    """
+    Generate a trading signal for a symbol based on market context and optionally LSTM prediction.
+    Returns (action, confidence).
+    """
+    # If LSTM prediction is not available, use rule-based logic
+    if not lstm_prediction_available or lstm_prediction is None:
+        if market_context.get('trend_up') and market_context.get('macd_bullish'):
+            return 'buy', 0.8  # Example confidence score
+        elif market_context.get('trend_down'):
+            return 'sell', 0.8
+        return 'hold', 0.5
+
+    # LSTM-based signal generation (example logic)
+    if lstm_prediction > 0.55:
+        return 'buy', float(lstm_prediction)
+    elif lstm_prediction < 0.45:
+        return 'sell', 1.0 - float(lstm_prediction)
+    else:
+        return 'hold', 0.5

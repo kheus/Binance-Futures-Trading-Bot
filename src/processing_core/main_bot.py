@@ -11,13 +11,14 @@ from binance.websocket.um_futures.websocket_client import UMFuturesWebsocketClie
 from confluent_kafka import Consumer
 from src.data_ingestion.data_formatter import format_candle
 from src.processing_core.lstm_model import train_or_load_model
-from src.processing_core.signal_generator import check_signal, prepare_lstm_input
+from src.processing_core.signal_generator import generate_signal  # or check_signal
 from src.trade_execution.order_manager import place_order, update_trailing_stop, init_trailing_stop_manager, EnhancedOrderManager
 from src.trade_execution.sync_orders import get_current_atr, sync_binance_trades_with_postgres
 from src.database.db_handler import insert_trade, insert_signal, insert_metrics, create_tables, insert_price_data, clean_old_data
 from src.monitoring.metrics import record_trade_metric
 from src.monitoring.alerting import send_telegram_alert
 from src.performance.tracker import performance_tracker_loop
+from src.processing_core.indicators import calculate_indicators
 import sys
 import os
 import time
@@ -31,6 +32,7 @@ from rich.console import Console
 from rich.table import Table
 from rich.logging import RichHandler
 import psycopg2.pool
+import signal
 
 # Initialize rich console for enhanced logging
 console = Console()
@@ -234,72 +236,6 @@ def start_websocket():
 websocket_thread = threading.Thread(target=start_websocket, daemon=True)
 websocket_thread.start()
 
-def calculate_indicators(df, symbol):
-    logger.info(f"Calculating indicators for {symbol} DataFrame with {len(df)} rows 📊")
-    if len(df) < 50:
-        logger.info(f"⚠️ Skipping indicator calculation for {symbol} due to insufficient data")
-        return df
-
-    df = df.dropna(subset=['open', 'high', 'low', 'close', 'volume']).copy()
-    if len(df) < 50:
-        logger.warning(f"⚠️ Data cleaned, insufficient rows for {symbol}: {len(df)}")
-        return df
-
-    try:
-        df['RSI'] = talib.RSI(df['close'], timeperiod=14)
-        df['MACD'], df['MACD_signal'], df['MACD_hist'] = talib.MACD(df['close'], fastperiod=12, slowperiod=26, signalperiod=9)
-        df['ADX'] = talib.ADX(df['high'], df['low'], df['close'], timeperiod=14)
-        df['EMA20'] = talib.EMA(df['close'], timeperiod=20)
-        df['EMA50'] = talib.EMA(df['close'], timeperiod=50)
-        df['ATR'] = talib.ATR(df['high'], df['low'], df['close'], timeperiod=14)
-        df['ROC'] = talib.ROC(df['close'], timeperiod=5) * 100
-
-        # Validate ADX and ROC
-        if df['ADX'].iloc[-1] > 90:
-            logger.warning(f"[Indicators] Unusually high ADX for {symbol}: {df['ADX'].iloc[-1]:.2f}. Check input data: high={df['high'].iloc[-1]:.2f}, low={df['low'].iloc[-1]:.2f}, close={df['close'].iloc[-1]:.2f}")
-        if abs(df['ROC'].iloc[-1]) > 30:
-            logger.warning(f"[Indicators] Unusually high ROC for {symbol}: {df['ROC'].iloc[-1]:.2f}%. Check close prices: {df['close'].iloc[-6:].tolist()}")
-
-        # Remplir les NaN avec la méthode forward fill, puis backward fill
-        required_cols = ['RSI', 'MACD', 'MACD_signal', 'MACD_hist', 'ADX', 'EMA20', 'EMA50', 'ATR', 'ROC']
-        df[required_cols] = df[required_cols].ffill().bfill()
-
-        # Vérifier si des NaN persist
-        if df[required_cols].isna().any().any():
-            logger.warning(f"⚠️ [Indicators] NaN values persist in indicators for {symbol} after filling")
-
-        metrics = {
-            "symbol": symbol,
-            "timestamp": int(df.index[-1].timestamp() * 1000),
-            "rsi": float(df['RSI'].iloc[-1]),
-            "macd": float(df['MACD'].iloc[-1]),
-            "adx": float(df['ADX'].iloc[-1]),
-            "ema20": float(df['EMA20'].iloc[-1]),
-            "ema50": float(df['EMA50'].iloc[-1]),
-            "atr": float(df['ATR'].iloc[-1]),
-            "roc": float(df['ROC'].iloc[-1])
-        }
-        insert_metrics(symbol, metrics)
-
-        # Create a table for indicators
-        table = Table(title=f"Technical Indicators for {symbol}")
-        table.add_column("Indicator", style="cyan")
-        table.add_column("Value", style="magenta")
-        table.add_row("RSI", f"{metrics['rsi']:.2f}")
-        table.add_row("MACD", f"{metrics['macd']:.4f}")
-        table.add_row("ADX", f"{metrics['adx']:.2f}")
-        table.add_row("EMA20", f"{metrics['ema20']:.4f}")
-        table.add_row("EMA50", f"{metrics['ema50']:.4f}")
-        table.add_row("ATR", f"{metrics['atr']:.4f}")
-        table.add_row("ROC", f"{metrics['roc']:.2f}%")
-        console.log(table)
-
-    except Exception as e:
-        logger.error(f"❌ [Indicators] Error calculating indicators for {symbol}: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-
-    return df
 async def main():
     dataframes = {symbol: pd.DataFrame() for symbol in SYMBOLS}
     order_details = {symbol: None for symbol in SYMBOLS}
@@ -359,14 +295,19 @@ async def main():
             logger.error(f"❌ [Data] Insufficient historical data fetched for {symbol}: {len(klines)} rows")
             raise ValueError(f"Insufficient historical data for {symbol}")
         data_hist = pd.DataFrame(klines, columns=["open_time", "open", "high", "low", "close", "volume",
-                                                "close_time", "quote_asset_vol", "num_trades", "taker_buy_base_vol",
-                                                "taker_buy_quote_vol", "ignore"])
+                                                  "close_time", "quote_asset_vol", "num_trades", "taker_buy_base_vol",
+                                                  "taker_buy_quote_vol", "ignore"])
         data_hist = data_hist[["open_time", "open", "high", "low", "close", "volume"]].astype(float)
         dataframes[symbol] = data_hist.rename(columns={"open_time": "timestamp"})
         dataframes[symbol]["timestamp"] = pd.to_datetime(dataframes[symbol]["timestamp"], unit="ms")
         dataframes[symbol].set_index("timestamp", inplace=True)
         dataframes[symbol] = dataframes[symbol].tail(500)
-        dataframes[symbol] = calculate_indicators(dataframes[symbol], symbol)
+        df = calculate_indicators(dataframes[symbol], symbol)
+        required_cols = ['close', 'volume', 'RSI', 'MACD', 'ADX']
+        if df is not None and not df.empty and all(col in df.columns for col in required_cols):
+            logger.info(f"[Main] Indicators calculated successfully for {symbol}")
+        else:
+            logger.error(f"[Main] Failed to calculate indicators for {symbol}, DataFrame: {df.columns.tolist() if df is not None else 'None'}")
 
         logger.info(f"[Main] Training or loading LSTM model for {symbol} 🤖")
         models[symbol], scalers[symbol] = train_or_load_model(dataframes[symbol], symbol)
@@ -486,14 +427,8 @@ async def main():
 
                 if len(dataframes[symbol]) >= 101:
                     logger.debug(f"[main_bot] Calling check_signal for {symbol} with dataframe length {len(dataframes[symbol])}")
-                    action, new_position, confidence, confidence_factors = check_signal(
-                        df=dataframes[symbol],
-                        model=models[symbol],
-                        current_position=current_positions[symbol],
-                        last_order_details=last_order_details[symbol],
-                        symbol=symbol,
-                        last_action_sent=last_action_sent[symbol][0],
-                        config=config
+                    action, new_position, confidence, confidence_factors = generate_signal(
+                        symbol, dataframes[symbol], market_context={}
                     )
                     if action == last_action_sent[symbol][0]:
                         logger.info(f"[Signal] Ignored repeated action for {symbol}: {action} 🔄")

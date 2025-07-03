@@ -53,13 +53,14 @@ CREATE TABLE IF NOT EXISTS metrics (
 -- TABLE : signals
 CREATE TABLE IF NOT EXISTS signals (
     id SERIAL PRIMARY KEY,
-    symbol VARCHAR(50),
-    signal_type VARCHAR(50),
-    price DECIMAL,
-    quantity DECIMAL,
-    strategy_mode VARCHAR(20),
-    timestamp timestamp with time zone,
-    confidence DOUBLE PRECISION
+    symbol VARCHAR(20) NOT NULL,
+    timestamp BIGINT NOT NULL,
+    signal_type VARCHAR(10) NOT NULL,
+    price NUMERIC(20, 8) NOT NULL,
+    created_at BIGINT NOT NULL,
+    confidence_score NUMERIC(5, 2),
+    strategy VARCHAR(20),
+    UNIQUE (symbol, timestamp)
 );
 
 -- TABLE : training_data
