@@ -188,9 +188,6 @@ def insert_trade(trade_data):
         raise
 
 def insert_signal(symbol, signal_type, price, quantity, strategy_mode, timestamp, confidence):
-    """
-    Insère un signal dans la table signals avec les nouvelles colonnes.
-    """
     query = """
     INSERT INTO signals (symbol, signal_type, price, quantity, strategy_mode, timestamp, confidence)
     VALUES (%s, %s, %s, %s, %s, to_timestamp(%s / 1000.0), %s)
@@ -203,7 +200,6 @@ def insert_signal(symbol, signal_type, price, quantity, strategy_mode, timestamp
     """
     conn = None
     try:
-        # Validate timestamp
         if not isinstance(timestamp, (int, float)) or timestamp < 0:
             raise ValueError(f"Invalid timestamp for {symbol}: {timestamp}")
         conn = get_db_connection()
@@ -228,18 +224,29 @@ def insert_signal(symbol, signal_type, price, quantity, strategy_mode, timestamp
         if conn:
             release_db_connection(conn)
 
-def insert_training_data(symbol, data, timestamp):
-    query = """
-    INSERT INTO training_data (symbol, data, timestamp)
-    VALUES (%s, %s, %s)
+def insert_training_data(symbol, indicators, market_context, timestamp):
     """
+    Insère les données d'entraînement dans la table training_data.
+    """
+    query = """
+    INSERT INTO training_data (symbol, indicators, market_context, timestamp)
+    VALUES (%s, %s, %s, %s);
+    """
+    conn = None
     try:
-        execute_query(query, (symbol, json.dumps(data), timestamp))
-        logger.info(f"Training data inserted for {symbol} at {timestamp}")
-        return True
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            cursor.execute(query, (symbol, indicators, market_context, timestamp))
+            conn.commit()
+            logger.debug(f"[insert_training_data] Inserted training data for {symbol} at {timestamp}")
     except Exception as e:
-        logger.error(f"Error inserting training data for {symbol}: {str(e)}")
-        return False
+        logger.error(f"[insert_training_data] Error inserting training data for {symbol}: {e}, query: {query[:100]}..., params: {(symbol, indicators, market_context, timestamp)}")
+        if conn:
+            conn.rollback()
+        raise
+    finally:
+        if conn:
+            release_db_connection(conn)
 
 def get_future_prices(symbol, limit=10):
     query = """

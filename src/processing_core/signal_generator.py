@@ -140,21 +140,25 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
     lstm_input = prepare_lstm_input(df)
     try:
         prediction = model.predict(lstm_input, verbose=0)[0][0]
+        logger.debug(f"[check_signal] LSTM prediction for {symbol}: {prediction:.4f}")
     except Exception as e:
         logger.error(f"[Prediction Error] {e} for {symbol}")
         return "None", current_position, 0.0, []
 
     dynamic_up, dynamic_down = calculate_dynamic_thresholds(adx, strategy_mode)
+    logger.debug(f"[check_signal] Dynamic thresholds for {symbol}: up={dynamic_up:.3f}, down={dynamic_down:.3f}")
     trend_up = ema20 > ema50
     trend_down = ema20 < ema50
     macd_bullish = macd > signal_line
     rsi_strong = (trend_up and rsi > 50) or (trend_down and rsi < 45) or (abs(rsi - 50) > 15)
+    logger.debug(f"[check_signal] Conditions for {symbol}: trend_up={trend_up}, trend_down={trend_down}, macd_bullish={macd_bullish}, rsi_strong={rsi_strong}")
     rolling_high = df['high'].rolling(window=20).max()
     rolling_low = df['low'].rolling(window=20).min()
     breakout_up = close > (rolling_high.iloc[-1] - 0.1 * atr) if len(df) >= 20 else False
     breakout_down = close < (rolling_low.iloc[-1] + 0.1 * atr) if len(df) >= 20 else False
     bullish_divergence = (df['close'].iloc[-1] < df['close'].iloc[-3] and df['RSI'].iloc[-1] > df['RSI'].iloc[-3])
     bearish_divergence = (df['close'].iloc[-1] > df['close'].iloc[-3] and df['RSI'].iloc[-1] < df['RSI'].iloc[-3])
+    logger.debug(f"[check_signal] Breakout/Divergence for {symbol}: breakout_up={breakout_up}, breakout_down={breakout_down}, bullish_divergence={bullish_divergence}, bearish_divergence={bearish_divergence}")
 
     confidence_factors = []
     if prediction > 0.55 or prediction < 0.45:
@@ -182,6 +186,7 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
     if config is None:
         logger.error(f"[check_signal] Config is None for {symbol}, cannot calculate quantity")
         return "None", current_position, 0.0, []
+
     capital = config["binance"].get("capital", 1000.0)
     leverage = config["binance"].get("leverage", 1.0)
     quantity = (capital * leverage) / close if close > 0 else 0.0
@@ -195,12 +200,12 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
             action = "buy"
             new_position = "long"
     elif strategy_mode == "trend":
-        if (trend_up and macd_bullish and prediction > dynamic_up and roc > 0.3):
-            action = "sell"
-            new_position = "short"
-        elif (trend_down and not macd_bullish and prediction < dynamic_down and roc < -0.3):
-            action = "buy"
-            new_position = "long"
+          if (trend_up and macd_bullish and prediction > dynamic_up and roc > 1.0):
+             action = "sell"
+             new_position = "short"
+          elif (trend_down and not macd_bullish and prediction < dynamic_down and roc < -1.0):
+               action = "buy"
+               new_position = "long"
     elif strategy_mode == "range":
         range_high = rolling_high.iloc[-1]
         range_low = rolling_low.iloc[-1]
@@ -225,6 +230,8 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
         action = "close_sell"
         new_position = None
 
+    logger.debug(f"[check_signal] Action for {symbol}: {action}, Confidence: {len(confidence_factors)}/6, Prediction: {prediction:.4f}")
+
     if action == last_action_sent:
         logger.info(f"[Anti-Repeat] Signal {action} ignored for {symbol} as it was sent previously.")
         return "None", current_position, 0.0, []
@@ -232,37 +239,38 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
     if action in ("buy", "sell"):
         try:
             training_record = {
-                "symbol": symbol,
-                "timestamp": signal_timestamp,
                 "prediction": float(prediction),
                 "action": action,
                 "price": float(close),
-                "quantity": float(quantity),
-                "indicators": {
-                    "rsi": round(rsi, 2),
-                    "macd": round(macd, 4),
-                    "adx": round(adx, 2),
-                    "roc": round(roc, 2),
-                    "ema20": round(ema20, 4),
-                    "ema50": round(ema50, 4),
-                    "atr": round(atr, 4),
-                    "strategy_mode": strategy_mode
-                },
-                "market_context": {
-                    "trend_up": bool(trend_up),  # Convert np.bool_ to Python bool
-                    "trend_down": bool(trend_down),
-                    "macd_bullish": bool(macd_bullish),
-                    "breakout_up": bool(breakout_up),
-                    "breakout_down": bool(breakout_down)
-                }
+                "quantity": float(quantity)
             }
-            training_record["check_timestamp"] = int((datetime.now() + timedelta(minutes=5)).timestamp() * 1000)
-            insert_training_data(symbol, json.dumps(training_record), signal_timestamp)
+            indicators = {
+                "rsi": round(rsi, 2),
+                "macd": round(macd, 4),
+                "adx": round(adx, 2),
+                "roc": round(roc, 2),
+                "ema20": round(ema20, 4),
+                "ema50": round(ema50, 4),
+                "atr": round(atr, 4),
+                "strategy_mode": strategy_mode
+            }
+            market_context = {
+                "trend_up": bool(trend_up),
+                "trend_down": bool(trend_down),
+                "macd_bullish": bool(macd_bullish),
+                "breakout_up": bool(breakout_up),
+                "breakout_down": bool(breakout_down)
+            }
+            check_timestamp = int((datetime.now() + timedelta(minutes=5)).timestamp() * 1000)
+            insert_training_data(symbol, json.dumps(indicators), json.dumps(market_context), signal_timestamp)
             logger.info(f"[Performance Tracking] Stored training data for {symbol} at {signal_timestamp}")
             check_time = datetime.now() + timedelta(minutes=5)
             logger.info(f"[Performance Tracking] Will verify market direction at {check_time.strftime('%H:%M')}")
+            # Update training_record with check_timestamp for later use if needed
+            training_record["check_timestamp"] = check_timestamp
         except Exception as e:
             logger.error(f"[Performance Tracking] Error storing training data: {e}")
+            raise
 
     confidence = len(confidence_factors) / 6.0
     if action != "None":

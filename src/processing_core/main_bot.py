@@ -252,13 +252,19 @@ def calculate_indicators(df, symbol):
         df['EMA20'] = talib.EMA(df['close'], timeperiod=20)
         df['EMA50'] = talib.EMA(df['close'], timeperiod=50)
         df['ATR'] = talib.ATR(df['high'], df['low'], df['close'], timeperiod=14)
-        df['ROC'] = talib.ROC(df['close'], timeperiod=5)
+        df['ROC'] = talib.ROC(df['close'], timeperiod=5) * 100
+
+        # Validate ADX and ROC
+        if df['ADX'].iloc[-1] > 90:
+            logger.warning(f"[Indicators] Unusually high ADX for {symbol}: {df['ADX'].iloc[-1]:.2f}. Check input data: high={df['high'].iloc[-1]:.2f}, low={df['low'].iloc[-1]:.2f}, close={df['close'].iloc[-1]:.2f}")
+        if abs(df['ROC'].iloc[-1]) > 30:
+            logger.warning(f"[Indicators] Unusually high ROC for {symbol}: {df['ROC'].iloc[-1]:.2f}%. Check close prices: {df['close'].iloc[-6:].tolist()}")
 
         # Remplir les NaN avec la méthode forward fill, puis backward fill
         required_cols = ['RSI', 'MACD', 'MACD_signal', 'MACD_hist', 'ADX', 'EMA20', 'EMA50', 'ATR', 'ROC']
         df[required_cols] = df[required_cols].ffill().bfill()
 
-        # Vérifier si des NaN persistent
+        # Vérifier si des NaN persist
         if df[required_cols].isna().any().any():
             logger.warning(f"⚠️ [Indicators] NaN values persist in indicators for {symbol} after filling")
 
@@ -285,7 +291,7 @@ def calculate_indicators(df, symbol):
         table.add_row("EMA20", f"{metrics['ema20']:.4f}")
         table.add_row("EMA50", f"{metrics['ema50']:.4f}")
         table.add_row("ATR", f"{metrics['atr']:.4f}")
-        table.add_row("ROC", f"{metrics['roc']:.4f}")
+        table.add_row("ROC", f"{metrics['roc']:.2f}%")
         console.log(table)
 
     except Exception as e:
@@ -294,7 +300,6 @@ def calculate_indicators(df, symbol):
         logger.error(traceback.format_exc())
 
     return df
-
 async def main():
     dataframes = {symbol: pd.DataFrame() for symbol in SYMBOLS}
     order_details = {symbol: None for symbol in SYMBOLS}
