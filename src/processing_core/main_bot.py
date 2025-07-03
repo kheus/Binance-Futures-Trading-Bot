@@ -458,7 +458,14 @@ async def main():
 
                         # Insérer le signal
                         try:
-                            insert_signal(symbol, action, float(candle_df["close"].iloc[-1]), (CAPITAL * LEVERAGE) / float(candle_df["close"].iloc[-1]), dataframes[symbol]['strategy_mode'].iloc[-1] if 'strategy_mode' in dataframes[symbol].columns else "unknown", timestamp, confidence)
+                            insert_signal(
+                                symbol,
+                                timestamp,
+                                action,
+                                float(candle_df["close"].iloc[-1]),
+                                confidence,
+                                dataframes[symbol]['strategy_mode'].iloc[-1] if 'strategy_mode' in dataframes[symbol].columns else "unknown"
+                            )
                             logger.info(f"[Signal] Generated signal {action} for {symbol} with confidence {confidence:.2f}")
                         except psycopg2.pool.PoolError as e:
                             logger.error(f"❌ [Signal] Failed to insert signal for {symbol} due to connection pool exhaustion: {e}")
