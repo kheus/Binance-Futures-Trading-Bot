@@ -1,4 +1,5 @@
 ﻿import logging
+from tkinter import INSERT
 import psycopg2
 from psycopg2 import pool
 from pathlib import Path
@@ -192,7 +193,7 @@ def insert_signal(symbol, signal_type, price, quantity, strategy_mode, timestamp
     """
     query = """
     INSERT INTO signals (symbol, signal_type, price, quantity, strategy_mode, timestamp, confidence)
-    VALUES (%s, %s, %s, %s, %s, %s, %s)
+    VALUES (%s, %s, %s, %s, %s, to_timestamp(%s / 1000.0), %s)
     ON CONFLICT (symbol, timestamp) DO UPDATE
     SET signal_type = EXCLUDED.signal_type,
         price = EXCLUDED.price,
@@ -202,18 +203,27 @@ def insert_signal(symbol, signal_type, price, quantity, strategy_mode, timestamp
     """
     conn = None
     try:
+        # Validate timestamp
+        if not isinstance(timestamp, (int, float)) or timestamp < 0:
+            raise ValueError(f"Invalid timestamp for {symbol}: {timestamp}")
         conn = get_db_connection()
         with conn.cursor() as cursor:
             cursor.execute(
                 query,
-                (symbol, signal_type, price, quantity, strategy_mode, timestamp, confidence)
+                (symbol, signal_type, float(price), float(quantity), strategy_mode, float(timestamp), float(confidence))
             )
             conn.commit()
             logger.info(f"[insert_signal] Inserted signal for {symbol}: action={signal_type}, timestamp={timestamp}, confidence={confidence}")
+    except psycopg2.errors.DatatypeMismatch as e:
+        logger.error(f"[insert_signal] Datatype mismatch error: {e}, query: {query[:100]}..., params: {(symbol, signal_type, price, quantity, strategy_mode, timestamp, confidence)}")
+        if conn:
+            conn.rollback()
+        raise
     except Exception as e:
         logger.error(f"[insert_signal] Error inserting signal: {e}", exc_info=True)
         if conn:
             conn.rollback()
+        raise
     finally:
         if conn:
             release_db_connection(conn)

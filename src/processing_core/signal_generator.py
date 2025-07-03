@@ -8,8 +8,11 @@ from datetime import datetime, timedelta
 from src.database.db_handler import insert_signal, insert_training_data, get_future_prices, get_training_data_count
 from monitoring.alerting import send_telegram_alert
 import json
+from rich.console import Console
+from rich.table import Table
 
 logger = logging.getLogger(__name__)
+console = Console()
 
 def prepare_lstm_input(df):
     required_cols = ['close', 'volume', 'RSI', 'MACD', 'ADX']
@@ -37,6 +40,61 @@ def select_strategy_mode(adx, rsi, atr):
     elif adx < 15 and 40 < rsi < 60 and atr < 30:
         return "range"
     return "scalp"
+
+def log_indicator_summary(symbol, rsi, macd, adx, ema20, ema50, atr, roc, confidence_factors):
+    table = Table(title=f"Indicator Summary for {symbol}")
+    table.add_column("Indicator", style="cyan")
+    table.add_column("Value", style="magenta")
+    table.add_column("Interpretation", style="green")
+
+    # RSI
+    if rsi < 30:
+        table.add_row("RSI", f"{rsi:.2f}", "Near oversold zone")
+    elif rsi > 70:
+        table.add_row("RSI", f"{rsi:.2f}", "Near overbought zone")
+    else:
+        table.add_row("RSI", f"{rsi:.2f}", "Neutral")
+
+    # MACD
+    if macd > 0.5:
+        table.add_row("MACD", f"{macd:.4f}", "Bullish")
+    elif macd < -0.5:
+        table.add_row("MACD", f"{macd:.4f}", "Bearish")
+    else:
+        table.add_row("MACD", f"{macd:.4f}", "Neutral to slightly bearish" if macd < 0 else "Neutral to slightly bullish")
+
+    # ADX
+    if adx >= 50:
+        table.add_row("ADX", f"{adx:.2f}", "Strong trend detected")
+    elif adx >= 25:
+        table.add_row("ADX", f"{adx:.2f}", "Moderate trend")
+    else:
+        table.add_row("ADX", f"{adx:.2f}", "Weak trend")
+
+    # EMA
+    if abs(ema20 - ema50) / ema50 < 0.001:
+        table.add_row("EMA20 vs EMA50", f"{ema20:.4f} ≈ {ema50:.4f}", "Neutral moving average crossover")
+    elif ema20 > ema50:
+        table.add_row("EMA20 vs EMA50", f"{ema20:.4f} > {ema50:.4f}", "Bullish trend")
+    else:
+        table.add_row("EMA20 vs EMA50", f"{ema20:.4f} < {ema50:.4f}", "Bearish trend")
+
+    # ROC
+    if roc > 1:
+        table.add_row("ROC", f"{roc:.2f}%", "Strong bullish momentum")
+    elif roc < -1:
+        table.add_row("ROC", f"{roc:.2f}%", "Strong bearish momentum")
+    elif roc > 0:
+        table.add_row("ROC", f"{roc:.2f}%", "Light bullish momentum")
+    elif roc < 0:
+        table.add_row("ROC", f"{roc:.2f}%", "Bearish momentum")
+    else:
+        table.add_row("ROC", f"{roc:.2f}%", "Neutral")
+
+    # Confidence Factors
+    table.add_row("Confidence Factors", ", ".join(confidence_factors) if confidence_factors else "None", "")
+
+    console.log(table)
 
 def calculate_market_direction(symbol, signal_timestamp):
     try:
@@ -97,6 +155,23 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
     breakout_down = close < (rolling_low.iloc[-1] + 0.1 * atr) if len(df) >= 20 else False
     bullish_divergence = (df['close'].iloc[-1] < df['close'].iloc[-3] and df['RSI'].iloc[-1] > df['RSI'].iloc[-3])
     bearish_divergence = (df['close'].iloc[-1] > df['close'].iloc[-3] and df['RSI'].iloc[-1] < df['RSI'].iloc[-3])
+
+    confidence_factors = []
+    if prediction > 0.55 or prediction < 0.45:
+        confidence_factors.append("LSTM strong")
+    if (trend_up and macd > signal_line) or (trend_down and macd < signal_line):
+        confidence_factors.append("MACD aligned")
+    if rsi > 50 or rsi < 50:
+        confidence_factors.append("RSI strong")
+    if (trend_up and ema20 > ema50) or (trend_down and ema20 < ema50):
+        confidence_factors.append("EMA trend")
+    if abs(roc) > 0.3:
+        confidence_factors.append("ROC momentum")
+    if breakout_up or breakout_down:
+        confidence_factors.append("Breakout detected")
+
+    # Log the indicator summary with confidence factors
+    log_indicator_summary(symbol, rsi, macd, adx, ema20, ema50, atr, roc, confidence_factors)
 
     action = "None"
     new_position = None
@@ -174,11 +249,11 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
                     "strategy_mode": strategy_mode
                 },
                 "market_context": {
-                    "trend_up": trend_up,
-                    "trend_down": trend_down,
-                    "macd_bullish": macd_bullish,
-                    "breakout_up": breakout_up,
-                    "breakout_down": breakout_down
+                    "trend_up": bool(trend_up),  # Convert np.bool_ to Python bool
+                    "trend_down": bool(trend_down),
+                    "macd_bullish": bool(macd_bullish),
+                    "breakout_up": bool(breakout_up),
+                    "breakout_down": bool(breakout_down)
                 }
             }
             training_record["check_timestamp"] = int((datetime.now() + timedelta(minutes=5)).timestamp() * 1000)
@@ -188,20 +263,6 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
             logger.info(f"[Performance Tracking] Will verify market direction at {check_time.strftime('%H:%M')}")
         except Exception as e:
             logger.error(f"[Performance Tracking] Error storing training data: {e}")
-
-    confidence_factors = []
-    if prediction > 0.55 or prediction < 0.45:
-        confidence_factors.append("LSTM strong")
-    if (trend_up and macd > signal_line) or (trend_down and macd < signal_line):
-        confidence_factors.append("MACD aligned")
-    if rsi > 50 or rsi < 50:
-        confidence_factors.append("RSI strong")
-    if (trend_up and ema20 > ema50) or (trend_down and ema20 < ema50):
-        confidence_factors.append("EMA trend")
-    if abs(roc) > 0.3:
-        confidence_factors.append("ROC momentum")
-    if breakout_up or breakout_down:
-        confidence_factors.append("Breakout detected")
 
     confidence = len(confidence_factors) / 6.0
     if action != "None":

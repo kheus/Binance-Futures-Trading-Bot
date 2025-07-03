@@ -375,11 +375,27 @@ async def main():
 
     topics = [f"{symbol}_candle" for symbol in SYMBOLS]
     try:
-        consumer.subscribe(topics)
-        logger.info(f"[Kafka] Subscribed to topics: {topics} 📡")
+        max_retries = 5
+        retry_delay = 5
+        for attempt in range(max_retries):
+            try:
+                consumer.subscribe(topics)
+                logger.info(f"[Kafka] Subscribed to topics: {topics} 📡")
+                break
+            except Exception as e:
+                logger.error(f"❌ [Kafka] Failed to subscribe to topics (attempt {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                    retry_delay *= 2
+                else:
+                    logger.error("[Kafka] Max retries reached for topic subscription")
+                    raise
     except Exception as e:
         logger.error(f"❌ [Kafka] Failed to subscribe to topics: {e}")
         raise
+
+    logger.info("[Main] Waiting for Kafka topics to be created...")
+    time.sleep(10)  # Wait 10 seconds for kafka_consumer.py to create topics
 
     last_log_time = time.time()
     iteration_count = 0
