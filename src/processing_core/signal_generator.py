@@ -143,6 +143,10 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
     try:
         prediction = model.predict(lstm_input, verbose=0)[0][0]
         logger.debug(f"[check_signal] LSTM prediction for {symbol}: {prediction:.4f}")
+        # 🚨 Ligne de test à ajouter temporairement
+        #  prediction = 0.65  # ← Forcé pour déclencher un SELL
+        # logger.warning(f"[FORCE TEST] Prediction overridden to {prediction}")
+
     except Exception as e:
         logger.error(f"[Prediction Error] {e} for {symbol}")
         return "None", current_position, 0.0, []

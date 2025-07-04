@@ -34,6 +34,7 @@ from rich.table import Table
 from rich.logging import RichHandler
 import psycopg2.pool
 import signal
+from pathlib import Path
 
 # Initialize rich console for enhanced logging
 console = Console()

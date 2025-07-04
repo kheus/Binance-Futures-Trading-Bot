@@ -23,6 +23,7 @@ from binance.um_futures import UMFutures
 from src.monitoring.alerting import send_telegram_alert
 import psycopg2
 from psycopg2 import pool
+import math
 
 logger = logging.getLogger(__name__)
 
@@ -81,9 +82,24 @@ def get_tick_info(client, symbol):
         exchange_info = client.get_exchange_info()
         symbol_info = next((s for s in exchange_info["symbols"] if s["symbol"] == symbol), None)
         if not symbol_info:
-            raise ValueError(f"Symbol {symbol} not found in exchange info.")
-        price_filter = next(f for f in symbol_info['filters'] if f['filterType'] == 'PRICE_FILTER')
-        return float(price_filter['tickSize']), int(symbol_info['quantityPrecision'])
+            logger.error(f"[OrderManager] Symbol {symbol} not found in exchange info.")
+            return 0.0001, 8  # Fallback values
+
+        # Find PRICE_FILTER explicitly
+        price_filter = next((f for f in symbol_info['filters'] if f['filterType'] == 'PRICE_FILTER'), None)
+        if not price_filter:
+            logger.error(f"[OrderManager] PRICE_FILTER not found for {symbol}. Using fallback tick size.")
+            return 0.0001, 8  # Fallback values
+
+        # Find LOT_SIZE filter for quantity precision
+        lot_size_filter = next((f for f in symbol_info['filters'] if f['filterType'] == 'LOT_SIZE'), None)
+        if not lot_size_filter:
+            logger.error(f"[OrderManager] LOT_SIZE filter not found for {symbol}. Using fallback precision.")
+            return 0.0001, 8  # Fallback values
+
+        tick_size = float(price_filter['tickSize'])
+        quantity_precision = int(symbol_info.get('quantityPrecision', 8))  # Use exchange-provided precision or default
+        return tick_size, quantity_precision
     except Exception as e:
         logger.error(f"[OrderManager] Error getting tick info for {symbol}: {e}")
         return 0.0001, 8  # Fallback values
@@ -105,38 +121,70 @@ def check_open_position(client, symbol, side):
         logger.error(f"[OrderManager] Error checking open position for {symbol}: {e}")
         return False, 0
 
+def get_exchange_precision(client, symbol):
+    """Récupère les règles de précision exactes depuis l'API Binance"""
+    try:
+        info = client.exchange_info()
+        symbol_info = next((s for s in info['symbols'] if s['symbol'] == symbol), None)
+        if not symbol_info:
+            raise ValueError(f"Symbol {symbol} not found")
+        filters = {f['filterType']: f for f in symbol_info['filters']}
+        return {
+            'price_tick': float(filters['PRICE_FILTER']['tickSize']),
+            'qty_step': float(filters['LOT_SIZE']['stepSize']),
+            'min_qty': float(filters['LOT_SIZE']['minQty']),
+            'price_precision': symbol_info['pricePrecision'],
+            'qty_precision': symbol_info['quantityPrecision']
+        }
+    except Exception as e:
+        logger.error(f"Error getting precision for {symbol}: {e}")
+        # Valeurs par défaut pour XRP/USDT
+        return {
+            'price_tick': 0.0001,
+            'qty_step': 1.0,
+            'min_qty': 1.0,
+            'price_precision': 4,
+            'qty_precision': 0
+        }
+
 def place_order(signal, price, atr, client, symbol, capital, leverage, trade_id=None):
     try:
-        # 1. Enhanced margin check
-        if not check_margin(client, symbol, capital, leverage):
-            logger.error("Cancellation - margin problem")
-            return None
+        # 1. Get precise exchange rules
+        rules = get_exchange_precision(client, symbol)
+        logger.info(f"Precision rules for {symbol}: {rules}")
 
-        # 2. Secure quantity calculation
-        tick_size, qty_precision = get_tick_info(client, symbol)
-        base_qty = capital / price
-        qty = round(base_qty * leverage, qty_precision)
+        # 2. Adjust price to tick size and precision
+        price = round(price / rules['price_tick']) * rules['price_tick']
+        price = round(price, rules['price_precision'])
 
-        # 3. Minimum check (uses exchange info for robustness)
-        exchange_info = client.get_exchange_info()
-        symbol_info = next((s for s in exchange_info["symbols"] if s["symbol"] == symbol), None)
-        min_qty = 1.0
-        if symbol_info:
-            lot_size = next((f for f in symbol_info["filters"] if f["filterType"] == "LOT_SIZE"), None)
-            if lot_size:
-                min_qty = float(lot_size["minQty"])
-        if qty < min_qty:
-            logger.warning(f"Quantité ajustée à {min_qty} (min)")
-            qty = min_qty
+        # 3. Calculate and adjust quantity
+        qty = (capital * leverage) / price
+        qty = math.floor(qty / rules['qty_step']) * rules['qty_step']
+        qty = max(qty, rules['min_qty'])
+        qty = round(qty, rules['qty_precision'])
 
-        # 4. Order placement with timeout
+        # Special handling for XRP/USDT (quantité entière)
+        if symbol == 'XRPUSDT':
+            qty = int(qty)
+
+        logger.info(f"""
+Order details for {symbol}:
+Original Price: {price}
+Rounded Price: {round(price / rules['price_tick']) * rules['price_tick']}
+Capital: {capital}
+Leverage: {leverage}
+Raw Qty: {(capital * leverage) / price}
+Adjusted Qty: {qty}
+Rules: {rules}
+""")
+
+        # 4. Place order
         order = client.create_order(
             symbol=symbol,
-            side=SIDE_BUY if signal == "buy" else SIDE_SELL,
+            side=SIDE_SELL if signal == 'sell' else SIDE_BUY,
             type=ORDER_TYPE_MARKET,
             quantity=qty,
-            recvWindow=5000,
-            newClientOrderId=f"order_{symbol}_{trade_id or int(time.time())}"
+            recvWindow=10000
         )
 
         # Alternative response handling
@@ -339,8 +387,37 @@ class EnhancedOrderManager:
                 logger.error(f"[EnhancedOrderManager] Failed to get current price for {symbol}")
                 return None
 
-            # Calculer la quantité en fonction du capital et du levier
+            # Get exchange precision rules
+            rules = get_exchange_precision(self.client, symbol)
+            logger.info(f"[EnhancedOrderManager] Precision rules for {symbol}: {rules}")
+
+            # Calculate and adjust quantity
             quantity = (capital * leverage) / price
+            quantity = math.floor(quantity / rules['qty_step']) * rules['qty_step']
+            quantity = max(quantity, rules['min_qty'])
+            quantity = round(quantity, rules['qty_precision'])
+
+            # Special handling for specific symbols (e.g., XRPUSDT)
+            if symbol == 'XRPUSDT':
+                quantity = int(quantity)
+
+            # Adjust price to tick size
+            price = round(price / rules['price_tick']) * rules['price_tick']
+            price = round(price, rules['price_precision'])
+
+            # Log order details
+            logger.info(f"""
+[EnhancedOrderManager] Order details for {symbol}:
+Original Price: {price}
+Rounded Price: {round(price / rules['price_tick']) * rules['price_tick']}
+Capital: {capital}
+Leverage: {leverage}
+Raw Quantity: {(capital * leverage) / price}
+Adjusted Quantity: {quantity}
+Rules: {rules}
+""")
+
+            # Check margin
             if not self.check_margin(symbol, quantity, price, leverage):
                 logger.error(f"[EnhancedOrderManager] Cancellation - margin problem for {symbol}")
                 return None
@@ -351,7 +428,8 @@ class EnhancedOrderManager:
                 side=side,
                 type='MARKET',
                 quantity=quantity,
-                newClientOrderId=f"trade_{trade_id}"
+                newClientOrderId=f"trade_{trade_id}",
+                recvWindow=10000
             )
             order_data = {
                 'order_id': str(order['orderId']),
@@ -361,7 +439,11 @@ class EnhancedOrderManager:
                 'price': price,
                 'timestamp': int(order.get('updateTime', order.get('transactTime', 0))),
                 'status': order['status'].lower(),
-                'trade_id': trade_id
+                'trade_id': trade_id,
+                'pnl': 0.0,  # Add default PNL for new orders
+                'stop_loss': None,  # Add default stop_loss
+                'take_profit': None,  # Add default take_profit
+                'is_trailing': False  # Add default is_trailing
             }
             logger.info(f"[EnhancedOrderManager] Order placed for {symbol}: {order_data['order_id']}")
             return order_data

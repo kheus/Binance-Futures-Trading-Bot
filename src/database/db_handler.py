@@ -180,6 +180,8 @@ def insert_trade(trade_data):
             trade_data['timestamp'],
             trade_data['pnl'],
             trade_data['is_trailing'],
+            trade_data.get('pnl', 0.0),  # Default to 0.0 if missing
+            trade_data.get('is_trailing', False),  # Default to False if missing
             trade_data['trade_id']
         ))
         logger.info(f"[db_handler] Trade inserted for {trade_data['symbol']}: {trade_data['order_id']}")
