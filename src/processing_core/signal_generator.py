@@ -5,6 +5,8 @@ import pandas as pd
 import talib
 import time
 from datetime import datetime, timedelta
+
+from websocket import send
 from src.database.db_handler import insert_signal, insert_training_data, get_future_prices, get_training_data_count
 from monitoring.alerting import send_telegram_alert
 import json
@@ -146,7 +148,7 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
         return "None", current_position, 0.0, []
 
     dynamic_up, dynamic_down = calculate_dynamic_thresholds(adx, strategy_mode)
-    logger.debug(f"[check_signal] Dynamic thresholds for {symbol}: up={dynamic_up:.3f}, down={dynamic_down:.3f}")
+    logger.info(f"[Thresholds] {symbol} → Prediction: {prediction:.4f}, Dynamic Down: {dynamic_down:.4f}, Dynamic Up: {dynamic_up:.4f}")
     trend_up = ema20 > ema50
     trend_down = ema20 < ema50
     macd_bullish = macd > signal_line
@@ -231,8 +233,11 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
         new_position = None
 
     logger.debug(f"[check_signal] Action for {symbol}: {action}, Confidence: {len(confidence_factors)}/6, Prediction: {prediction:.4f}")
+    if action != "None":
+        logger.info(f"[Signal] {symbol} - Action: {action}, Confidence: {len(confidence_factors)}/6, Prediction: {prediction:.4f}")
+        send_telegram_alert(f"[Signal] {symbol} - Action: {action}, Confidence: {len(confidence_factors)}/6, Prediction: {prediction:.4f}")
 
-    if action == last_action_sent:
+    if last_action_sent is not None and isinstance(last_action_sent, tuple) and action == last_action_sent[0]:
         logger.info(f"[Anti-Repeat] Signal {action} ignored for {symbol} as it was sent previously.")
         return "None", current_position, 0.0, []
 
@@ -275,8 +280,8 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
     confidence = len(confidence_factors) / 6.0
     if action != "None":
         if confidence >= 0.5:
-            insert_signal(symbol, action.lower(), close, quantity, strategy_mode, signal_timestamp, confidence)
-            logger.info(f"[Signal Stored] {action} at {close} for {symbol} with quantity {quantity} and confidence {confidence:.2f}")
+            insert_signal(symbol, signal_timestamp, action.lower(), close, confidence, strategy_mode)
+            logger.info(f"[Signal Stored] {action} at {close} for {symbol} with confidence {confidence:.2f}")
         else:
             logger.info(f"[Signal Ignored] {action} for {symbol} due to low confidence: {confidence:.2f}")
             action = "None"

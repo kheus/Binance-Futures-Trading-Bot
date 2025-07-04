@@ -15,7 +15,7 @@ from src.processing_core.signal_generator import check_signal
 from src.trade_execution.order_manager import place_order, update_trailing_stop, init_trailing_stop_manager, EnhancedOrderManager
 from src.trade_execution.sync_orders import get_current_atr, sync_binance_trades_with_postgres
 from src.database.db_handler import insert_trade, insert_signal, insert_metrics, create_tables, insert_price_data, clean_old_data
-from src.processing_core.signal_generator import prepare_lstm_input
+from src.processing_core.signal_generator import prepare_lstm_input, select_strategy_mode
 from src.monitoring.metrics import record_trade_metric
 from src.monitoring.alerting import send_telegram_alert
 from src.performance.tracker import performance_tracker_loop
@@ -435,10 +435,11 @@ async def main():
                         current_position=current_positions.get(symbol),
                         last_order_details=last_order_details.get(symbol),
                         symbol=symbol,
-                        last_action_sent=last_action_sent.get(symbol),
-                        config=config  # Assure-toi que ce dictionnaire existe et est chargé plus haut
+                        last_action_sent=last_action_sent.get(symbol) if isinstance(last_action_sent.get(symbol), tuple) else None,
+                        config=config
                     )
-                    if action == last_action_sent[symbol][0]:
+
+                    if action in ("buy", "sell", "close_buy", "close_sell") and action == last_action_sent.get(symbol, (None,))[0]:
                         logger.info(f"[Signal] Ignored repeated action for {symbol}: {action} 🔄")
                         continue
                     timestamp = int(candle_df.index[-1].timestamp() * 1000)

@@ -187,22 +187,29 @@ def insert_trade(trade_data):
         logger.error(f"[db_handler] Error inserting trade for {trade_data['symbol']}: {e}")
         raise
 
+from datetime import datetime
+
 def insert_signal(symbol, timestamp, signal_type, price, confidence_score=None, strategy=None):
     """
     Insert a signal into the signals table, skipping duplicates.
     """
+    created_at = datetime.utcnow()  # Format accepté par PostgreSQL TIMESTAMP
     query = """
     INSERT INTO signals (symbol, timestamp, signal_type, price, created_at, confidence_score, strategy)
     VALUES (%s, %s, %s, %s, %s, %s, %s)
     ON CONFLICT (symbol, timestamp) DO NOTHING
     """
     try:
-        created_at = int(time.time() * 1000)
-        execute_query(query, (symbol, timestamp, signal_type, float(price), created_at, confidence_score, strategy), fetch=False)
+        execute_query(
+            query,
+            (symbol, timestamp, signal_type, float(price), created_at, confidence_score, strategy),
+            fetch=False
+        )
         logger.info(f"[insert_signal] Signal inserted or skipped (if duplicate) for {symbol} at {timestamp}")
     except Exception as e:
         logger.error(f"[insert_signal] Error inserting signal: {str(e)}")
         raise
+
 
 def insert_training_data(symbol, indicators, market_context, timestamp):
     query = """
@@ -346,6 +353,7 @@ def insert_price_data(price_data, symbol):
         query = """
         INSERT INTO price_data (symbol, timestamp, open, high, low, close, volume)
         VALUES (%s, to_timestamp(%s / 1000.0), %s, %s, %s, %s, %s)
+        ON CONFLICT (symbol, timestamp) DO NOTHING
         """
         execute_query(query, (
             symbol,
@@ -356,20 +364,11 @@ def insert_price_data(price_data, symbol):
             float(price_data['close'].iloc[-1]),
             float(price_data['volume'].iloc[-1])
         ))
-        logger.info(f"Price data inserted for {symbol} at {int(price_data.index[-1].timestamp() * 1000)}")
+        logger.info(f"Price data inserted or skipped (if duplicate) for {symbol} at {int(price_data.index[-1].timestamp() * 1000)}")
         return True
     except Exception as e:
         logger.error(f"Error inserting price data for {symbol}: {str(e)}, data: {price_data}")
         return False
-
-def get_trades():
-    query = "SELECT * FROM trades ORDER BY timestamp DESC"
-    try:
-        with get_db_connection() as conn:
-            return pd.read_sql_query(query, conn).to_dict(orient='records')
-    except Exception as e:
-        logger.error(f"Failed to fetch trades: {e}")
-        raise
 
 def get_signals():
     query = "SELECT * FROM signals ORDER BY timestamp DESC"

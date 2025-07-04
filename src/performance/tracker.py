@@ -6,6 +6,7 @@ from src.database.db_handler import get_pending_training_data, update_training_o
 from tabulate import tabulate
 import psycopg2.pool
 import eventlet
+import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -102,117 +103,70 @@ def should_retrain_model():
         return False
 
 def performance_tracker_loop(client, symbols):
-    """
-    Periodically track performance of signals and clean old data.
-    """
-    last_cleanup = 0
-    cleanup_interval = 24 * 3600  # 24 hours
-
-    # Expected columns for records from get_pending_training_data
-    columns = [
-        'id', 'symbol', 'timestamp', 'indicators', 'market_context',
-        'market_direction', 'price_change_pct', 'prediction_correct',
-        'created_at', 'updated_at'
-    ]
-
     while True:
         try:
-            # Periodic cleanup of old data
-            current_time = time.time()
-            if current_time - last_cleanup > cleanup_interval:
-                logger.info("[Tracker] Starting database cleanup")
-                try:
-                    clean_old_data(retention_days=30, trades_retention_days=90)
-                    logger.info("[Tracker] Database cleanup completed")
-                except psycopg2.pool.PoolError as e:
-                    logger.error(f"[Tracker] Connection pool exhausted during cleanup: {str(e)}")
-                last_cleanup = current_time
-
-            # Retrieve pending records
-            pending_records = get_pending_training_data()
-            if not pending_records:
-                logger.info("[Tracker] No pending records to process")
-                time.sleep(300)  # Wait 5 minutes if no data
-                continue
-
-            total_correct = 0
-            processed_records = 0
-            for record in pending_records:
-                try:
-                    if isinstance(record, tuple):
-                        record = dict(zip(columns, record))  # Safe transformation
-                    symbol = record['symbol']
-                    if symbol not in symbols:  # Filter by the list of symbols
-                        logger.debug(f"[Tracker] Skipping record for {symbol} (not in SYMBOLS)")
-                        continue
-                    signal_ts = record['timestamp']
-                    record_id = record['id']
-                    market_context = record.get('market_context', {})
-
-                    # Infer action from signals table or market_context
-                    action = get_action_from_signals(symbol, signal_ts)
-                    if action is None:
-                        if market_context.get('trend_up') and market_context.get('macd_bullish'):
-                            action = 'buy'
-                        elif market_context.get('trend_down'):
-                            action = 'sell'
-                        else:
-                            action = 'hold'
-                    logger.debug(f"[Tracker] Inferred action for {symbol} (ID={record_id}): {action}")
-
-                    logger.debug(f"[Tracker] Processing record: ID={record_id}, Symbol={symbol}, TS={signal_ts}, Action={action}")
-
-                    # Calculate market direction
-                    direction, pct_change = calculate_market_direction(symbol, signal_ts)
-                    if direction is not None:
-                        prediction_correct = 1 if direction == (1 if action == 'buy' else 0) else 0
-                        if isinstance(prediction_correct, np.bool_):
-                            prediction_correct = bool(prediction_correct)
-                        update_training_outcome(
-                            record_id=record_id,
-                            market_direction=direction,
-                            price_change_pct=pct_change,
-                            prediction_correct=prediction_correct
-                        )
-                        logger.info(
-                            f"[Tracker] Updated {symbol} signal: ID={record_id}, "
-                            f"Direction={pct_change:.2f}%, Correct={prediction_correct}"
-                        )
-                        processed_records += 1
-                        total_correct += prediction_correct
-                    else:
-                        logger.warning(f"[Tracker] Insufficient data for {symbol} at {signal_ts}")
-
-                    # Pause to reduce pressure on connection pool
-                    eventlet.sleep(0.1)
-                except Exception as e:
-                    logger.error(f"[Tracker] Error processing record ID={record.get('id', 'unknown')}: {str(e)}")
+            for symbol in symbols:
+                query = """
+                SELECT id, symbol, timestamp, action, price
+                FROM training_data
+                WHERE symbol = %s AND action IS NOT NULL AND market_direction IS NULL
+                ORDER BY timestamp ASC
+                LIMIT 100
+                """
+                records = execute_query(query, (symbol,), fetch=True)
+                if not records:
+                    logger.debug(f"[Tracker] No actionable records for {symbol}")
                     continue
 
-            # Calculate and log accuracy for the batch
-            if processed_records > 0:
-                accuracy = total_correct / processed_records
-                logger.info(f"[Tracker] Batch accuracy: {accuracy:.2%} ({total_correct}/{processed_records})")
-                log_performance_as_table(record_id, symbol, accuracy, processed_records)
-            else:
-                logger.info("[Tracker] No records processed in this batch")
+                processed = 0
+                for record in records:
+                    record_id, symbol, timestamp, action, price = record
+                    future_timestamp = timestamp + 5 * 60 * 1000
+                    query = """
+                    SELECT close
+                    FROM price_data
+                    WHERE symbol = %s AND timestamp >= %s AND timestamp <= %s
+                    ORDER BY timestamp ASC
+                    LIMIT 1
+                    """
+                    price_data = execute_query(query, (symbol, timestamp, future_timestamp + 360 * 1000), fetch=True)  # 6-minute window
+                    if not price_data:
+                        logger.warning(f"[Market Direction] No future price data for {symbol} at {timestamp} (window: {timestamp} to {future_timestamp + 360 * 1000})")
+                        continue
 
-            # Verify if the model should be retrained
-            if should_retrain_model():
-                logger.info("[Tracker] Starting model retraining...")
-                # To be implemented: logic for retraining the model
+                    future_price = float(price_data[0][0])
+                    price_change = (future_price - price) / price * 100
+                    market_direction = 'up' if future_price > price else 'down'
+                    prediction_correct = (
+                        (action in ['buy', 'close_sell'] and market_direction == 'up') or
+                        (action in ['sell', 'close_buy'] and market_direction == 'down')
+                    )
 
-            time.sleep(60)  # Wait before next iteration
+                    update_query = """
+                    UPDATE training_data
+                    SET market_direction = %s, price_change_pct = %s, prediction_correct = %s, updated_at = %s
+                    WHERE id = %s
+                    """
+                    execute_query(update_query, (market_direction, price_change, prediction_correct, int(datetime.now().timestamp() * 1000), record_id), fetch=False)
+                    processed += 1
 
-        except psycopg2.pool.PoolError as e:
-            logger.error(f"[Tracker] Connection pool exhausted in tracker loop: {str(e)}")
-            time.sleep(60)  # Wait before retrying
-        except KeyboardInterrupt:
-            logger.info("[Tracker] Received interrupt signal, shutting down gracefully...")
-            break
+                if processed > 0:
+                    logger.info(f"[Tracker] Processed {processed} records for {symbol}")
+                    accuracy_query = """
+                    SELECT COUNT(*) FILTER (WHERE prediction_correct = TRUE) / NULLIF(COUNT(*), 0)::FLOAT * 100 AS accuracy
+                    FROM training_data
+                    WHERE symbol = %s AND prediction_correct IS NOT NULL
+                    """
+                    accuracy_result = execute_query(accuracy_query, (symbol,), fetch=True)
+                    accuracy = accuracy_result[0][0] if accuracy_result and accuracy_result[0][0] is not None else 0.0
+                    logger.info(f"[Tracker] Model accuracy for {symbol}: {accuracy:.2f}%")
+                else:
+                    logger.debug(f"[Tracker] No records processed for {symbol}")
+
+            time.sleep(60)
         except Exception as e:
-            logger.error(f"[Tracker] Error in tracker loop: {str(e)}")
-            time.sleep(60)  # Wait before retrying
+            logger.error(f"[Tracker] Error in performance tracker loop: {str(e)}")
+            time.sleep(60)
 
 def log_performance_as_table(record_id, symbol, accuracy, processed_records):
     """
