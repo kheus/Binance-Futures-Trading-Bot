@@ -107,28 +107,48 @@ def get_tick_info(client, symbol):
 def round_to_tick(value, tick_size):
     return round(round(value / tick_size) * tick_size, 8)
 
-def check_open_position(client, symbol, side, current_positions=None):
-    """Vérifie si une position est ouverte pour le symbole et le côté spécifiés."""
+def check_open_position(client, symbol, side, current_positions):
+    """
+    Vérifie si une position est ouverte pour le symbole et le côté spécifiés,
+    en utilisant d'abord le tracker interne puis l'API Binance pour confirmation.
+    Retourne (has_position: bool, position_qty: float)
+    """
     try:
-        positions = client.get_position_risk(symbol=symbol)
-        logger.debug(f"[OrderManager] Position risk for {symbol}: {positions}")
-        for position in positions:
-            position_amt = float(position['positionAmt'])
-            position_side = position['positionSide'].lower()
-            logger.debug(f"[OrderManager] Checking position: symbol={symbol}, side={side.lower()}, positionAmt={position_amt}, positionSide={position_side}")
-            if position_amt != 0 and position_side == side.lower():
-                logger.info(f"[OrderManager] Found open position for {symbol} on side {side}: quantity={position_amt}")
-                return True, position_amt
-        if current_positions and symbol in current_positions and current_positions[symbol]:
-            position = current_positions[symbol]
-            if position.get('side') == side.lower() and float(position.get('quantity', 0)) != 0:
-                logger.info(f"[OrderManager] Found open position in current_positions for {symbol} on side {side}: quantity={position['quantity']}")
-                return True, float(position['quantity'])
-        logger.debug(f"[OrderManager] No open position found for {symbol} on side {side}")
-        return False, 0
+        position_info = client.get_position_risk(symbol=symbol)
+        position_qty = 0.0
+        has_position = False
+        position_side = side.upper()  # Normalize to 'BUY' or 'SELL'
+
+        # Check current_positions first
+        current_position = current_positions.get(symbol)
+        if isinstance(current_position, str):
+            # Handle string-based position (e.g., 'long', 'short')
+            has_position = current_position in ['long', 'short']
+            position_qty = 0.0  # Cannot determine quantity from string
+            logger.debug(f"[OrderManager] String-based position for {symbol}: {current_position}")
+        elif isinstance(current_position, dict):
+            # Handle dictionary-based position
+            position_qty = float(current_position.get('quantity', 0.0))
+            has_position = position_qty != 0.0
+            logger.debug(f"[OrderManager] Dict-based position for {symbol}: qty={position_qty}")
+
+        # Verify with Binance API
+        for pos in position_info:
+            if pos['symbol'] == symbol:
+                qty = float(pos['positionAmt'])
+                if qty != 0:
+                    api_position_side = 'long' if qty > 0 else 'short'
+                    has_position = True
+                    position_qty = abs(qty)
+                    if isinstance(current_position, str) and current_position != api_position_side:
+                        logger.warning(f"[OrderManager] Mismatch in position for {symbol}: tracker={current_position}, API={api_position_side}")
+                    break
+
+        logger.debug(f"[OrderManager] Position check for {symbol}: has_position={has_position}, qty={position_qty}")
+        return has_position, position_qty
     except Exception as e:
-        logger.error(f"[OrderManager] Error checking open position for {symbol}: {e}")
-        return False, 0
+        logger.error(f"[OrderManager] Error checking open position for {symbol}: {str(e)}")
+        return False, 0.0
 
 def get_exchange_precision(client, symbol):
     """Récupère les règles de précision exactes depuis l'API Binance"""

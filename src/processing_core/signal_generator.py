@@ -238,6 +238,14 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
         logger.info(f"[Anti-Repeat] Signal {action} ignored for {symbol} as it was sent previously.")
         return "None", current_position, 0.0, []
 
+    new_position = None
+    if action == "buy":
+        new_position = {"side": "long", "quantity": 0.0}  # Quantity updated later
+    elif action == "sell":
+        new_position = {"side": "short", "quantity": 0.0}
+    elif action in ["close_buy", "close_sell"]:
+        new_position = None
+
     if action in ("buy", "sell"):
         try:
             training_record = {
@@ -264,24 +272,28 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
                 "breakout_down": bool(breakout_down)
             }
             check_timestamp = int((datetime.now() + timedelta(minutes=5)).timestamp() * 1000)
-            # Check insertion result
-            if insert_training_data(symbol, signal_timestamp, indicators, market_context):
+            success = insert_training_data(symbol, signal_timestamp, indicators, market_context)
+            if success:
                 logger.info(f"[Performance Tracking] Stored training data for {symbol} at {signal_timestamp}")
                 check_time = datetime.now() + timedelta(minutes=5)
                 logger.info(f"[Performance Tracking] Will verify market direction at {check_time.strftime('%H:%M')}")
                 training_record["check_timestamp"] = check_timestamp
             else:
-                logger.error(f"[Performance Tracking] Failed to store training data for {symbol}")
+                logger.error(f"[Performance Tracking] Failed to store training data for {symbol} at {signal_timestamp}")
                 raise Exception("Training data insertion failed")
         except Exception as e:
-            logger.error(f"[Performance Tracking] Error storing training data: {e}")
+            logger.error(f"[Performance Tracking] Error storing training data for {symbol}: {str(e)}")
             raise
 
     confidence = len(confidence_factors) / 6.0
     if action != "None":
         if confidence >= 0.5:
-            insert_signal(symbol, signal_timestamp, action.lower(), close, confidence, strategy_mode)
-            logger.info(f"[Signal Stored] {action} at {close} for {symbol} with confidence {confidence:.2f}")
+            try:
+                insert_signal(symbol, signal_timestamp, action.lower(), close, confidence, strategy_mode)
+                logger.info(f"[Signal Stored] {action} at {close} for {symbol} with confidence {confidence:.2f}")
+            except Exception as e:
+                logger.error(f"[Signal Stored] Failed to store signal for {symbol}: {str(e)}")
+                raise
         else:
             logger.info(f"[Signal Ignored] {action} for {symbol} due to low confidence: {confidence:.2f}")
             action = "None"

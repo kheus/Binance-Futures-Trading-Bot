@@ -232,12 +232,19 @@ def insert_training_data(symbol, timestamp, indicators, market_context):
 
         conn = get_db_connection()
         with conn.cursor() as cur:
+            logger.debug(
+                f"[insert_training_data] Executing for {symbol} at {timestamp_ms}, "
+                f"indicators: {indicators_json}, market_context: {market_context_json}"
+            )
             cur.execute(query, (symbol, timestamp_ms, indicators_json, market_context_json))
             conn.commit()
             logger.debug(f"[insert_training_data] Inserted training data for {symbol} at {timestamp_ms}")
         return True
     except Exception as e:
-        logger.error(f"[insert_training_data] Error inserting training data for {symbol}: {str(e)}")
+        logger.error(
+            f"[insert_training_data] Error inserting training data for {symbol} at {timestamp_ms}: {str(e)}, "
+            f"indicators: {indicators}, market_context: {market_context}"
+        )
         if conn:
             conn.rollback()
         return False
