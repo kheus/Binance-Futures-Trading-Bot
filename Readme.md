@@ -249,6 +249,10 @@ git add C:\Users\Cheikh\binance-trading-bot\src\processing_core\signal_generator
 git add C:\Users\Cheikh\binance-trading-bot\src\trade_execution\order_manager.py 
 git add C:\Users\Cheikh\binance-trading-bot\src\trade_execution\sync_orders.py 
 git add C:\Users\Cheikh\binance-trading-bot\src\trade_execution\ultra_aggressive_trailing.py 
+git add C:\Users\Cheikh\binance-trading-bot\src\data_ingestion\data_formatter.py
+git add C:\Users\Cheikh\binance-trading-bot\src\data_ingestion\kafka_consumer.py
+git add C:\Users\Cheikh\binance-trading-bot\src\monitoring\metrics.py
+git add C:\Users\Cheikh\binance-trading-bot\src\monitoring\alerting.py
 git add C:\Users\Cheikh\binance-trading-bot\Readme.md 
 git commit -m "Updates" 
 git push -u origin master

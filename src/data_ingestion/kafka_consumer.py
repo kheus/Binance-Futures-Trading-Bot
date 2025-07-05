@@ -1,4 +1,5 @@
-﻿import json
+﻿# src/data_ingestion/kafka_consumer.py
+import json
 import yaml
 import websocket
 from confluent_kafka import Producer, admin
@@ -46,15 +47,32 @@ def create_topics():
     try:
         admin_client = admin.AdminClient({"bootstrap.servers": KAFKA_BOOTSTRAP})
         topics = [f"{symbol}_candle" for symbol in SYMBOLS]
-        existing_topics = admin_client.list_topics().topics.keys()
+        existing_topics = set(admin_client.list_topics(timeout=10).topics.keys())
         new_topics = [t for t in topics if t not in existing_topics]
         if new_topics:
-            admin_client.create_topics([admin.NewTopic(t, num_partitions=1, replication_factor=1) for t in new_topics])
-            logger.info(f"[Kafka] Created topics: {new_topics}")
+            futures = admin_client.create_topics(
+                [admin.NewTopic(t, num_partitions=1, replication_factor=1) for t in new_topics],
+                operation_timeout=30
+            )
+            for topic, future in futures.items():
+                try:
+                    future.result(timeout=30)  # Wait for topic creation
+                    logger.info(f"[Kafka] Created topic: {topic}")
+                except Exception as e:
+                    logger.error(f"[Kafka] Failed to create topic {topic}: {e}")
+            # Verify topic creation
+            time.sleep(2)  # Allow metadata to propagate
+            existing_topics = set(admin_client.list_topics(timeout=10).topics.keys())
+            failed_topics = [t for t in new_topics if t not in existing_topics]
+            if failed_topics:
+                logger.error(f"[Kafka] Failed to verify creation of topics: {failed_topics}")
+            else:
+                logger.info(f"[Kafka] Successfully created and verified topics: {new_topics}")
         else:
             logger.info("[Kafka] All required topics already exist")
     except Exception as e:
         logger.error(f"[Kafka] Failed to create topics: {e}")
+        raise
 
 create_topics()
 
