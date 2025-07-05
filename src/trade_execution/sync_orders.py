@@ -1,182 +1,106 @@
 # File: src/trade_execution/sync_orders.py
+
 import logging
+import time
+import eventlet
 from binance.um_futures import UMFutures
 from src.monitoring.metrics import get_current_atr
 from src.trade_execution.ultra_aggressive_trailing import TrailingStopManager
 from src.database.db_handler import insert_or_update_order, update_trade_on_close, insert_trade
 from src.trade_execution.order_manager import check_open_position
-import time
-import eventlet
 
 logger = logging.getLogger(__name__)
-
-_last_logs = {}
-_processed_trade_orders = set()  # Track processed trade orders to avoid duplicates
-
-def log_once(key, message, level="info", cooldown=2.0):
-    now = time.time()
-    if key not in _last_logs or (now - _last_logs[key]) > cooldown:
-        getattr(logger, level)(message)
-        _last_logs[key] = now
+_processed_orders = set()
 
 def sync_binance_trades_with_postgres(client: UMFutures, symbols, ts_manager: TrailingStopManager, current_positions: dict):
-    logger.info("[sync_orders] Syncing Binance trades with PostgreSQL and internal tracker... 🚀")
-    start_time = int((time.time() - 24 * 60 * 60) * 1000)  # Last 24 hours
-    no_position_symbols = set()
-
+    """Synchronisation robuste des ordres ouverts avec gestion d'erreur améliorée"""
+    logger.info("[sync_orders] Starting optimized open orders sync")
+    
     for symbol in symbols:
         try:
-            all_orders = client.get_all_orders(symbol=symbol, limit=20, startTime=start_time)
-
-            if not isinstance(all_orders, list):
-                logger.warning(f"⚠️ Invalid response format for {symbol}: {all_orders}")
+            # 1. Récupération des ordres ouverts avec gestion d'erreur renforcée
+            try:
+                # Solution: Utiliser get_all_orders avec filter manuel
+                all_orders = client.get_all_orders(symbol=symbol, limit=50)
+                open_orders = [o for o in all_orders if o.get('status') in ['NEW', 'PARTIALLY_FILLED']]
+                
+                if not open_orders:
+                    logger.debug(f"[sync_orders] No open orders for {symbol}")
+                    continue
+                    
+            except Exception as e:
+                logger.error(f"[sync_orders] API Error for {symbol}: {str(e)}")
                 continue
 
-            if not all_orders:
-                logger.info(f"[sync_orders] No orders received for {symbol}")
-                continue
-
-            for order in all_orders:
-                logger.debug(f"[sync_orders] Raw order for {symbol}: {order}")
-                if not isinstance(order, dict):
-                    logger.warning(f"⚠️ Skipping non-dict order for {symbol}: {order}")
-                    continue
-
-                order_id_raw = order.get('orderId') or order.get('clientOrderId')
-                if not order_id_raw:
-                    logger.error(f"❌ Skipped order with missing orderId and clientOrderId for {symbol}: {order}")
-                    continue
-
+            # 2. Traitement des ordres
+            for order in open_orders:
                 try:
-                    order_id = str(order_id_raw)
-                    if not order_id:
-                        logger.error(f"❌ Skipped order with empty order_id after conversion for {symbol}: {order}")
+                    # Validation robuste de l'orderId
+                    order_id = str(order.get('orderId', '')).strip()
+                    client_order_id = str(order.get('clientOrderId', '')).strip()
+                    
+                    if not order_id and not client_order_id:
+                        logger.warning(f"[sync_orders] Invalid order - no ID for {symbol}")
+                        continue
+                        
+                    effective_id = order_id or client_order_id
+                    
+                    # Vérification des doublons
+                    if effective_id in _processed_orders:
+                        continue
+                    _processed_orders.add(effective_id)
+
+                    # Enregistrement de l'ordre
+                    if not insert_or_update_order(order):
+                        logger.error(f"[sync_orders] Failed to save order {effective_id}")
                         continue
 
-                    logger.debug(f"[sync_orders] Processing order_id: {order_id} for {symbol}")
-                    insert_or_update_order(order)
+                    # 3. Récupération des trades associés
+                    try:
+                        # Solution alternative pour éviter l'erreur orderId
+                        trades = client.get_account_trades(symbol=symbol, limit=10)
+                        related_trades = [t for t in trades if str(t.get('orderId', '')).strip() == order_id]
+                        
+                        if not related_trades:
+                            logger.debug(f"[sync_orders] No trades found for order {effective_id}")
+                            continue
+                            
+                    except Exception as e:
+                        logger.error(f"[sync_orders] Trade fetch error: {str(e)}")
+                        continue
 
-                    if order['status'] == 'FILLED':
-                        trades = client.get_account_trades(symbol=symbol, limit=100)
-                        logger.debug(f"[sync_orders] Retrieved trades for {symbol}: {len(trades)} trades")
+                    # 4. Traitement du premier trade trouvé
+                    trade = related_trades[0]
+                    trade_data = {
+                        'order_id': effective_id,
+                        'symbol': symbol,
+                        'side': order['side'],
+                        'quantity': float(trade.get('qty', 0)),
+                        'price': float(trade.get('price', 0)),
+                        'timestamp': int(trade.get('time', time.time() * 1000)) // 1000,
+                        'trade_id': client_order_id or f"trade_{trade['time']}",
+                        'is_trailing': False
+                    }
 
-                        for trade in trades:
-                            if not isinstance(trade, dict):
-                                logger.warning(f"⚠️ Skipping non-dict trade for {symbol}: {trade}")
-                                continue
-
-                            trade_order_id = str(trade.get('orderId', ''))
-                            if not trade_order_id:
-                                logger.warning(f"❌ Skipped trade with missing orderId for {symbol}: {trade}")
-                                continue
-
-                            if trade_order_id != order_id:
-                                continue
-
-                            entry_price = float(trade.get('price', 0.0))
-                            if entry_price <= 0:
-                                try:
-                                    ticker = client.ticker_price(symbol=symbol)
-                                    entry_price = float(ticker.get('price', 0.0))
-                                except Exception as e:
-                                    logger.error(f"❌ Failed to fetch ticker price for {symbol}: {str(e)}")
-                                    continue
-
-                            quantity = float(trade.get('qty', 0.0))
-                            position_type = "long" if order['side'] == 'BUY' else "short"
-                            trade_id = order.get('clientOrderId') or f"trade_{int(trade['time'])}"
-
-                            trade_data = {
-                                'order_id': order_id,
-                                'symbol': symbol,
-                                'side': order['side'],
-                                'quantity': quantity,
-                                'price': entry_price,
-                                'exit_price': None,
-                                'stop_loss': None,
-                                'take_profit': None,
-                                'timestamp': trade.get('time') / 1000,
-                                'pnl': 0.0,
-                                'is_trailing': False,
-                                'trade_id': trade_id
-                            }
-
-                            logger.debug(f"[sync_orders] Inserting trade for {symbol}, order_id: {order_id}, trade_id: {trade_id}")
-                            success = insert_trade(trade_data)
-
-                            if not success:
-                                logger.error(f"[sync_orders] Failed to insert trade for {symbol}, order_id: {order_id}")
-                                continue
-
-                            has_position, position_qty = check_open_position(client, symbol, order['side'], current_positions)
-                            logger.debug(f"[sync_orders] Position check for {symbol}: has_position={has_position}, qty={position_qty}")
-
-                            if not has_position:
-                                no_position_symbols.add(symbol)
-                                trade_orders = client.get_account_trades(symbol=symbol, limit=100)
-                                logger.debug(f"[sync_orders] Processing close trades for order_id={order_id}, order={order}")
-
-                                for trade_order in trade_orders:
-                                    trade_key = f"{symbol}_{trade_order.get('orderId')}_{trade_order.get('price')}"
-                                    if trade_key in _processed_trade_orders:
-                                        logger.debug(f"[sync_orders] Skipping already processed trade for {symbol}: {trade_key}")
-                                        continue
-
-                                    if (
-                                        trade_order.get('orderId') != order.get('orderId') and
-                                        trade_order.get('side') != order['side'] and
-                                        float(trade_order.get('qty', 0.0)) == quantity
-                                    ):
-                                        exit_price = float(trade_order.get('price', 0.0))
-                                        if not order_id:
-                                            logger.error(f"[sync_orders] Skipping update_trade_on_close due to empty order_id for {symbol}: {order}")
-                                            continue
-                                        success = update_trade_on_close(symbol, order_id, exit_price, quantity, order['side'])
-                                        if success:
-                                            _processed_trade_orders.add(trade_key)
-                                            log_once(
-                                                key=f"update_trade_on_close_{symbol}_{order_id}_{exit_price}",
-                                                message=f"[sync_orders] Updated closed trade for {symbol}, order_id: {order_id}, exit_price: {exit_price}",
-                                                level="info",
-                                                cooldown=10.0
-                                            )
-                                        continue
-
-                            open_orders = client.get_open_orders(symbol=symbol)
-                            for open_order in open_orders:
-                                if not isinstance(open_order, dict) or not open_order.get('clientOrderId'):
-                                    logger.warning(f"⚠️ Skipping invalid open order for {symbol}: {open_order}")
-                                    continue
-                                if open_order['clientOrderId'].startswith(f"trailing_stop_{symbol}_{trade_id}"):
-                                    logger.debug(f"[sync_orders] Trailing stop already exists for {symbol} trade {trade_id}. Skipping.")
-                                    continue
-
-                            atr = get_current_atr(client, symbol)
-                            if atr <= 0:
-                                logger.error(f"❌ [sync_orders] Invalid ATR for {symbol}: {atr}")
-                                continue
-
+                    # 5. Insertion et gestion du stop
+                    if insert_trade(trade_data):
+                        atr = get_current_atr(client, symbol)
+                        if atr and atr > 0:
                             ts_manager.initialize_trailing_stop(
                                 symbol=symbol,
-                                entry_price=entry_price,
-                                position_type=position_type,
-                                quantity=quantity,
+                                entry_price=trade_data['price'],
+                                position_type='long' if order['side'] == 'BUY' else 'short',
+                                quantity=trade_data['quantity'],
                                 atr=atr,
-                                trade_id=trade_id
+                                trade_id=trade_data['trade_id']
                             )
 
-                            logger.info(f"[sync_orders] Initialized trailing stop for recovered trade {order_id} ({symbol}) 📈")
-
                 except Exception as e:
-                    logger.error(f"❌ [sync_orders] Error processing order {order_id} for {symbol}: {str(e)}")
+                    logger.error(f"[sync_orders] Processing error: {str(e)}")
                     continue
 
-            eventlet.sleep(0.1)
-
         except Exception as e:
-            logger.error(f"❌ [sync_orders] Error syncing trades for {symbol}: {str(e)}")
+            logger.error(f"[sync_orders] Symbol processing error: {str(e)}")
             continue
 
-    if no_position_symbols:
-        logger.info(f"[sync_orders] No open positions found for symbols: {', '.join(no_position_symbols)}")
-    logger.info("[sync_orders] Trade sync completed. ✅")
+    logger.info("[sync_orders] Sync completed successfully")

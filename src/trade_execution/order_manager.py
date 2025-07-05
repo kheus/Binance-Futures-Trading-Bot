@@ -109,46 +109,46 @@ def round_to_tick(value, tick_size):
 
 def check_open_position(client, symbol, side, current_positions):
     """
-    Vérifie si une position est ouverte pour le symbole et le côté spécifiés,
-    en utilisant d'abord le tracker interne puis l'API Binance pour confirmation.
+    Vérifie si une position est ouverte avec une gestion robuste des erreurs.
     Retourne (has_position: bool, position_qty: float)
     """
-    try:
-        position_info = client.get_position_risk(symbol=symbol)
-        position_qty = 0.0
-        has_position = False
-        position_side = side.upper()  # Normalize to 'BUY' or 'SELL'
+    position_qty = 0.0
+    has_position = False
 
-        # Check current_positions first
+    try:
+        # 1. Vérification via le tracker interne en premier
         current_position = current_positions.get(symbol)
-        if isinstance(current_position, str):
-            # Handle string-based position (e.g., 'long', 'short')
+        if isinstance(current_position, str):  # Format 'long'/'short'
             has_position = current_position in ['long', 'short']
-            position_qty = 0.0  # Cannot determine quantity from string
-            logger.debug(f"[OrderManager] String-based position for {symbol}: {current_position}")
+            logger.debug(f"[Position Check] Using string position for {symbol}: {current_position}")
         elif isinstance(current_position, dict):
-            # Handle dictionary-based position
             position_qty = float(current_position.get('quantity', 0.0))
             has_position = position_qty != 0.0
-            logger.debug(f"[OrderManager] Dict-based position for {symbol}: qty={position_qty}")
+            logger.debug(f"[Position Check] Using dict position for {symbol}: qty={position_qty}")
 
-        # Verify with Binance API
-        for pos in position_info:
-            if pos['symbol'] == symbol:
-                qty = float(pos['positionAmt'])
-                if qty != 0:
-                    api_position_side = 'long' if qty > 0 else 'short'
-                    has_position = True
-                    position_qty = abs(qty)
-                    if isinstance(current_position, str) and current_position != api_position_side:
-                        logger.warning(f"[OrderManager] Mismatch in position for {symbol}: tracker={current_position}, API={api_position_side}")
-                    break
+        # 2. Vérification via l'API Binance avec gestion d'erreur
+        try:
+            position_info = client.get_position_risk(symbol=symbol)
+            for pos in position_info:
+                if pos['symbol'] == symbol:
+                    qty = float(pos['positionAmt'])
+                    if qty != 0:
+                        api_position_side = 'long' if qty > 0 else 'short'
+                        has_position = True
+                        position_qty = abs(qty)
+                        # Log en cas de divergence entre tracker et API
+                        if isinstance(current_position, str) and current_position != api_position_side:
+                            logger.warning(f"[Position Mismatch] {symbol}: tracker={current_position}, API={api_position_side}")
+                        break
+        except Exception as api_error:
+            logger.warning(f"[API Position Error] For {symbol}, using tracker value: {api_error}")
 
-        logger.debug(f"[OrderManager] Position check for {symbol}: has_position={has_position}, qty={position_qty}")
+        logger.debug(f"[Position Result] {symbol}: has_position={has_position}, qty={position_qty}")
         return has_position, position_qty
+
     except Exception as e:
-        logger.error(f"[OrderManager] Error checking open position for {symbol}: {str(e)}")
-        return False, 0.0
+        logger.error(f"[Position Check Error] For {symbol}: {str(e)}")
+        return False, 0.0  # Fallback safe
 
 def get_exchange_precision(client, symbol):
     """Récupère les règles de précision exactes depuis l'API Binance"""
@@ -564,14 +564,21 @@ def insert_or_update_order(order):
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        order_id = str(order.get('orderId') or order.get('order_id'))
-        symbol = order.get('symbol')
-        status = order.get('status')
-        side = order.get('side')
+
+        # Validation robuste de l'order_id
+        order_id = str(order.get('orderId', '')) or str(order.get('order_id', ''))
+        if not order_id:
+            logger.error("No valid orderId found in order data")
+            return
+
+        # Validation des autres champs
+        symbol = str(order.get('symbol', ''))
+        status = str(order.get('status', 'UNKNOWN'))
+        side = str(order.get('side', 'UNKNOWN')).upper()
         quantity = float(order.get('origQty', order.get('quantity', 0)))
         price = float(order.get('price', 0))
-        timestamp = int(order.get('time', order.get('timestamp', 0)))
-        client_order_id = order.get('clientOrderId', order.get('client_order_id', ''))
+        timestamp = int(order.get('time', order.get('timestamp', time.time() * 1000)))
+        client_order_id = str(order.get('clientOrderId', order.get('client_order_id', '')))
 
         query = """
         INSERT INTO orders (order_id, symbol, status, side, quantity, price, timestamp, client_order_id)
@@ -587,7 +594,7 @@ def insert_or_update_order(order):
         conn.commit()
         logger.info(f"Order {order_id} for {symbol} updated in DB.")
     except Exception as e:
-        logger.error(f"[db_handler] Error updating order {order_id} for {symbol}: {e}")
+        logger.error(f"[DB Error] Order update failed: {str(e)}")
         if conn:
             conn.rollback()
     finally:
