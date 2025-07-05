@@ -301,4 +301,4 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
 
     logger.info(f"[Confidence Score] {symbol} → {len(confidence_factors)}/6 | Factors: {', '.join(confidence_factors) if confidence_factors else 'None'}")
 
-    return action, new_position, confidence,
+    return action, new_position, confidence, confidence_factors

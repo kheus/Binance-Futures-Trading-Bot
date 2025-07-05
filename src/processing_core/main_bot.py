@@ -500,7 +500,8 @@ async def main():
                                             entry_price=order_details[symbol]['price'],
                                             position_type='long' if action == 'buy' else 'short',
                                             quantity=order_details[symbol]['quantity'],
-                                            atr=atr
+                                            atr=atr,
+                                            trade_id=order_details[symbol]['trade_id'] if 'trade_id' in order_details[symbol] else str(timestamp)
                                         )
                                         if last_sl_order_ids[symbol]:
                                             order_details[symbol]['is_trailing'] = True
