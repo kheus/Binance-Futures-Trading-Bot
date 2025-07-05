@@ -158,37 +158,51 @@ def insert_or_update_order(order):
 
 def insert_trade(trade_data):
     query = """
-    INSERT INTO trades (order_id, symbol, side, quantity, price, stop_loss, take_profit, timestamp, pnl, is_trailing, trade_id)
-    VALUES (%s, %s, %s, %s, %s, %s, %s, to_timestamp(%s / 1000.0), %s, %s, %s)
+    INSERT INTO trades (order_id, symbol, side, quantity, price, exit_price, stop_loss, take_profit, timestamp, pnl, is_trailing, trade_id)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, to_timestamp(%s / 1000.0), %s, %s, %s)
     ON CONFLICT (trade_id) DO UPDATE
     SET order_id = EXCLUDED.order_id,
         side = EXCLUDED.side,
         quantity = EXCLUDED.quantity,
         price = EXCLUDED.price,
+        exit_price = EXCLUDED.exit_price,
         stop_loss = EXCLUDED.stop_loss,
         take_profit = EXCLUDED.take_profit,
         timestamp = EXCLUDED.timestamp,
         pnl = EXCLUDED.pnl,
-        is_trailing = EXCLUDED.is_trailing;
+        is_trailing = EXCLUDED.is_trailing
     """
+    conn = None
     try:
-        execute_query(query, (
-            trade_data['order_id'],
-            trade_data['symbol'],
-            trade_data['side'],
-            trade_data['quantity'],
-            trade_data['price'],
-            trade_data.get('stop_loss'),
-            trade_data.get('take_profit'),
-            trade_data['timestamp'],
-            trade_data.get('pnl', 0.0),
-            trade_data.get('is_trailing', False),
-            trade_data['trade_id']
-        ))
-        logger.info(f"[db_handler] Trade inserted for {trade_data['symbol']}: {trade_data['order_id']}")
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            params = (
+                str(trade_data['order_id']),
+                trade_data['symbol'],
+                trade_data['side'],
+                float(trade_data['quantity']),
+                float(trade_data['price']),
+                trade_data.get('exit_price', None),
+                trade_data.get('stop_loss', None),
+                trade_data.get('take_profit', None),
+                float(trade_data['timestamp']),
+                float(trade_data.get('pnl', 0.0)),
+                bool(trade_data.get('is_trailing', False)),
+                str(trade_data['trade_id'])
+            )
+            logger.debug(f"[insert_trade] Executing for {trade_data['symbol']}, order_id: {trade_data['order_id']}, trade_id: {trade_data['trade_id']}")
+            cur.execute(query, params)
+            conn.commit()
+            logger.info(f"[insert_trade] Inserted/updated trade for {trade_data['symbol']}: order_id={trade_data['order_id']}, trade_id={trade_data['trade_id']}")
+        return True
     except Exception as e:
-        logger.error(f"[db_handler] Error inserting trade for {trade_data['symbol']}: {e}")
-        raise
+        logger.error(f"[insert_trade] Error inserting trade for {trade_data['symbol']}, order_id: {trade_data['order_id']}: {str(e)}")
+        if conn:
+            conn.rollback()
+        return False
+    finally:
+        if conn:
+            release_db_connection(conn)
 
 def insert_signal(symbol, timestamp, signal_type, price, confidence_score=None, strategy=None):
     """
@@ -232,19 +246,47 @@ def insert_training_data(symbol, timestamp, indicators, market_context):
 
         conn = get_db_connection()
         with conn.cursor() as cur:
-            logger.debug(
-                f"[insert_training_data] Executing for {symbol} at {timestamp_ms}, "
-                f"indicators: {indicators_json}, market_context: {market_context_json}"
-            )
+            logger.debug(f"[insert_training_data] Executing for {symbol} at {timestamp_ms}, indicators: {indicators_json}, market_context: {market_context_json}")
             cur.execute(query, (symbol, timestamp_ms, indicators_json, market_context_json))
             conn.commit()
             logger.debug(f"[insert_training_data] Inserted training data for {symbol} at {timestamp_ms}")
         return True
     except Exception as e:
-        logger.error(
-            f"[insert_training_data] Error inserting training data for {symbol} at {timestamp_ms}: {str(e)}, "
-            f"indicators: {indicators}, market_context: {market_context}"
-        )
+        logger.error(f"[insert_training_data] Error inserting training data for {symbol} at {timestamp_ms}: {str(e)}")
+        if conn:
+            conn.rollback()
+        return False
+    finally:
+        if conn:
+            release_db_connection(conn)
+
+def update_trade_on_close(symbol, order_id, exit_price, quantity, side, leverage=50):
+    query = """
+    UPDATE trades
+    SET exit_price = %s,
+        pnl = %s
+    WHERE symbol = %s AND order_id = %s::varchar
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("SELECT price FROM trades WHERE symbol = %s AND order_id = %s::varchar", (symbol, str(order_id)))
+            result = cur.fetchone()
+            if not result:
+                logger.error(f"[update_trade_on_close] No trade found for {symbol}, order_id: {order_id}")
+                return False
+            entry_price = float(result[0])
+            if side.upper() == 'BUY':
+                pnl = (exit_price - entry_price) * quantity * leverage
+            else:  # SELL
+                pnl = (entry_price - exit_price) * quantity * leverage
+            cur.execute(query, (float(exit_price), float(pnl), symbol, str(order_id)))
+            conn.commit()
+            logger.info(f"[update_trade_on_close] Updated trade for {symbol}, order_id: {order_id}, exit_price: {exit_price}, pnl: {pnl}")
+        return True
+    except Exception as e:
+        logger.error(f"[update_trade_on_close] Error updating trade for {symbol}, order_id: {order_id}: {str(e)}")
         if conn:
             conn.rollback()
         return False

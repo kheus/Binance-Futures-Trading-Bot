@@ -1,25 +1,29 @@
+# File: src/trade_execution/ultra_aggressive_trailing.py
 import logging
 import time
 from binance.um_futures import UMFutures
+from src.database.db_handler import update_trade_on_close
 
 logger = logging.getLogger(__name__)
 
 class UltraAgressiveTrailingStop:
-    def __init__(self, client, symbol, trailing_distance=0.01):  # 1% du prix
+    def __init__(self, client, symbol, trailing_distance=0.01):
         self.client = client
         self.symbol = symbol
-        self.trailing_distance = trailing_distance  # Distance dynamique (1%)
+        self.trailing_distance = trailing_distance
         self.max_retries = 3
         self.trailing_stop_order_id = None
         self.entry_price = 0.0
         self.current_stop_price = 0.0
         self.position_type = None
         self.quantity = 0.0
+        self.trade_id = None
 
-    def initialize_trailing_stop(self, entry_price, position_type, quantity, atr):
+    def initialize_trailing_stop(self, entry_price, position_type, quantity, atr, trade_id):
         self.entry_price = float(entry_price)
         self.position_type = position_type
         self.quantity = format_quantity(self.symbol, float(quantity))
+        self.trade_id = trade_id
 
         if self.entry_price <= 0:
             logger.error(f"[{self.symbol}] ❌ Invalid entry_price: {self.entry_price}")
@@ -35,7 +39,6 @@ class UltraAgressiveTrailingStop:
             logger.error(f"[{self.symbol}] ❌ Invalid current_price: {current_price}")
             return None
 
-        # Calculer le stop-loss initial basé sur trailing_distance
         stop_price = format_price(self.symbol, 
             self.entry_price * (1 - self.trailing_distance) if position_type == 'long' 
             else self.entry_price * (1 + self.trailing_distance))
@@ -44,7 +47,6 @@ class UltraAgressiveTrailingStop:
             logger.error(f"[{self.symbol}] ❌ stop_price={stop_price} invalid.")
             return None
 
-        # Vérification du solde disponible
         try:
             account = self.client.balance()
             usdt_balance = next((float(x['balance']) for x in account if x['asset'] == 'USDT'), 0)
@@ -53,7 +55,7 @@ class UltraAgressiveTrailingStop:
             usdt_balance = 0
 
         notional_value = stop_price * self.quantity
-        if notional_value > usdt_balance * 50:  # En cross 50x
+        if notional_value > usdt_balance * 50:
             logger.warning(f"[{self.symbol}] ❌ Not enough margin (need ≈ {notional_value}, have ≈ {usdt_balance}).")
             return None
 
@@ -106,11 +108,9 @@ class UltraAgressiveTrailingStop:
             if should_update:
                 for attempt in range(self.max_retries):
                     try:
-                        # ❌ D'abord annuler l'ancien ordre
                         self.client.cancel_order(symbol=self.symbol, orderId=self.trailing_stop_order_id)
                         logger.info(f"[{self.symbol}] ❌ Old trailing stop order {self.trailing_stop_order_id} canceled.")
 
-                        # ✅ Puis créer un nouveau STOP_MARKET
                         order = self.client.new_order(
                             symbol=self.symbol,
                             side='SELL' if self.position_type == 'long' else 'BUY',
@@ -133,15 +133,31 @@ class UltraAgressiveTrailingStop:
             logger.error(f"[{self.symbol}] ❌ Failed to update trailing stop: {e}")
 
     def verify_order_execution(self):
-        """Vérifie si l'ordre de trailing stop a été exécuté."""
         try:
+            if not self.trailing_stop_order_id:
+                logger.error(f"[{self.symbol}] ❌ No trailing stop order to verify")
+                return False
             order = self.client.query_order(symbol=self.symbol, orderId=self.trailing_stop_order_id)
             status = order.get('status')
             if status == 'FILLED':
-                logger.info(f"[{self.symbol}] ✅ Trailing stop order {self.trailing_stop_order_id} executed at {self.current_stop_price}")
-                self.trailing_stop_order_id = None
-                self.current_stop_price = 0.0
-                return True
+                exit_price = float(order.get('avgPrice', self.current_stop_price))
+                # Use trade_id (original order_id) instead of trailing_stop_order_id
+                success = update_trade_on_close(
+                    symbol=self.symbol,
+                    order_id=self.trade_id,  # Use trade_id, not trailing stop order_id
+                    exit_price=exit_price,
+                    quantity=self.quantity,
+                    side='BUY' if self.position_type == 'long' else 'SELL',
+                    leverage=50
+                )
+                if success:
+                    logger.info(f"[{self.symbol}] ✅ Trailing stop order {self.trailing_stop_order_id} executed at {exit_price}, trade_id: {self.trade_id}")
+                    self.trailing_stop_order_id = None
+                    self.current_stop_price = 0.0
+                    return True
+                else:
+                    logger.error(f"[{self.symbol}] ❌ Failed to update trade for trade_id {self.trade_id}")
+                    return False
             elif status in ['CANCELED', 'REJECTED', 'EXPIRED']:
                 logger.warning(f"[{self.symbol}] ⚠️ Trailing stop order {self.trailing_stop_order_id} {status.lower()}")
                 self.trailing_stop_order_id = None
@@ -160,10 +176,10 @@ class TrailingStopManager:
     def has_trailing_stop(self, symbol):
         return symbol in self.stops and self.stops[symbol].trailing_stop_order_id is not None
 
-    def initialize_trailing_stop(self, symbol, entry_price, position_type, quantity, atr):
+    def initialize_trailing_stop(self, symbol, entry_price, position_type, quantity, atr, trade_id):
         if symbol not in self.stops:
             self.stops[symbol] = UltraAgressiveTrailingStop(self.client, symbol)
-        return self.stops[symbol].initialize_trailing_stop(entry_price, position_type, quantity, atr)
+        return self.stops[symbol].initialize_trailing_stop(entry_price, position_type, quantity, atr, trade_id)
 
     def update_trailing_stop(self, symbol, current_price):
         if symbol in self.stops:

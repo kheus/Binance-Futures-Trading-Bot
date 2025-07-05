@@ -1,4 +1,4 @@
-﻿-- Drop unused table
+﻿-- File: src/database/schema.sql
 -- Drop unused table
 DROP TABLE IF EXISTS price_history;
 
@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS trades (
     side VARCHAR(10),
     quantity DECIMAL,
     price DECIMAL,
+    exit_price DECIMAL,  -- Added exit_price column
     stop_loss DECIMAL,
     take_profit DECIMAL,
     timestamp timestamp with time zone,
@@ -35,9 +36,12 @@ CREATE TABLE IF NOT EXISTS trades (
 CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp);
 CREATE INDEX IF NOT EXISTS idx_trades_trade_id ON trades(trade_id);
 
--- Migration for existing trades table (if trade_id is missing)
+-- Migration for existing trades table (add exit_price and trade_id if missing)
 DO $$
 BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'trades' AND column_name = 'exit_price') THEN
+        ALTER TABLE trades ADD COLUMN exit_price DECIMAL;
+    END IF;
     IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'trades' AND column_name = 'trade_id') THEN
         ALTER TABLE trades ADD COLUMN trade_id VARCHAR(64) UNIQUE;
         UPDATE trades SET trade_id = order_id WHERE trade_id IS NULL;
@@ -84,7 +88,7 @@ CREATE TABLE IF NOT EXISTS signals (
     created_at timestamp with time zone,
     confidence_score DECIMAL,
     strategy VARCHAR(50),
-    UNIQUE(symbol, timestamp)  -- Add unique constraint
+    UNIQUE(symbol, timestamp)
 );
 CREATE INDEX IF NOT EXISTS idx_signals_symbol ON signals(symbol);
 CREATE INDEX IF NOT EXISTS idx_signals_timestamp ON signals(timestamp);
@@ -101,7 +105,7 @@ CREATE TABLE IF NOT EXISTS training_data (
     prediction_correct BOOLEAN,
     created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
     updated_at timestamp with time zone,
-    UNIQUE(symbol, timestamp)  -- Add unique constraint
+    UNIQUE(symbol, timestamp)
 );
 CREATE INDEX IF NOT EXISTS idx_training_data_symbol ON training_data(symbol);
 CREATE INDEX IF NOT EXISTS idx_training_data_timestamp ON training_data(timestamp);
