@@ -107,15 +107,24 @@ def get_tick_info(client, symbol):
 def round_to_tick(value, tick_size):
     return round(round(value / tick_size) * tick_size, 8)
 
-def check_open_position(client, symbol, side):
+def check_open_position(client, symbol, side, current_positions=None):
     """Vérifie si une position est ouverte pour le symbole et le côté spécifiés."""
     try:
         positions = client.get_position_risk(symbol=symbol)
+        logger.debug(f"[OrderManager] Position risk for {symbol}: {positions}")
         for position in positions:
             position_amt = float(position['positionAmt'])
             position_side = position['positionSide'].lower()
+            logger.debug(f"[OrderManager] Checking position: symbol={symbol}, side={side.lower()}, positionAmt={position_amt}, positionSide={position_side}")
             if position_amt != 0 and position_side == side.lower():
+                logger.info(f"[OrderManager] Found open position for {symbol} on side {side}: quantity={position_amt}")
                 return True, position_amt
+        if current_positions and symbol in current_positions and current_positions[symbol]:
+            position = current_positions[symbol]
+            if position.get('side') == side.lower() and float(position.get('quantity', 0)) != 0:
+                logger.info(f"[OrderManager] Found open position in current_positions for {symbol} on side {side}: quantity={position['quantity']}")
+                return True, float(position['quantity'])
+        logger.debug(f"[OrderManager] No open position found for {symbol} on side {side}")
         return False, 0
     except Exception as e:
         logger.error(f"[OrderManager] Error checking open position for {symbol}: {e}")

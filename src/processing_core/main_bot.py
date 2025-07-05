@@ -113,8 +113,9 @@ order_manager = EnhancedOrderManager(client, SYMBOLS)
 
 # Synchronisation initiale des trades
 logger.info("[MainBot] Syncing Binance trades with PostgreSQL and internal tracker... 🚀")
+current_positions = {symbol: None for symbol in SYMBOLS}  # Ajouté pour passer à la fonction de sync
 try:
-    sync_binance_trades_with_postgres(client, SYMBOLS, ts_manager)
+    sync_binance_trades_with_postgres(client, SYMBOLS, ts_manager, current_positions)
 except psycopg2.pool.PoolError as e:
     logger.error(f"❌ [MainBot] Failed to sync trades due to connection pool exhaustion: {e}")
     send_telegram_alert(f"Failed to sync trades: connection pool exhausted")
@@ -241,7 +242,7 @@ websocket_thread.start()
 async def main():
     dataframes = {symbol: pd.DataFrame() for symbol in SYMBOLS}
     order_details = {symbol: None for symbol in SYMBOLS}
-    current_positions = {symbol: None for symbol in SYMBOLS}
+    # current_positions déjà initialisé plus haut et passé à la sync
     last_order_details = {symbol: None for symbol in SYMBOLS}
     last_model_updates = {symbol: time.time() for symbol in SYMBOLS}
     last_action_sent = {symbol: (None, 0) for symbol in SYMBOLS}  # Store (action, timestamp)
@@ -353,7 +354,7 @@ async def main():
             if current_time - last_sync_time >= sync_interval:
                 logger.info("[MainBot] Running periodic trade sync... 🚀")
                 try:
-                    sync_binance_trades_with_postgres(client, SYMBOLS, ts_manager)
+                    sync_binance_trades_with_postgres(client, SYMBOLS, ts_manager, current_positions)
                 except psycopg2.pool.PoolError as e:
                     logger.error(f"❌ [MainBot] Failed to sync trades due to connection pool exhaustion: {e}")
                     send_telegram_alert(f"Failed to sync trades: connection pool exhausted")
@@ -483,34 +484,39 @@ async def main():
                                     continue
                                 order_details[symbol] = order_manager.place_enhanced_order(action, symbol, CAPITAL, LEVERAGE, trade_id=str(timestamp))
                                 if order_details[symbol]:
-                                    insert_trade(order_details[symbol])
+                                    current_positions[symbol] = new_position  # Update position first
+                                    try:
+                                        insert_trade(order_details[symbol])
+                                        logger.info(f"[Main] Trade inserted for {symbol}: {order_details[symbol]['order_id']}")
+                                    except Exception as e:
+                                        logger.error(f"❌ [Main] Failed to insert trade for {symbol}: {e}")
+                                        send_telegram_alert(f"Failed to insert trade for {symbol}: {str(e)}")
                                     last_order_details[symbol] = order_details[symbol]
                                     record_trade_metric(order_details[symbol])
                                     send_telegram_alert(f"Trade executed: {action.upper()} {symbol} at {price} 💰")
-                                    current_positions[symbol] = new_position
-                                    current_market_price = float(candle_df["close"].iloc[-1])
-                                    last_sl_order_ids[symbol] = update_trailing_stop(
-                                        client=client,
-                                        symbol=symbol,
-                                        signal=action,
-                                        current_price=current_market_price,
-                                        atr=atr,
-                                        base_qty=float(order_details[symbol]["quantity"]),
-                                        existing_sl_order_id=last_sl_order_ids[symbol],
-                                        trade_id=str(timestamp)
-                                    )
-
-                                    # Create a table for the order
-                                    table = Table(title=f"Order Placed for {symbol}")
-                                    table.add_column("Field", style="cyan")
-                                    table.add_column("Value", style="magenta")
-                                    table.add_row("Order ID", order_details[symbol].get("order_id", "N/A"))
-                                    table.add_row("Side", order_details[symbol].get("side", "N/A"))
-                                    table.add_row("Quantity", f"{order_details[symbol].get('quantity', 0):.2f}")
-                                    table.add_row("Price", f"{order_details[symbol].get('price', 0):.4f}")
-                                    table.add_row("Confidence Score", f"{confidence:.2f}")
-                                    table.add_row("Confidence Factors", ", ".join(confidence_factors) if confidence_factors else "None")
-                                    console.log(table)
+                                    try:
+                                        last_sl_order_ids[symbol] = ts_manager.initialize_trailing_stop(
+                                            symbol=symbol,
+                                            entry_price=order_details[symbol]['price'],
+                                            position_type='long' if action == 'buy' else 'short',
+                                            quantity=order_details[symbol]['quantity'],
+                                            atr=atr
+                                        )
+                                        if last_sl_order_ids[symbol]:
+                                            order_details[symbol]['is_trailing'] = True
+                                            try:
+                                                insert_trade(order_details[symbol])  # Re-insert with is_trailing=True
+                                                logger.info(f"[Main] Trade updated with trailing stop for {symbol}: {order_details[symbol]['order_id']}")
+                                            except Exception as e:
+                                                logger.error(f"❌ [Main] Failed to update trade with trailing stop for {symbol}: {e}")
+                                                send_telegram_alert(f"Failed to update trade with trailing stop for {symbol}: {str(e)}")
+                                            logger.info(f"[Main] Trailing stop initialized for {symbol}, trade_id: {str(timestamp)}")
+                                        else:
+                                            logger.error(f"❌ [Main] Failed to initialize trailing stop for {symbol}")
+                                            send_telegram_alert(f"Failed to initialize trailing stop for {symbol}")
+                                    except Exception as e:
+                                        logger.error(f"❌ [Main] Error initializing trailing stop for {symbol}: {e}")
+                                        send_telegram_alert(f"Error initializing trailing stop for {symbol}: {str(e)}")
                                 else:
                                     logger.error(f"❌ [Order] Failed to place {action} order for {symbol}")
                             except (TypeError, ValueError, IndexError, psycopg2.pool.PoolError) as e:

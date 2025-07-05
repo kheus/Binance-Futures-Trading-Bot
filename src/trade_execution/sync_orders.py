@@ -9,26 +9,24 @@ import eventlet
 
 logger = logging.getLogger(__name__)
 
-def sync_binance_trades_with_postgres(client: UMFutures, symbols, ts_manager: TrailingStopManager):
+def sync_binance_trades_with_postgres(client: UMFutures, symbols, ts_manager: TrailingStopManager, current_positions: dict):
     logger.info("[sync_orders] Syncing Binance trades with PostgreSQL and internal tracker... 🚀")
     start_time = int((time.time() - 24 * 60 * 60) * 1000)  # Last 24 hours
+    no_position_symbols = set()  # Track symbols with no open positions
     for symbol in symbols:
         try:
-            all_orders = client.get_all_orders(symbol=symbol, limit=100, startTime=start_time)
-            logger.debug(f"Raw all_orders response for {symbol}: {all_orders}")
+            all_orders = client.get_all_orders(symbol=symbol, limit=20, startTime=start_time)
             if not isinstance(all_orders, list):
                 logger.warning(f"⚠️ Invalid response format for {symbol}: {all_orders}")
                 continue
             if not all_orders:
                 logger.info(f"[sync_orders] No orders received for {symbol}")
                 continue
-            
             for order in all_orders:
                 if not isinstance(order, dict) or not order.get('orderId'):
                     logger.warning(f"⚠️ Skipping invalid order for {symbol}: {order}")
                     continue
                 insert_or_update_order(order)
-
                 if order['status'] == 'FILLED':
                     trades = client.get_account_trades(symbol=symbol, limit=100)
                     for trade in trades:
@@ -41,10 +39,9 @@ def sync_binance_trades_with_postgres(client: UMFutures, symbols, ts_manager: Tr
                             quantity = float(trade['qty'])
                             position_type = "long" if order['side'] == 'BUY' else "short"
                             trade_id = order.get('clientOrderId', str(int(trade['time'])))
-                            
-                            has_position, position_qty = check_open_position(client, symbol, order['side'])
+                            has_position, position_qty = check_open_position(client, symbol, order['side'], current_positions)
                             if not has_position:
-                                logger.info(f"[sync_orders] No open position for {symbol} on side {order['side']}. Skipping trailing stop.")
+                                no_position_symbols.add(symbol)
                                 continue
 
                             open_orders = client.get_open_orders(symbol=symbol)
@@ -66,9 +63,10 @@ def sync_binance_trades_with_postgres(client: UMFutures, symbols, ts_manager: Tr
                                 trade_id=trade_id
                             )
                             logger.info(f"Initialized trailing stop for recovered trade {order['orderId']} ({symbol}) 📈")
-            # Pause pour éviter de surcharger le pool de connexions
             eventlet.sleep(0.1)
         except Exception as e:
             logger.error(f"❌ [sync_orders] Error syncing trades for {symbol}: {str(e)}")
             continue
+    if no_position_symbols:
+        logger.info(f"[sync_orders] No open positions found for symbols: {', '.join(no_position_symbols)}")
     logger.info("[sync_orders] Trade sync completed. ✅")

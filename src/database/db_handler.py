@@ -1,5 +1,4 @@
 ﻿import logging
-from tkinter import INSERT
 import psycopg2
 from psycopg2 import pool
 from pathlib import Path
@@ -82,38 +81,49 @@ def execute_query(query, params=None, fetch=False):
             release_db_connection(conn)
 
 def create_tables():
+    """
+    Exécute le fichier schema.sql entier dans une seule connexion/transaction.
+    """
+    conn = None
     try:
         schema_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "schema.sql"))
+        if not os.path.exists(schema_path):
+            logger.error(f"[create_tables] schema.sql not found at {schema_path}")
+            raise FileNotFoundError(f"schema.sql not found at {schema_path}")
+
         with open(schema_path, "r", encoding="utf-8-sig") as file:
             schema_sql = file.read()
-        queries = [q.strip() for q in schema_sql.split(';') if q.strip()]
+
         conn = get_db_connection()
-        try:
-            with conn.cursor() as cur:
-                for query in queries:
-                    try:
-                        cur.execute(query)
-                    except psycopg2.Error as e:
-                        logger.error(f"Erreur lors de l'exécution de la requête : {query[:80]}... -> {e.pgerror}")
-                        raise
+        with conn.cursor() as cur:
+            logger.info("[create_tables] Executing full schema.sql...")
+            cur.execute(schema_sql)
             conn.commit()
-            logger.info("Tables created or verified successfully via schema.sql.")
-        finally:
-            release_db_connection(conn)
-    except Exception as e:
-        logger.error(f"Error reading or executing schema.sql: {e}")
+            logger.info("[create_tables] schema.sql executed successfully.")
+    except psycopg2.Error as e:
+        logger.error(f"[create_tables] PostgreSQL error: {e.pgerror}, code: {e.pgcode}")
+        if conn:
+            conn.rollback()
         raise
+    except Exception as e:
+        logger.error(f"[create_tables] Unexpected error: {str(e)}")
+        if conn:
+            conn.rollback()
+        raise
+    finally:
+        if conn:
+            release_db_connection(conn)
 
 def insert_or_update_order(order):
     query_check = "SELECT order_id FROM orders WHERE order_id = %s"
     query_update = """
         UPDATE orders
-        SET symbol = %s, side = %s, quantity = %s, price = %s, status = %s, timestamp = to_timestamp(%s / 1000.0)
+        SET symbol = %s, side = %s, quantity = %s, price = %s, status = %s, timestamp = to_timestamp(%s / 1000.0), client_order_id = %s
         WHERE order_id = %s
     """
     query_insert = """
-        INSERT INTO orders (order_id, symbol, side, quantity, price, status, timestamp)
-        VALUES (%s, %s, %s, %s, %s, %s, to_timestamp(%s / 1000.0))
+        INSERT INTO orders (order_id, symbol, side, quantity, price, status, timestamp, client_order_id)
+        VALUES (%s, %s, %s, %s, %s, %s, to_timestamp(%s / 1000.0), %s)
     """
     conn = None
     try:
@@ -122,25 +132,18 @@ def insert_or_update_order(order):
             order_id_str = str(order['orderId']) if 'orderId' in order else str(order['order_id'])
             cur.execute(query_check, (order_id_str,))
             exists = cur.fetchone()
-
             symbol = order.get('symbol')
             side = order.get('side')
             quantity = float(order.get('origQty', order.get('quantity', 0)))
             price = float(order.get('price'))
             status = order.get('status')
             timestamp = int(order.get('time', order.get('timestamp', 0)))
-
+            client_order_id = order.get('clientOrderId', order.get('client_order_id', None))
             if exists:
-                cur.execute(
-                    query_update,
-                    (symbol, side, quantity, price, status, timestamp, order_id_str)
-                )
+                cur.execute(query_update, (symbol, side, quantity, price, status, timestamp, client_order_id, order_id_str))
                 logger.debug(f"Order {order_id_str} for {symbol} updated in DB.")
             else:
-                cur.execute(
-                    query_insert,
-                    (order_id_str, symbol, side, quantity, price, status, timestamp)
-                )
+                cur.execute(query_insert, (order_id_str, symbol, side, quantity, price, status, timestamp, client_order_id))
                 logger.debug(f"Order {order_id_str} for {symbol} inserted in DB.")
             conn.commit()
             return True
@@ -178,10 +181,8 @@ def insert_trade(trade_data):
             trade_data.get('stop_loss'),
             trade_data.get('take_profit'),
             trade_data['timestamp'],
-            trade_data['pnl'],
-            trade_data['is_trailing'],
-            trade_data.get('pnl', 0.0),  # Default to 0.0 if missing
-            trade_data.get('is_trailing', False),  # Default to False if missing
+            trade_data.get('pnl', 0.0),
+            trade_data.get('is_trailing', False),
             trade_data['trade_id']
         ))
         logger.info(f"[db_handler] Trade inserted for {trade_data['symbol']}: {trade_data['order_id']}")
@@ -189,47 +190,57 @@ def insert_trade(trade_data):
         logger.error(f"[db_handler] Error inserting trade for {trade_data['symbol']}: {e}")
         raise
 
-from datetime import datetime
-
 def insert_signal(symbol, timestamp, signal_type, price, confidence_score=None, strategy=None):
     """
     Insert a signal into the signals table, skipping duplicates.
     """
-    created_at = datetime.utcnow()  # Format accepté par PostgreSQL TIMESTAMP
+    created_at = datetime.utcnow()
     query = """
     INSERT INTO signals (symbol, timestamp, signal_type, price, created_at, confidence_score, strategy)
     VALUES (%s, %s, %s, %s, %s, %s, %s)
     ON CONFLICT (symbol, timestamp) DO NOTHING
     """
     try:
+        timestamp_ms = int(float(timestamp))  # Validate timestamp
+        if timestamp_ms < 946684800000 or timestamp_ms > 4102444800000:  # 2000 to 2100
+            raise ValueError(f"Invalid timestamp for {symbol}: {timestamp_ms}")
         execute_query(
             query,
-            (symbol, timestamp, signal_type, float(price), created_at, confidence_score, strategy),
+            (symbol, timestamp_ms, signal_type, float(price), created_at, confidence_score, strategy),
             fetch=False
         )
-        logger.info(f"[insert_signal] Signal inserted or skipped (if duplicate) for {symbol} at {timestamp}")
+        logger.info(f"[insert_signal] Signal inserted or skipped (if duplicate) for {symbol} at {timestamp_ms}")
+        return True
     except Exception as e:
         logger.error(f"[insert_signal] Error inserting signal: {str(e)}")
         raise
 
-
-def insert_training_data(symbol, indicators, market_context, timestamp):
+def insert_training_data(symbol, timestamp, indicators, market_context):
     query = """
     INSERT INTO training_data (symbol, timestamp, indicators, market_context)
-    VALUES (%s, %s, %s, %s);
+    VALUES (%s, %s, %s::jsonb, %s::jsonb)
+    ON CONFLICT (symbol, timestamp) DO NOTHING
     """
     conn = None
     try:
+        timestamp_ms = int(float(timestamp))
+        if timestamp_ms < 946684800000 or timestamp_ms > 4102444800000:  # 2000 to 2100
+            raise ValueError(f"Invalid timestamp for {symbol}: {timestamp_ms}")
+
+        indicators_json = json.dumps(indicators) if isinstance(indicators, dict) else indicators
+        market_context_json = json.dumps(market_context) if isinstance(market_context, dict) else market_context
+
         conn = get_db_connection()
-        with conn.cursor() as cursor:
-            cursor.execute(query, (symbol, timestamp, indicators, market_context))
+        with conn.cursor() as cur:
+            cur.execute(query, (symbol, timestamp_ms, indicators_json, market_context_json))
             conn.commit()
-            logger.debug(f"[insert_training_data] Inserted training data for {symbol} at {timestamp}")
+            logger.debug(f"[insert_training_data] Inserted training data for {symbol} at {timestamp_ms}")
+        return True
     except Exception as e:
-        logger.error(f"[insert_training_data] Error inserting training data for {symbol}: {e}, query: {query[:100]}..., params: {(symbol, indicators, market_context, timestamp)}")
+        logger.error(f"[insert_training_data] Error inserting training data for {symbol}: {str(e)}")
         if conn:
             conn.rollback()
-        raise
+        return False
     finally:
         if conn:
             release_db_connection(conn)
@@ -248,10 +259,10 @@ def get_pending_training_data():
     """
     try:
         conn = get_db_connection()
-        with conn.cursor() as cursor:
-            cursor.execute(query)
-            columns = [desc[0] for desc in cursor.description]
-            results = cursor.fetchall()
+        with conn.cursor() as cur:
+            cur.execute(query)
+            columns = [desc[0] for desc in cur.description]
+            results = cur.fetchall()
             records = [dict(zip(columns, row)) for row in results]
             logger.info(f"[get_pending_training_data] Fetched {len(records)} pending training data records")
             return records
@@ -321,9 +332,10 @@ def insert_metrics(symbol, metrics):
     ON CONFLICT (symbol, timestamp) DO NOTHING
     """
     try:
+        timestamp_ms = int(metrics.get('timestamp'))
         execute_query(query, (
             symbol,
-            metrics.get('timestamp'),
+            timestamp_ms,
             metrics.get('rsi'),
             metrics.get('macd'),
             metrics.get('adx'),
@@ -331,7 +343,7 @@ def insert_metrics(symbol, metrics):
             metrics.get('ema50'),
             metrics.get('atr')
         ))
-        logger.info(f"Metrics inserted or skipped (if duplicate) for {symbol} at {metrics.get('timestamp')}")
+        logger.info(f"Metrics inserted or skipped (if duplicate) for {symbol} at {timestamp_ms}")
         return True
     except Exception as e:
         logger.error(f"Error inserting metrics for {symbol}: {str(e)}")
@@ -462,8 +474,8 @@ def get_latest_prices():
 def insert_order_if_missing(order):
     query_check = "SELECT 1 FROM orders WHERE order_id = %s AND symbol = %s"
     query_insert = """
-    INSERT INTO orders (order_id, symbol, side, quantity, price, timestamp, status)
-    VALUES (%s, %s, %s, %s, %s, to_timestamp(%s / 1000.0), %s)
+    INSERT INTO orders (order_id, symbol, side, quantity, price, timestamp, status, client_order_id)
+    VALUES (%s, %s, %s, %s, %s, to_timestamp(%s / 1000.0), %s, %s)
     """
     conn = None
     try:
@@ -482,7 +494,8 @@ def insert_order_if_missing(order):
                 float(order['quantity']),
                 float(order['price']),
                 int(order['timestamp']),
-                str(order['status'])
+                str(order['status']),
+                str(order.get('client_order_id', order.get('clientOrderId', None)))
             )
             cur.execute(query_insert, params_insert)
             conn.commit()
