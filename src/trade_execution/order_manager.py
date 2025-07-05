@@ -116,17 +116,16 @@ def check_open_position(client, symbol, side, current_positions):
     has_position = False
 
     try:
-        # 1. Vérification via le tracker interne en premier
+        # Vérification via le tracker interne
         current_position = current_positions.get(symbol)
-        if isinstance(current_position, str):  # Format 'long'/'short'
-            has_position = current_position in ['long', 'short']
-            logger.debug(f"[Position Check] Using string position for {symbol}: {current_position}")
-        elif isinstance(current_position, dict):
+        if isinstance(current_position, dict):
             position_qty = float(current_position.get('quantity', 0.0))
             has_position = position_qty != 0.0
             logger.debug(f"[Position Check] Using dict position for {symbol}: qty={position_qty}")
+        elif current_position is not None:
+            logger.warning(f"[Position Check] Invalid position format for {symbol}: {current_position}")
 
-        # 2. Vérification via l'API Binance avec gestion d'erreur
+        # Vérification via l'API Binance
         try:
             position_info = client.get_position_risk(symbol=symbol)
             for pos in position_info:
@@ -137,8 +136,8 @@ def check_open_position(client, symbol, side, current_positions):
                         has_position = True
                         position_qty = abs(qty)
                         # Log en cas de divergence entre tracker et API
-                        if isinstance(current_position, str) and current_position != api_position_side:
-                            logger.warning(f"[Position Mismatch] {symbol}: tracker={current_position}, API={api_position_side}")
+                        if isinstance(current_position, dict) and current_position.get('side') != api_position_side:
+                            logger.warning(f"[Position Mismatch] {symbol}: tracker={current_position.get('side')}, API={api_position_side}")
                         break
         except Exception as api_error:
             logger.warning(f"[API Position Error] For {symbol}, using tracker value: {api_error}")
@@ -251,7 +250,7 @@ Rules: {rules}
                 position_type=position_type,
                 quantity=qty,
                 atr=atr,
-                trade_id=trade_id or int(time.time())
+                trade_id=trade_id or str(int(time.time()))
             )
             if not ts_id:
                 logger.error(f"[OrderManager] Trailing stop init failed. Canceling order.")
@@ -272,7 +271,7 @@ Rules: {rules}
             "stop_loss": None,
             "take_profit": None,
             "pnl": 0.0,
-            "trade_id": trade_id or int(time.time())
+            "trade_id": trade_id or str(int(time.time()))
         }
         logger.info(f"[OrderManager] Successfully placed {signal} order for {symbol}: {order_details}")
         send_telegram_alert(f"Order placed for {symbol} - {signal.upper()} at {avg_price:.2f} USDT, Qty: {qty:.4f} with ATR: {atr:.2f}")
@@ -301,12 +300,15 @@ def update_trailing_stop(client, symbol, signal, current_price, atr, base_qty, e
             logger.info(f"[Trailing Stop] No open position for {symbol} on side {signal}. Skipping trailing stop update.")
             return None
 
+        # Normalize trade_id
+        trade_id = str(trade_id or existing_sl_order_id).replace('trade_', '')
+
         # Vérifier si un trailing stop existe déjà
         open_orders = client.get_open_orders(symbol=symbol)
         for order in open_orders:
-            if order['clientOrderId'].startswith(f"trailing_stop_{symbol}_{trade_id or existing_sl_order_id}"):
-                logger.info(f"[Trailing Stop] Trailing stop already exists for {symbol} trade {trade_id or existing_sl_order_id}. Updating.")
-                return ts_manager.update_trailing_stop(symbol, current_price, trade_id=trade_id or existing_sl_order_id)
+            if order['clientOrderId'].startswith(f"trailing_stop_{symbol}_{trade_id}"):
+                logger.info(f"[Trailing Stop] Trailing stop already exists for {symbol} trade {trade_id}. Updating.")
+                return ts_manager.update_trailing_stop(symbol, current_price, trade_id=trade_id)
 
         # Initialiser un nouveau trailing stop si aucun n'existe
         if existing_sl_order_id in (-1, None):
@@ -317,9 +319,9 @@ def update_trailing_stop(client, symbol, signal, current_price, atr, base_qty, e
                 position_type=position_type,
                 quantity=base_qty,
                 atr=atr,
-                trade_id=trade_id or int(time.time())
+                trade_id=trade_id or str(int(time.time()))
             )
-        return ts_manager.update_trailing_stop(symbol, current_price, trade_id=trade_id or existing_sl_order_id)
+        return ts_manager.update_trailing_stop(symbol, current_price, trade_id=trade_id)
     except Exception as e:
         logger.error(f"[OrderManager] Error updating trailing stop for {symbol}: {e}")
         return None
@@ -331,6 +333,7 @@ def place_scaled_take_profits(client, symbol, entry_price, quantity, position_ty
             {"factor": 3.0, "percent": 0.4, "reduce_ts": True},
             {"factor": 5.0, "percent": 0.2, "close_position": True}
         ]
+        trade_id = str(trade_id or int(time.time())).replace('trade_', '')
         for level in tp_levels:
             tp_price = entry_price + (level["factor"] * atr) if position_type == "long" else entry_price - (level["factor"] * atr)
             partial_qty = quantity * level["percent"]
@@ -342,11 +345,11 @@ def place_scaled_take_profits(client, symbol, entry_price, quantity, position_ty
                 quantity=partial_qty,
                 closePosition=level.get("close_position", False),
                 priceProtect=True,
-                newClientOrderId=f"tp_{symbol}_{trade_id or int(time.time())}"
+                newClientOrderId=f"tp_{symbol}_{trade_id}"
             )
             if level.get("reduce_ts"):
-                ts_manager.adjust_quantity(symbol, quantity * (1 - level["percent"]), trade_id=trade_id or int(time.time()))
-        logger.info(f"[OrderManager] Placed scaled take-profits for {symbol}")
+                ts_manager.adjust_quantity(symbol, quantity * (1 - level["percent"]), trade_id=trade_id)
+        logger.info(f"[OrderManager] Placed scaled take-profits for {symbol}, trade_id={trade_id}")
     except Exception as e:
         logger.error(f"[OrderManager] Error placing take-profits for {symbol}: {e}")
 
@@ -386,7 +389,9 @@ class EnhancedOrderManager:
     def get_current_price(self, symbol):
         try:
             ticker = self.client.ticker_price(symbol=symbol)
-            return float(ticker['price'])
+            price = float(ticker['price'])
+            logger.debug(f"[OrderManager] Fetched price for {symbol}: {price}")
+            return price
         except Exception as e:
             logger.error(f"[EnhancedOrderManager] Failed to get price for {symbol}: {e}")
             return None
@@ -452,6 +457,7 @@ Rules: {rules}
                 return None
 
             side = 'BUY' if action == 'buy' else 'SELL'
+            trade_id = str(trade_id).replace('trade_', '')  # Normalize trade_id
             order = self.client.new_order(
                 symbol=symbol,
                 side=side,
@@ -469,10 +475,10 @@ Rules: {rules}
                 'timestamp': int(order.get('updateTime', order.get('transactTime', 0))),
                 'status': order['status'].lower(),
                 'trade_id': trade_id,
-                'pnl': 0.0,  # Add default PNL for new orders
-                'stop_loss': None,  # Add default stop_loss
-                'take_profit': None,  # Add default take_profit
-                'is_trailing': False  # Add default is_trailing
+                'pnl': 0.0,
+                'stop_loss': None,
+                'take_profit': None,
+                'is_trailing': False
             }
             logger.info(f"[EnhancedOrderManager] Order placed for {symbol}: {order_data['order_id']}")
             return order_data
@@ -496,6 +502,7 @@ def monitor_and_update_trailing_stop(client, symbol, order_id, ts_manager, trade
         logger.info(f"[OrderManager] Order {order_id} status: {status}")
         if status == "FILLED":
             current_price = float(client.ticker_price(symbol=symbol)['price'])
+            trade_id = str(trade_id or int(time.time())).replace('trade_', '')
             ts_manager.update_trailing_stop(symbol, current_price, trade_id=trade_id)
             logger.info(f"[OrderManager] Trailing stop updated for {symbol} at price {current_price}")
         return status
@@ -600,5 +607,3 @@ def insert_or_update_order(order):
     finally:
         if conn:
             release_db_connection(conn)
-
-# Les autres fonctions d'accès à la base doivent aussi utiliser get_db_connection et release_db_connection.

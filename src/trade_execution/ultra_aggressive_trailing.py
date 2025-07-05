@@ -72,7 +72,7 @@ class UltraAgressiveTrailingStop:
                 )
                 self.trailing_stop_order_id = order['orderId']
                 self.current_stop_price = stop_price
-                logger.info(f"[{self.symbol}] ✅ Trailing stop placed (order {self.trailing_stop_order_id}) at {stop_price} (Qty: {self.quantity})")
+                logger.info(f"[{self.symbol}] ✅ Trailing stop placed (order {self.trailing_stop_order_id}) at {stop_price} (Qty: {self.quantity}, trade_id: {self.trade_id})")
                 return self.trailing_stop_order_id
             except Exception as e:
                 msg = str(e)
@@ -83,9 +83,13 @@ class UltraAgressiveTrailingStop:
                 time.sleep(1 + attempt)
         return None
 
-    def update_trailing_stop(self, current_price):
+    def update_trailing_stop(self, current_price, trade_id=None):
         if not self.trailing_stop_order_id or not self.entry_price:
             logger.error(f"[{self.symbol}] ❌ No trailing stop active or invalid entry_price")
+            return
+
+        if trade_id and trade_id != self.trade_id:
+            logger.warning(f"[{self.symbol}] ⚠️ Trade ID mismatch: expected {self.trade_id}, got {trade_id}")
             return
 
         try:
@@ -122,7 +126,7 @@ class UltraAgressiveTrailingStop:
                         )
                         self.trailing_stop_order_id = order['orderId']
                         self.current_stop_price = new_stop
-                        logger.info(f"[{self.symbol}] 🔄 Trailing stop updated to {new_stop} (order {self.trailing_stop_order_id})")
+                        logger.info(f"[{self.symbol}] 🔄 Trailing stop updated to {new_stop} (order {self.trailing_stop_order_id}, trade_id: {self.trade_id})")
                         return
                     except Exception as e:
                         logger.error(f"[{self.symbol}] Retry {attempt + 1}/{self.max_retries} failed to update trailing stop: {e}")
@@ -141,10 +145,9 @@ class UltraAgressiveTrailingStop:
             status = order.get('status')
             if status == 'FILLED':
                 exit_price = float(order.get('avgPrice', self.current_stop_price))
-                # Use trade_id (original order_id) instead of trailing_stop_order_id
                 success = update_trade_on_close(
                     symbol=self.symbol,
-                    order_id=self.trade_id,  # Use trade_id, not trailing stop order_id
+                    order_id=self.trade_id,
                     exit_price=exit_price,
                     quantity=self.quantity,
                     side='BUY' if self.position_type == 'long' else 'SELL',
@@ -181,9 +184,9 @@ class TrailingStopManager:
             self.stops[symbol] = UltraAgressiveTrailingStop(self.client, symbol)
         return self.stops[symbol].initialize_trailing_stop(entry_price, position_type, quantity, atr, trade_id)
 
-    def update_trailing_stop(self, symbol, current_price):
+    def update_trailing_stop(self, symbol, current_price, trade_id=None):
         if symbol in self.stops:
-            self.stops[symbol].update_trailing_stop(current_price)
+            self.stops[symbol].update_trailing_stop(current_price, trade_id=trade_id)
             if self.stops[symbol].verify_order_execution():
                 self.close_position(symbol)
 

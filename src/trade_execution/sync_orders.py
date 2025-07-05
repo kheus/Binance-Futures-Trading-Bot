@@ -2,12 +2,11 @@
 
 import logging
 import time
-import eventlet
 from binance.um_futures import UMFutures
 from src.monitoring.metrics import get_current_atr
 from src.trade_execution.ultra_aggressive_trailing import TrailingStopManager
 from src.database.db_handler import insert_or_update_order, update_trade_on_close, insert_trade
-from src.trade_execution.order_manager import check_open_position
+from src.trade_execution.order_manager import EnhancedOrderManager, check_open_position
 
 logger = logging.getLogger(__name__)
 _processed_orders = set()
@@ -18,14 +17,31 @@ def sync_binance_trades_with_postgres(client: UMFutures, symbols, ts_manager: Tr
     
     for symbol in symbols:
         try:
+            # Log current state
+            logger.debug(f"[sync_orders] Current positions before sync for {symbol}: {current_positions[symbol]}")
+            
+            # Check if an open position exists
+            side = current_positions[symbol]['side'] if current_positions[symbol] else None
+            try:
+                has_position, position_qty = check_open_position(client, symbol, side, current_positions)
+                logger.debug(f"[sync_orders] Position check for {symbol}: has_position={has_position}, qty={position_qty}")
+            except Exception as e:
+                logger.error(f"[sync_orders] Failed to check position for {symbol}: {e}")
+                has_position = False
+                position_qty = 0.0
+
             # 1. Récupération des ordres ouverts avec gestion d'erreur renforcée
             try:
-                # Solution: Utiliser get_all_orders avec filter manuel
                 all_orders = client.get_all_orders(symbol=symbol, limit=50)
                 open_orders = [o for o in all_orders if o.get('status') in ['NEW', 'PARTIALLY_FILLED']]
                 
-                if not open_orders:
-                    logger.debug(f"[sync_orders] No open orders for {symbol}")
+                if not open_orders and not has_position and current_positions[symbol] is not None:
+                    # Only clear position if no open orders, no position, and no trailing stop
+                    if not ts_manager.has_trailing_stop(symbol):
+                        logger.debug(f"[sync_orders] No open orders or position for {symbol}, clearing current_positions")
+                        current_positions[symbol] = None
+                    else:
+                        logger.debug(f"[sync_orders] Trailing stop exists for {symbol}, preserving current_positions")
                     continue
                     
             except Exception as e:
@@ -57,7 +73,6 @@ def sync_binance_trades_with_postgres(client: UMFutures, symbols, ts_manager: Tr
 
                     # 3. Récupération des trades associés
                     try:
-                        # Solution alternative pour éviter l'erreur orderId
                         trades = client.get_account_trades(symbol=symbol, limit=10)
                         related_trades = [t for t in trades if str(t.get('orderId', '')).strip() == order_id]
                         
@@ -71,36 +86,52 @@ def sync_binance_trades_with_postgres(client: UMFutures, symbols, ts_manager: Tr
 
                     # 4. Traitement du premier trade trouvé
                     trade = related_trades[0]
+                    trade_id = client_order_id or f"trade_{trade['time']}"
+                    trade_id = trade_id.replace('trade_', '')  # Normalize trade_id
                     trade_data = {
                         'order_id': effective_id,
                         'symbol': symbol,
-                        'side': order['side'],
+                        'side': order['side'].lower(),
                         'quantity': float(trade.get('qty', 0)),
                         'price': float(trade.get('price', 0)),
                         'timestamp': int(trade.get('time', time.time() * 1000)) // 1000,
-                        'trade_id': client_order_id or f"trade_{trade['time']}",
-                        'is_trailing': False
+                        'trade_id': trade_id,
+                        'is_trailing': False,
+                        'stop_loss': None,
+                        'take_profit': None,
+                        'pnl': 0.0
                     }
 
                     # 5. Insertion et gestion du stop
                     if insert_trade(trade_data):
+                        current_positions[symbol] = {
+                            'side': trade_data['side'],
+                            'quantity': trade_data['quantity'],
+                            'price': trade_data['price'],
+                            'trade_id': trade_id
+                        }
+                        logger.debug(f"[sync_orders] Updated current_positions for {symbol}: {current_positions[symbol]}")
                         atr = get_current_atr(client, symbol)
                         if atr and atr > 0:
                             ts_manager.initialize_trailing_stop(
                                 symbol=symbol,
                                 entry_price=trade_data['price'],
-                                position_type='long' if order['side'] == 'BUY' else 'short',
+                                position_type='long' if order['side'].lower() == 'buy' else 'short',
                                 quantity=trade_data['quantity'],
                                 atr=atr,
-                                trade_id=trade_data['trade_id']
+                                trade_id=trade_id
                             )
+                            trade_data['is_trailing'] = True
+                            insert_trade(trade_data)
+                            logger.info(f"[sync_orders] Initialized trailing stop for {symbol}, trade_id={trade_id}")
 
                 except Exception as e:
-                    logger.error(f"[sync_orders] Processing error: {str(e)}")
+                    logger.error(f"[sync_orders] Processing error for order {effective_id}: {str(e)}")
                     continue
 
         except Exception as e:
-            logger.error(f"[sync_orders] Symbol processing error: {str(e)}")
+            logger.error(f"[sync_orders] Symbol processing error for {symbol}: {str(e)}")
             continue
 
     logger.info("[sync_orders] Sync completed successfully")
+    logger.debug(f"[sync_orders] Final current_positions: {current_positions}")

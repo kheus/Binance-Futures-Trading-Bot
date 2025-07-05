@@ -240,9 +240,19 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
 
     new_position = None
     if action == "buy":
-        new_position = {"side": "long", "quantity": 0.0}  # Quantity updated later
+        new_position = {
+            "side": "long",
+            "quantity": quantity,
+            "price": close,
+            "trade_id": str(signal_timestamp)
+        }
     elif action == "sell":
-        new_position = {"side": "short", "quantity": 0.0}
+        new_position = {
+            "side": "short",
+            "quantity": quantity,
+            "price": close,
+            "trade_id": str(signal_timestamp)
+        }
     elif action in ["close_buy", "close_sell"]:
         new_position = None
 
