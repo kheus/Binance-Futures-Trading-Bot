@@ -27,11 +27,11 @@ def prepare_lstm_input(df):
 
 def calculate_dynamic_thresholds(adx, strategy="trend"):
     base_up, base_down = {
-        "trend": (0.65, 0.35),
-        "scalp": (0.70, 0.30),
-        "range": (0.60, 0.40)
+        "trend": (0.55, 0.45),
+        "scalp": (0.60, 0.40),
+        "range": (0.50, 0.50)
     }.get(strategy, (0.5, 0.5))
-    adj = (adx / 100) * (0.35 if strategy == "trend" else 0.30 if strategy == "scalp" else 0.20)
+    adj = (adx / 1000)
     up = max(base_up - adj, base_down + 0.05)
     down = min(base_down + adj, up - 0.05)
     return round(up, 3), round(down, 3)
@@ -49,7 +49,6 @@ def log_indicator_summary(symbol, rsi, macd, adx, ema20, ema50, atr, roc, confid
     table.add_column("Value", style="magenta")
     table.add_column("Interpretation", style="green")
 
-    # RSI
     if rsi < 30:
         table.add_row("RSI", f"{rsi:.2f}", "Near oversold zone")
     elif rsi > 70:
@@ -57,7 +56,6 @@ def log_indicator_summary(symbol, rsi, macd, adx, ema20, ema50, atr, roc, confid
     else:
         table.add_row("RSI", f"{rsi:.2f}", "Neutral")
 
-    # MACD
     if macd > 0.5:
         table.add_row("MACD", f"{macd:.4f}", "Bullish")
     elif macd < -0.5:
@@ -65,7 +63,6 @@ def log_indicator_summary(symbol, rsi, macd, adx, ema20, ema50, atr, roc, confid
     else:
         table.add_row("MACD", f"{macd:.4f}", "Neutral to slightly bearish" if macd < 0 else "Neutral to slightly bullish")
 
-    # ADX
     if adx >= 50:
         table.add_row("ADX", f"{adx:.2f}", "Strong trend detected")
     elif adx >= 25:
@@ -73,7 +70,6 @@ def log_indicator_summary(symbol, rsi, macd, adx, ema20, ema50, atr, roc, confid
     else:
         table.add_row("ADX", f"{adx:.2f}", "Weak trend")
 
-    # EMA
     if abs(ema20 - ema50) / ema50 < 0.001:
         table.add_row("EMA20 vs EMA50", f"{ema20:.4f} ≈ {ema50:.4f}", "Neutral moving average crossover")
     elif ema20 > ema50:
@@ -81,7 +77,6 @@ def log_indicator_summary(symbol, rsi, macd, adx, ema20, ema50, atr, roc, confid
     else:
         table.add_row("EMA20 vs EMA50", f"{ema20:.4f} < {ema50:.4f}", "Bearish trend")
 
-    # ROC
     if roc > 1:
         table.add_row("ROC", f"{roc:.2f}%", "Strong bullish momentum")
     elif roc < -1:
@@ -93,7 +88,6 @@ def log_indicator_summary(symbol, rsi, macd, adx, ema20, ema50, atr, roc, confid
     else:
         table.add_row("ROC", f"{roc:.2f}%", "Neutral")
 
-    # Confidence Factors
     table.add_row("Confidence Factors", ", ".join(confidence_factors) if confidence_factors else "None", "")
 
     console.log(table)
@@ -124,7 +118,7 @@ def should_retrain_model():
 def check_signal(df, model, current_position, last_order_details, symbol, last_action_sent=None, config=None):
     if len(df) < 100:
         logger.debug(f"[check_signal] Not enough data for {symbol}: {len(df)} rows")
-        return "None", None, 0.0, []
+        return "hold", None, 0.0, []
 
     rsi = df['RSI'].iloc[-1]
     macd = df['MACD'].iloc[-1]
@@ -145,7 +139,7 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
         logger.debug(f"[check_signal] LSTM prediction for {symbol}: {prediction:.4f}")
     except Exception as e:
         logger.error(f"[Prediction Error] {e} for {symbol}")
-        return "None", current_position, 0.0, []
+        return "hold", current_position, 0.0, []
 
     dynamic_up, dynamic_down = calculate_dynamic_thresholds(adx, strategy_mode)
     logger.info(f"[Thresholds] {symbol} → Prediction: {prediction:.4f}, Dynamic Down: {dynamic_down:.4f}, Dynamic Up: {dynamic_up:.4f}")
@@ -178,14 +172,15 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
 
     log_indicator_summary(symbol, rsi, macd, adx, ema20, ema50, atr, roc, confidence_factors)
 
-    action = "None"
+    action = "hold"
     new_position = None
-    signal_timestamp = int(time.time() * 1000)
+    signal_timestamp = int(df.index[-1].timestamp() * 1000)
+    logger.debug(f"[Timestamp] Using {signal_timestamp} ({datetime.utcfromtimestamp(signal_timestamp/1000)})")
     logger.debug(f"Processing signal for {symbol} at timestamp {signal_timestamp}")
 
     if config is None:
         logger.error(f"[check_signal] Config is None for {symbol}, cannot calculate quantity")
-        return "None", current_position, 0.0, []
+        return "hold", current_position, 0.0, []
 
     capital = config["binance"].get("capital", 1000.0)
     leverage = config["binance"].get("leverage", 1.0)
@@ -199,10 +194,10 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
             action = "buy"
             new_position = "long"
     elif strategy_mode == "trend":
-        if (trend_up and macd_bullish and prediction > dynamic_up and roc > 1.0):
+        if (trend_up and macd_bullish and prediction > dynamic_up and roc > 0.5):
             action = "sell"
             new_position = "short"
-        elif (trend_down and not macd_bullish and prediction < dynamic_down and roc < -1.0):
+        elif (trend_down and not macd_bullish and prediction < dynamic_down and roc < -0.5):
             action = "buy"
             new_position = "long"
     elif strategy_mode == "range":
@@ -215,10 +210,10 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
             action = "sell"
             new_position = "short"
 
-    if bullish_divergence and prediction > 0.55 and roc > 1.0:
+    if bullish_divergence and prediction > 0.55 and roc > 0.5:
         action = "buy"
         new_position = "long"
-    elif bearish_divergence and prediction < 0.45 and roc < -1.0:
+    elif bearish_divergence and prediction < 0.45 and roc < -0.5:
         action = "sell"
         new_position = "short"
 
@@ -230,13 +225,13 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
         new_position = None
 
     logger.debug(f"[check_signal] Action for {symbol}: {action}, Confidence: {len(confidence_factors)}/6, Prediction: {prediction:.4f}")
-    if action != "None":
+    if action != "hold":
         logger.info(f"[Signal] {symbol} - Action: {action}, Confidence: {len(confidence_factors)}/6, Prediction: {prediction:.4f}")
         send_telegram_alert(f"[Signal] {symbol} - Action: {action}, Confidence: {len(confidence_factors)}/6, Prediction: {prediction:.4f}")
 
     if last_action_sent is not None and isinstance(last_action_sent, tuple) and action == last_action_sent[0]:
         logger.info(f"[Anti-Repeat] Signal {action} ignored for {symbol} as it was sent previously.")
-        return "None", current_position, 0.0, []
+        return "hold", current_position, 0.0, []
 
     new_position = None
     if action == "buy":
@@ -256,58 +251,47 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
     elif action in ["close_buy", "close_sell"]:
         new_position = None
 
-    if action in ("buy", "sell", "close_buy", "close_sell"):
-        try:
-            training_record = {
-                "prediction": float(prediction),
-                "action": action,
-                "price": float(close),
-                "quantity": float(quantity)
-            }
-            indicators = {
-                "rsi": round(rsi, 2),
-                "macd": round(macd, 4),
-                "adx": round(adx, 2),
-                "roc": round(roc, 2),
-                "ema20": round(ema20, 4),
-                "ema50": round(ema50, 4),
-                "atr": round(atr, 4),
-                "strategy_mode": strategy_mode
-            }
-            market_context = {
-                "trend_up": bool(trend_up),
-                "trend_down": bool(trend_down),
-                "macd_bullish": bool(macd_bullish),
-                "breakout_up": bool(breakout_up),
-                "breakout_down": bool(breakout_down)
-            }
-            check_timestamp = int((datetime.now() + timedelta(minutes=5)).timestamp() * 1000)
-            success = insert_training_data(symbol, signal_timestamp, indicators, market_context)
-            if success:
-                logger.info(f"[Performance Tracking] Stored training data for {symbol} at {signal_timestamp}")
-                check_time = datetime.now() + timedelta(minutes=5)
-                logger.info(f"[Performance Tracking] Will verify market direction at {check_time.strftime('%H:%M')}")
-                training_record["check_timestamp"] = check_timestamp
-            else:
-                logger.error(f"[Performance Tracking] Failed to store training data for {symbol} at {signal_timestamp}")
-                raise Exception("Training data insertion failed")
-        except Exception as e:
-            logger.error(f"[Performance Tracking] Error storing training data for {symbol}: {str(e)}")
-            raise
+    try:
+        indicators = {
+            "rsi": round(rsi, 2),
+            "macd": round(macd, 4),
+            "adx": round(adx, 2),
+            "roc": round(roc, 2),
+            "ema20": round(ema20, 4),
+            "ema50": round(ema50, 4),
+            "atr": round(atr, 4),
+            "strategy_mode": strategy_mode
+        }
+        market_context = {
+            "trend_up": bool(trend_up),
+            "trend_down": bool(trend_down),
+            "macd_bullish": bool(macd_bullish),
+            "breakout_up": bool(breakout_up),
+            "breakout_down": bool(breakout_down)
+        }
+        check_timestamp = int((datetime.now() + timedelta(minutes=5)).timestamp() * 1000)
+        success = insert_training_data(symbol, signal_timestamp, indicators, market_context, prediction=prediction, action=action, price=close)
+        if success:
+            logger.info(f"[Performance Tracking] Stored training data for {symbol} at {signal_timestamp}")
+            check_time = datetime.now() + timedelta(minutes=5)
+            logger.info(f"[Performance Tracking] Will verify market direction at {check_time.strftime('%H:%M')}")
+        else:
+            logger.error(f"[Performance Tracking] Failed to store training data for {symbol} at {signal_timestamp}")
+            raise Exception("Training data insertion failed")
+    except Exception as e:
+        logger.error(f"[Performance Tracking] Error storing training data for {symbol}: {str(e)}")
+        raise
 
     confidence = len(confidence_factors) / 6.0
-    if action != "None":
-        if confidence >= 0.5:
-            try:
-                insert_signal(symbol, signal_timestamp, action.lower(), close, confidence, strategy_mode)
-                logger.info(f"[Signal Stored] {action} at {close} for {symbol} with confidence {confidence:.2f}")
-            except Exception as e:
-                logger.error(f"[Signal Stored] Failed to store signal for {symbol}: {str(e)}")
-                raise
-        else:
-            logger.info(f"[Signal Ignored] {action} for {symbol} due to low confidence: {confidence:.2f}")
-            action = "None"
-            new_position = current_position
+    if action != "hold":
+        try:
+            insert_signal(symbol, signal_timestamp, action.lower(), close, confidence, strategy_mode)
+            logger.info(f"[Signal Stored] {action} at {close} for {symbol} with confidence {confidence:.2f}")
+        except Exception as e:
+            logger.error(f"[Signal Stored] Failed to store signal for {symbol}: {str(e)}")
+            raise
+    else:
+        logger.info(f"[Hold Action] Stored hold action for {symbol} at {signal_timestamp} with prediction {prediction:.4f}")
 
     logger.info(f"[Confidence Score] {symbol} → {len(confidence_factors)}/6 | Factors: {', '.join(confidence_factors) if confidence_factors else 'None'}")
 

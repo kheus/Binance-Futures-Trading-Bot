@@ -7,7 +7,7 @@ from src.database.db_handler import update_trade_on_close
 logger = logging.getLogger(__name__)
 
 class UltraAgressiveTrailingStop:
-    def __init__(self, client, symbol, trailing_distance=0.01):
+    def __init__(self, client, symbol, trailing_distance=0.002): # 0.2% trailing distance
         self.client = client
         self.symbol = symbol
         self.trailing_distance = trailing_distance
@@ -18,6 +18,21 @@ class UltraAgressiveTrailingStop:
         self.position_type = None
         self.quantity = 0.0
         self.trade_id = None
+        self.price_tick = self._get_price_tick()
+
+    def _get_price_tick(self):
+        """Fetch price tick size for the symbol from Binance exchange info."""
+        try:
+            exchange_info = self.client.get_exchange_info()
+            for symbol_info in exchange_info['symbols']:
+                if symbol_info['symbol'] == self.symbol:
+                    for f in symbol_info['filters']:
+                        if f['filterType'] == 'PRICE_FILTER':
+                            return float(f['tickSize'])
+            return 0.0001  # Default tick size if not found
+        except Exception as e:
+            logger.warning(f"[{self.symbol}] ⚠️ Could not fetch price tick: {e}. Using default 0.0001")
+            return 0.0001
 
     def initialize_trailing_stop(self, entry_price, position_type, quantity, atr, trade_id):
         self.entry_price = float(entry_price)
@@ -104,10 +119,14 @@ class UltraAgressiveTrailingStop:
                 else current_price * (1 + self.trailing_distance)
             )
 
+            # Add tolerance to account for price tick and rounding issues
             should_update = (
-                (self.position_type == 'long' and new_stop > self.current_stop_price) or
-                (self.position_type == 'short' and new_stop < self.current_stop_price)
+                (self.position_type == 'long' and new_stop >= self.current_stop_price + self.price_tick) or
+                (self.position_type == 'short' and new_stop <= self.current_stop_price - self.price_tick)
             )
+
+            logger.debug(f"[{self.symbol}] Checking update: new_stop={new_stop}, current_stop_price={self.current_stop_price}, "
+                        f"should_update={should_update}, position_type={self.position_type}, price_tick={self.price_tick}")
 
             if should_update:
                 for attempt in range(self.max_retries):

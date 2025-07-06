@@ -11,7 +11,7 @@ CREATE TABLE orders (
     quantity DECIMAL,
     price DECIMAL,
     status VARCHAR(20),
-    timestamp timestamp with time zone,
+    timestamp TIMESTAMP WITH TIME ZONE,
     client_order_id VARCHAR(255)
 );
 CREATE INDEX IF NOT EXISTS idx_orders_symbol ON orders(symbol);
@@ -25,10 +25,10 @@ CREATE TABLE IF NOT EXISTS trades (
     side VARCHAR(10),
     quantity DECIMAL,
     price DECIMAL,
-    exit_price DECIMAL,  -- Added exit_price column
+    exit_price DECIMAL,
     stop_loss DECIMAL,
     take_profit DECIMAL,
-    timestamp timestamp with time zone,
+    timestamp TIMESTAMP WITH TIME ZONE,
     pnl DECIMAL,
     is_trailing BOOLEAN,
     trade_id VARCHAR(64) UNIQUE NOT NULL
@@ -53,12 +53,13 @@ END $$;
 CREATE TABLE IF NOT EXISTS price_data (
     id SERIAL PRIMARY KEY,
     symbol VARCHAR(20),
-    timestamp timestamp with time zone,
+    timestamp BIGINT,
     open DECIMAL,
     high DECIMAL,
     low DECIMAL,
     close DECIMAL,
-    volume DECIMAL
+    volume DECIMAL,
+    UNIQUE(symbol, timestamp)
 );
 CREATE INDEX IF NOT EXISTS idx_price_data_symbol ON price_data(symbol);
 CREATE INDEX IF NOT EXISTS idx_price_data_timestamp ON price_data(timestamp);
@@ -85,7 +86,7 @@ CREATE TABLE IF NOT EXISTS signals (
     timestamp BIGINT,
     signal_type VARCHAR(20),
     price DECIMAL,
-    created_at timestamp with time zone,
+    created_at TIMESTAMP WITH TIME ZONE,
     confidence_score DECIMAL,
     strategy VARCHAR(50),
     UNIQUE(symbol, timestamp)
@@ -96,15 +97,18 @@ CREATE INDEX IF NOT EXISTS idx_signals_timestamp ON signals(timestamp);
 -- Create training_data table
 CREATE TABLE IF NOT EXISTS training_data (
     id SERIAL PRIMARY KEY,
-    symbol VARCHAR(20),
-    timestamp BIGINT,
+    symbol VARCHAR(20) NOT NULL,
+    timestamp BIGINT NOT NULL,
+    prediction FLOAT,
+    action VARCHAR(20),
+    price FLOAT,
     indicators JSONB,
     market_context JSONB,
     market_direction INTEGER,
-    price_change_pct DECIMAL,
+    price_change_pct FLOAT,
     prediction_correct BOOLEAN,
-    created_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
-    updated_at timestamp with time zone,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(symbol, timestamp)
 );
 CREATE INDEX IF NOT EXISTS idx_training_data_symbol ON training_data(symbol);

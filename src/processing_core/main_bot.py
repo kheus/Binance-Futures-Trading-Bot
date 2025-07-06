@@ -35,6 +35,7 @@ from rich.logging import RichHandler
 import psycopg2.pool
 import signal
 from pathlib import Path
+from src.database.db_handler import connection_pool
 
 # Initialize rich console for enhanced logging
 console = Console()
@@ -96,6 +97,7 @@ KAFKA_BOOTSTRAP = kafka_config["kafka"]["bootstrap_servers"]
 MODEL_UPDATE_INTERVAL = 900  # 15 minutes
 METRICS_UPDATE_INTERVAL = 300  # 5 minutes
 TRAILING_UPDATE_INTERVAL = binance_config.get("trailing_update_interval", 10)  # Default to 10 seconds
+PRICE_FETCH_INTERVAL = 60  # Fetch 1-minute candles every 60 seconds
 
 # Initialize Binance client
 try:
@@ -313,6 +315,35 @@ async def trailing_stop_updater():
             send_telegram_alert(f"Error in trailing stop updater: {str(e)}")
             await asyncio.sleep(TRAILING_UPDATE_INTERVAL)
 
+async def fetch_price_data_fallback():
+    while True:
+        try:
+            for symbol in SYMBOLS:
+                try:
+                    klines = client.klines(symbol=symbol, interval='1m', limit=5)
+                    if not klines:
+                        logger.warning(f"[Price Fetch] No 1m klines fetched for {symbol}")
+                        continue
+                    candle_df = pd.DataFrame(
+                        klines,
+                        columns=["open_time", "open", "high", "low", "close", "volume",
+                                 "close_time", "quote_asset_vol", "num_trades", "taker_buy_base_vol",
+                                 "taker_buy_quote_vol", "ignore"]
+                    )
+                    candle_df = candle_df[["open_time", "open", "high", "low", "close", "volume"]].astype(float)
+                    candle_df["open_time"] = pd.to_datetime(candle_df["open_time"], unit="ms")
+                    candle_df.set_index("open_time", inplace=True)
+                    if insert_price_data(candle_df, symbol):
+                        logger.debug(f"[Price Fetch] Inserted 1m price data for {symbol} at {int(candle_df.index[-1].timestamp() * 1000)}")
+                    else:
+                        logger.error(f"[Price Fetch] Failed to insert 1m price data for {symbol}")
+                except Exception as e:
+                    logger.error(f"[Price Fetch] Error fetching 1m klines for {symbol}: {e}")
+            await asyncio.sleep(PRICE_FETCH_INTERVAL)
+        except Exception as e:
+            logger.error(f"[Price Fetch] Error in fallback price fetcher: {e}")
+            await asyncio.sleep(PRICE_FETCH_INTERVAL)
+
 async def main():
     dataframes = {symbol: pd.DataFrame() for symbol in SYMBOLS}
     order_details = {symbol: None for symbol in SYMBOLS}
@@ -422,6 +453,8 @@ async def main():
     last_log_time = time.time()
     iteration_count = 0
     try:
+        # Start fallback price data fetcher
+        asyncio.create_task(fetch_price_data_fallback())
         while True:
             current_time = time.time()
             if current_time - last_sync_time >= sync_interval:
@@ -649,3 +682,48 @@ else:
             loop.run_until_complete(main())
         finally:
             loop.close()
+
+import asyncio
+import signal
+
+def handle_shutdown(loop):
+    logger.info("Shutdown initiated. Cancelling all tasks...")
+    tasks = [task for task in asyncio.all_tasks(loop) if task is not asyncio.current_task()]
+    for task in tasks:
+        task.cancel()
+    loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
+    loop.run_until_complete(loop.shutdown_asyncgens())
+    loop.close()
+    logger.info("Shutdown completed gracefully.")
+
+async def main():
+    try:
+        # Existing main logic here
+        await asyncio.gather(
+            trailing_stop_updater(),
+            fetch_price_data_fallback(),
+            # Add other coroutines if needed
+        )
+    except KeyboardInterrupt:
+        logger.info("Received KeyboardInterrupt, shutting down...")
+        handle_shutdown(asyncio.get_event_loop())
+    finally:
+        # Close Kafka consumer, WebSocket client, etc.
+        logger.info("Closing resources...")
+        try:
+            consumer.close()
+        except Exception:
+            pass
+        try:
+            connection_pool.closeall()
+        except Exception:
+            pass
+
+if __name__ == "__main__":
+    loop = asyncio.get_event_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, lambda: handle_shutdown(loop))
+    try:
+        loop.run_until_complete(main())
+    except (KeyboardInterrupt, SystemExit):
+        handle_shutdown(loop)

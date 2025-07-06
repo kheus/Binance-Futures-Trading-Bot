@@ -115,6 +115,9 @@ def create_tables():
             release_db_connection(conn)
 
 def insert_or_update_order(order):
+    """
+    Insert or update an order in the orders table with robust order_id handling.
+    """
     query_check = "SELECT order_id FROM orders WHERE order_id = %s"
     query_update = """
         UPDATE orders
@@ -129,26 +132,32 @@ def insert_or_update_order(order):
     try:
         conn = get_db_connection()
         with conn.cursor() as cur:
-            order_id_str = str(order['orderId']) if 'orderId' in order else str(order['order_id'])
+            # Robust order_id extraction: prefer clientOrderId, fallback to orderId, then order_id
+            order_id_str = str(order.get('clientOrderId') or order.get('orderId') or order.get('order_id', '')).strip()
+            if not order_id_str or order_id_str.lower() == "null" or order_id_str == "0":
+                logger.error(f"[insert_or_update_order] Skipping order with invalid order_id: {order}")
+                return False
+
             cur.execute(query_check, (order_id_str,))
             exists = cur.fetchone()
             symbol = order.get('symbol')
             side = order.get('side')
             quantity = float(order.get('origQty', order.get('quantity', 0)))
-            price = float(order.get('price'))
+            price = float(order.get('price', 0))
             status = order.get('status')
             timestamp = int(order.get('time', order.get('timestamp', 0)))
-            client_order_id = order.get('clientOrderId', order.get('client_order_id', None))
+            client_order_id = str(order.get('clientOrderId', order.get('client_order_id', '')))
+
             if exists:
                 cur.execute(query_update, (symbol, side, quantity, price, status, timestamp, client_order_id, order_id_str))
-                logger.debug(f"Order {order_id_str} for {symbol} updated in DB.")
+                logger.debug(f"[insert_or_update_order] Order {order_id_str} for {symbol} updated in DB.")
             else:
                 cur.execute(query_insert, (order_id_str, symbol, side, quantity, price, status, timestamp, client_order_id))
-                logger.debug(f"Order {order_id_str} for {symbol} inserted in DB.")
+                logger.debug(f"[insert_or_update_order] Order {order_id_str} for {symbol} inserted in DB.")
             conn.commit()
             return True
     except Exception as e:
-        logger.error(f"Error inserting/updating order {order_id_str}: {str(e)}")
+        logger.error(f"[insert_or_update_order] Error inserting/updating order {order.get('orderId', order.get('clientOrderId', ''))}: {str(e)}")
         if conn:
             conn.rollback()
         return False
@@ -229,25 +238,36 @@ def insert_signal(symbol, timestamp, signal_type, price, confidence_score=None, 
         logger.error(f"[insert_signal] Error inserting signal: {str(e)}")
         raise
 
-def insert_training_data(symbol, timestamp, indicators, market_context):
+def insert_training_data(symbol, timestamp, indicators, market_context, prediction=None, action=None, price=None):
     query = """
-    INSERT INTO training_data (symbol, timestamp, indicators, market_context)
-    VALUES (%s, %s, %s::jsonb, %s::jsonb)
+    INSERT INTO training_data (symbol, timestamp, indicators, market_context, prediction, action, price, created_at)
+    VALUES (%s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s)
     ON CONFLICT (symbol, timestamp) DO NOTHING
     """
     conn = None
     try:
         timestamp_ms = int(float(timestamp))
-        if timestamp_ms < 946684800000 or timestamp_ms > 4102444800000:  # 2000 to 2100
+        if timestamp_ms < 946684800000 or timestamp_ms > 4102444800000:
             raise ValueError(f"Invalid timestamp for {symbol}: {timestamp_ms}")
 
         indicators_json = json.dumps(indicators) if isinstance(indicators, dict) else indicators
         market_context_json = json.dumps(market_context) if isinstance(market_context, dict) else market_context
+        
+        # Get current time in milliseconds for created_at
+        created_at_ms = int(datetime.utcnow().timestamp() * 1000)
 
         conn = get_db_connection()
         with conn.cursor() as cur:
-            logger.debug(f"[insert_training_data] Executing for {symbol} at {timestamp_ms}, indicators: {indicators_json}, market_context: {market_context_json}")
-            cur.execute(query, (symbol, timestamp_ms, indicators_json, market_context_json))
+            cur.execute(query, (
+                symbol,
+                timestamp_ms,
+                indicators_json,
+                market_context_json,
+                float(prediction) if prediction is not None else None,
+                action,
+                float(price) if price is not None else None,
+                created_at_ms  # Use millisecond timestamp
+            ))
             conn.commit()
             logger.debug(f"[insert_training_data] Inserted training data for {symbol} at {timestamp_ms}")
         return True
@@ -259,7 +279,6 @@ def insert_training_data(symbol, timestamp, indicators, market_context):
     finally:
         if conn:
             release_db_connection(conn)
-
 def update_trade_on_close(symbol, order_id, exit_price, quantity, side, leverage=50):
     query = """
     UPDATE trades
@@ -302,7 +321,7 @@ def get_pending_training_data():
     SELECT id, symbol, timestamp, indicators, market_context, market_direction, 
            price_change_pct, prediction_correct, created_at, updated_at
     FROM training_data
-    WHERE market_direction IS NULL OR prediction_correct IS NULL
+    WHERE (market_direction IS NULL OR prediction_correct IS NULL)
     ORDER BY timestamp ASC
     LIMIT 100
     """
@@ -325,20 +344,23 @@ def get_pending_training_data():
 def update_training_outcome(record_id, market_direction, price_change_pct, prediction_correct):
     """
     Update a training data record with market direction, price change percentage, and prediction outcome.
+    Uses millisecond timestamp for updated_at.
     """
     query = """
     UPDATE training_data
     SET market_direction = %s,
         price_change_pct = %s,
         prediction_correct = %s,
-        updated_at = CURRENT_TIMESTAMP
+        updated_at = %s
     WHERE id = %s
     """
     try:
+        updated_at_ms = int(datetime.utcnow().timestamp() * 1000)
         execute_query(query, (
             int(market_direction),
             float(price_change_pct),
             bool(prediction_correct),
+            updated_at_ms,  # Use millisecond timestamp
             int(record_id)
         ))
         logger.info(f"[update_training_outcome] Updated training data record ID={record_id}")
@@ -347,17 +369,24 @@ def update_training_outcome(record_id, market_direction, price_change_pct, predi
         raise
 
 def get_future_prices(symbol, signal_timestamp, candle_count=5):
+    """
+    Fetch future price data for a given symbol and timestamp.
+    The 'timestamp' column is stored as BIGINT (milliseconds).
+    """
     query = """
     SELECT timestamp, open, high, low, close, volume
     FROM price_data
-    WHERE symbol = %s AND timestamp > to_timestamp(%s::double precision / 1000)
+    WHERE symbol = %s AND timestamp > %s
     ORDER BY timestamp ASC
     LIMIT %s
     """
     params = (str(symbol), int(signal_timestamp), int(candle_count))
     try:
         with get_db_connection() as conn:
-            return pd.read_sql_query(query, conn, params=params)
+            df = pd.read_sql_query(query, conn, params=params)
+            if not df.empty:
+                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            return df
     except Exception as e:
         logger.error(f"Failed to fetch future prices for {symbol}: {e}")
         raise
@@ -450,6 +479,10 @@ def get_metrics():
         raise
 
 def get_price_history(symbol, timeframe='1h', start_timestamp=None):
+    """
+    Fetch historical price data for a given symbol and timeframe.
+    The 'timestamp' column is stored as BIGINT (milliseconds).
+    """
     timeframe_to_limit = {
         '5m': 288, '15m': 96, '1h': 168, '4h': 84, '1d': 30
     }
@@ -461,27 +494,33 @@ def get_price_history(symbol, timeframe='1h', start_timestamp=None):
     """
     params = [str(symbol)]
     if start_timestamp is not None:
-        query += " AND timestamp >= to_timestamp(%s::double precision / 1000)"
+        query += " AND timestamp >= %s"  # Direct BIGINT comparison
         params.append(int(start_timestamp))
     query += " ORDER BY timestamp DESC LIMIT %s"
     params.append(int(limit))
     try:
         with get_db_connection() as conn:
-            return pd.read_sql_query(query, conn, params=params).sort_values('timestamp').to_dict(orient='records')
+            df = pd.read_sql_query(query, conn, params=params)
+            # Convert ms timestamp to datetime for returned data
+            if not df.empty:
+                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            return df.sort_values('timestamp').to_dict(orient='records')
     except Exception as e:
         logger.error(f"Failed to fetch price history for {symbol}: {e}")
         raise
 
 def clean_old_data(retention_days=7, trades_retention_days=None):
+    """
+    Delete old data from metrics and price_data tables using BIGINT ms timestamps.
+    """
     try:
         conn = get_db_connection()
         conn.autocommit = True
         cursor = conn.cursor()
         threshold_ms = int((datetime.now() - timedelta(days=retention_days)).timestamp() * 1000)
-        threshold_ts = datetime.now() - timedelta(days=retention_days)
         cursor.execute("DELETE FROM metrics WHERE timestamp < %s", (threshold_ms,))
         logger.info(f"[DB Cleanup] Deleted {cursor.rowcount} rows from metrics")
-        cursor.execute("DELETE FROM price_data WHERE timestamp < %s", (threshold_ts,))
+        cursor.execute("DELETE FROM price_data WHERE timestamp < %s", (threshold_ms,))
         logger.info(f"[DB Cleanup] Deleted {cursor.rowcount} rows from price_data")
         cursor.close()
         release_db_connection(conn)
@@ -596,4 +635,3 @@ def _validate_timestamp(ts):
         return ts
     except (TypeError, ValueError) as e:
         logger.error(f"Timestamp invalide: {ts} - {str(e)}")
-        raise ValueError(f"Format de timestamp invalide: {ts}") from e
