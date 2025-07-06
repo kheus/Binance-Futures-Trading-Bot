@@ -167,8 +167,8 @@ def insert_or_update_order(order):
 
 def insert_trade(trade_data):
     query = """
-    INSERT INTO trades (order_id, symbol, side, quantity, price, exit_price, stop_loss, take_profit, timestamp, pnl, is_trailing, trade_id)
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, to_timestamp(%s / 1000.0), %s, %s, %s)
+    INSERT INTO trades (order_id, symbol, side, quantity, price, exit_price, stop_loss, take_profit, timestamp, pnl, is_trailing, trade_id, status)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, to_timestamp(%s / 1000.0), %s, %s, %s, %s)
     ON CONFLICT (trade_id) DO UPDATE
     SET order_id = EXCLUDED.order_id,
         side = EXCLUDED.side,
@@ -179,7 +179,8 @@ def insert_trade(trade_data):
         take_profit = EXCLUDED.take_profit,
         timestamp = EXCLUDED.timestamp,
         pnl = EXCLUDED.pnl,
-        is_trailing = EXCLUDED.is_trailing
+        is_trailing = EXCLUDED.is_trailing,
+        status = EXCLUDED.status
     """
     conn = None
     try:
@@ -197,7 +198,8 @@ def insert_trade(trade_data):
                 float(trade_data['timestamp']),
                 float(trade_data.get('pnl', 0.0)),
                 bool(trade_data.get('is_trailing', False)),
-                str(trade_data['trade_id'])
+                str(trade_data['trade_id']),
+                str(trade_data.get('status', 'OPEN'))
             )
             logger.debug(f"[insert_trade] Executing for {trade_data['symbol']}, order_id: {trade_data['order_id']}, trade_id: {trade_data['trade_id']}")
             cur.execute(query, params)
@@ -279,11 +281,13 @@ def insert_training_data(symbol, timestamp, indicators, market_context, predicti
     finally:
         if conn:
             release_db_connection(conn)
+
 def update_trade_on_close(symbol, order_id, exit_price, quantity, side, leverage=50):
     query = """
     UPDATE trades
     SET exit_price = %s,
-        pnl = %s
+        pnl = %s,
+        status = 'CLOSED'
     WHERE symbol = %s AND order_id = %s::varchar
     """
     conn = None
@@ -444,19 +448,20 @@ def insert_price_data(price_data, symbol):
             return False
         query = """
         INSERT INTO price_data (symbol, timestamp, open, high, low, close, volume)
-        VALUES (%s, to_timestamp(%s / 1000.0), %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (symbol, timestamp) DO NOTHING
         """
+        timestamp_ms = int(price_data.index[-1].timestamp() * 1000)
         execute_query(query, (
             symbol,
-            int(price_data.index[-1].timestamp() * 1000),
+            timestamp_ms,
             float(price_data['open'].iloc[-1]),
             float(price_data['high'].iloc[-1]),
             float(price_data['low'].iloc[-1]),
             float(price_data['close'].iloc[-1]),
             float(price_data['volume'].iloc[-1])
         ))
-        logger.info(f"Price data inserted or skipped (if duplicate) for {symbol} at {int(price_data.index[-1].timestamp() * 1000)}")
+        logger.info(f"Price data inserted or skipped (if duplicate) for {symbol} at {timestamp_ms}")
         return True
     except Exception as e:
         logger.error(f"Error inserting price data for {symbol}: {str(e)}, data: {price_data}")

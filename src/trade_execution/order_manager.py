@@ -24,6 +24,7 @@ from src.monitoring.alerting import send_telegram_alert
 import psycopg2
 from psycopg2 import pool
 import math
+import asyncio
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +76,115 @@ except Exception as e:
 def init_trailing_stop_manager(client):
     global ts_manager
     ts_manager = TrailingStopManager(client)
+    # Load existing trailing stops from trades table
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        query = """
+        SELECT trade_id, symbol, side, quantity, price, stop_loss
+        FROM trades
+        WHERE is_trailing = TRUE AND status = 'OPEN'
+        """
+        cursor.execute(query)
+        trades = cursor.fetchall()
+        for trade in trades:
+            trade_id, symbol, side, quantity, entry_price, stop_loss = trade
+            position_type = 'long' if side.upper() == 'BUY' else 'short'
+            ts_id = ts_manager.initialize_trailing_stop(
+                symbol=symbol,
+                entry_price=float(entry_price),
+                position_type=position_type,
+                quantity=float(quantity),
+                atr=get_current_atr(client, symbol),
+                trade_id=str(trade_id)
+            )
+            if ts_id:
+                logger.info(f"[TrailingStopManager] Restored trailing stop for {symbol}, trade_id={trade_id}, stop_loss={stop_loss}")
+            else:
+                logger.error(f"[TrailingStopManager] Failed to restore trailing stop for {symbol}, trade_id={trade_id}")
+    except Exception as e:
+        logger.error(f"[TrailingStopManager] Error restoring trailing stops: {e}")
+    finally:
+        if conn:
+            release_db_connection(conn)
     return ts_manager
+
+async def trailing_stop_monitor(client):
+    """Monitor and update trailing stops for all open trades."""
+    while True:
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            query = """
+            SELECT trade_id, symbol, side, quantity, price, stop_loss
+            FROM trades
+            WHERE is_trailing = TRUE AND status = 'OPEN'
+            """
+            cursor.execute(query)
+            trades = cursor.fetchall()
+            for trade in trades:
+                trade_id, symbol, side, quantity, entry_price, stop_loss = trade
+                try:
+                    # Use synchronous client for price fetch if async not available
+                    ticker = client.ticker_price(symbol=symbol)
+                    current_price = float(ticker['price'])
+                    position_type = 'long' if side.upper() == 'BUY' else 'short'
+                    ts_id = ts_manager.update_trailing_stop(symbol, current_price, trade_id=str(trade_id))
+                    if ts_id:
+                        # Update stop_loss in trades table
+                        new_stop_loss = ts_manager.get_current_stop_price(symbol, trade_id=str(trade_id))
+                        if new_stop_loss:
+                            update_query = """
+                            UPDATE trades
+                            SET stop_loss = %s, timestamp = %s
+                            WHERE trade_id = %s
+                            """
+                            cursor.execute(update_query, (new_stop_loss, int(time.time() * 1000), trade_id))
+                            conn.commit()
+                            logger.info(f"[TrailingStopMonitor] Updated trailing stop for {symbol}, trade_id={trade_id}, new_stop_loss={new_stop_loss}")
+                        # Check if stop loss triggered
+                        if position_type == 'long' and current_price <= new_stop_loss:
+                            order = client.create_order(
+                                symbol=symbol,
+                                side=SIDE_SELL,
+                                type=ORDER_TYPE_MARKET,
+                                quantity=quantity
+                            )
+                            update_query = """
+                            UPDATE trades
+                            SET status = 'CLOSED', exit_price = %s, timestamp = %s
+                            WHERE trade_id = %s
+                            """
+                            cursor.execute(update_query, (current_price, int(time.time() * 1000), trade_id))
+                            conn.commit()
+                            logger.info(f"[TrailingStopMonitor] Stop loss triggered for {symbol}, trade_id={trade_id} at {current_price}")
+                            ts_manager.remove_trailing_stop(symbol, trade_id=str(trade_id))
+                        elif position_type == 'short' and current_price >= new_stop_loss:
+                            order = client.create_order(
+                                symbol=symbol,
+                                side=SIDE_BUY,
+                                type=ORDER_TYPE_MARKET,
+                                quantity=quantity
+                            )
+                            update_query = """
+                            UPDATE trades
+                            SET status = 'CLOSED', exit_price = %s, timestamp = %s
+                            WHERE trade_id = %s
+                            """
+                            cursor.execute(update_query, (current_price, int(time.time() * 1000), trade_id))
+                            conn.commit()
+                            logger.info(f"[TrailingStopMonitor] Stop loss triggered for {symbol}, trade_id={trade_id} at {current_price}")
+                            ts_manager.remove_trailing_stop(symbol, trade_id=str(trade_id))
+                except Exception as e:
+                    logger.error(f"[TrailingStopMonitor] Error updating trailing stop for {symbol}, trade_id={trade_id}: {e}")
+            await asyncio.sleep(30)  # Check every 30 seconds
+        except Exception as e:
+            logger.error(f"[TrailingStopMonitor] Error in monitor loop: {e}")
+            await asyncio.sleep(60)
+        finally:
+            if conn:
+                release_db_connection(conn)
 
 def get_tick_info(client, symbol):
     try:
@@ -177,21 +286,17 @@ def get_exchange_precision(client, symbol):
 
 def place_order(signal, price, atr, client, symbol, capital, leverage, trade_id=None):
     try:
-        # 1. Get precise exchange rules
         rules = get_exchange_precision(client, symbol)
         logger.info(f"Precision rules for {symbol}: {rules}")
 
-        # 2. Adjust price to tick size and precision
         price = round(price / rules['price_tick']) * rules['price_tick']
         price = round(price, rules['price_precision'])
 
-        # 3. Calculate and adjust quantity
         qty = (capital * leverage) / price
         qty = math.floor(qty / rules['qty_step']) * rules['qty_step']
         qty = max(qty, rules['min_qty'])
         qty = round(qty, rules['qty_precision'])
 
-        # Special handling for XRP/USDT (quantité entière)
         if symbol == 'XRPUSDT':
             qty = int(qty)
 
@@ -206,7 +311,6 @@ Adjusted Qty: {qty}
 Rules: {rules}
 """)
 
-        # 4. Place order
         order = client.create_order(
             symbol=symbol,
             side=SIDE_SELL if signal == 'sell' else SIDE_BUY,
@@ -215,12 +319,10 @@ Rules: {rules}
             recvWindow=10000
         )
 
-        # Alternative response handling
         order_id = order.get('orderId') or order.get('clientOrderId')
         if not order_id:
             raise ValueError("Invalid order response from Binance")
 
-        # Wait for the order to be finalized
         order_status = wait_until_order_finalized(client, symbol, order_id)
 
         if isinstance(order_status, dict) and order_status.get("status") == "REJECTED":
@@ -234,14 +336,31 @@ Rules: {rules}
         avg_price = get_average_fill_price(client, symbol, order_id) or price
         position_type = "long" if signal == "buy" else "short"
 
-        # Vérifier si un trailing stop existe déjà pour ce trade
-        open_orders = client.get_open_orders(symbol=symbol)
-        for open_order in open_orders:
-            if open_order['clientOrderId'].startswith(f"trailing_stop_{symbol}_{trade_id or int(time.time())}"):
-                logger.info(f"[OrderManager] Trailing stop already exists for {symbol} trade {trade_id}. Skipping.")
-                return order
+        # Store trade in database
+        trade_id = trade_id or str(int(time.time()))
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        query = """
+        INSERT INTO trades (order_id, symbol, side, quantity, price, stop_loss, is_trailing, trade_id, status, timestamp)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (trade_id) DO UPDATE
+        SET order_id = EXCLUDED.order_id,
+            quantity = EXCLUDED.quantity,
+            price = EXCLUDED.price,
+            stop_loss = EXCLUDED.stop_loss,
+            is_trailing = EXCLUDED.is_trailing,
+            status = EXCLUDED.status,
+            timestamp = EXCLUDED.timestamp
+        """
+        cursor.execute(query, (
+            str(order_id), symbol, signal.upper(), qty, avg_price, None, False, trade_id, 'OPEN', int(time.time() * 1000)
+        ))
+        conn.commit()
+        release_db_connection(conn)
 
-        # Placer un trailing stop si une position est ouverte
+        # Initialize trailing stop
+        ts_id = None
+        stop_loss = None
         has_position, position_qty = check_open_position(client, symbol, signal)
         if has_position:
             ts_id = ts_manager.initialize_trailing_stop(
@@ -250,12 +369,29 @@ Rules: {rules}
                 position_type=position_type,
                 quantity=qty,
                 atr=atr,
-                trade_id=trade_id or str(int(time.time()))
+                trade_id=trade_id
             )
-            if not ts_id:
-                logger.error(f"[OrderManager] Trailing stop init failed. Canceling order.")
+            if ts_id:
+                # Update trades table with trailing stop details
+                conn = get_db_connection()
+                cursor = conn.cursor()
+                stop_loss = ts_manager.get_current_stop_price(symbol, trade_id=trade_id)
+                cursor.execute(
+                    "UPDATE trades SET is_trailing = %s, stop_loss = %s, status = %s WHERE trade_id = %s",
+                    (True, stop_loss, 'OPEN', trade_id)
+                )
+                conn.commit()
+                release_db_connection(conn)
+                logger.info(f"[OrderManager] Initialized trailing stop for {symbol}, trade_id={trade_id}, stop_loss={stop_loss}")
+            else:
+                logger.error(f"[OrderManager] Trailing stop init failed for {symbol}, trade_id={trade_id}. Canceling order.")
                 try:
                     client.cancel_order(symbol=symbol, orderId=order_id)
+                    conn = get_db_connection()
+                    cursor = conn.cursor()
+                    cursor.execute("UPDATE trades SET status = 'CANCELED' WHERE trade_id = %s", (trade_id,))
+                    conn.commit()
+                    release_db_connection(conn)
                 except Exception as e:
                     logger.error(f"[OrderManager] Failed to cancel order {order_id} for {symbol}: {e}")
                 return None
@@ -268,14 +404,14 @@ Rules: {rules}
             "price": avg_price,
             "timestamp": int(time.time() * 1000),
             "is_trailing": bool(ts_id),
-            "stop_loss": None,
+            "stop_loss": stop_loss if ts_id else None,
             "take_profit": None,
             "pnl": 0.0,
-            "trade_id": trade_id or str(int(time.time()))
+            "trade_id": trade_id
         }
         logger.info(f"[OrderManager] Successfully placed {signal} order for {symbol}: {order_details}")
         send_telegram_alert(f"Order placed for {symbol} - {signal.upper()} at {avg_price:.2f} USDT, Qty: {qty:.4f} with ATR: {atr:.2f}")
-        log_order_as_table(signal, symbol, price, atr, qty, order_details)
+        log_order_as_table(signal, symbol, avg_price, atr, qty, order_details)
         track_order_locally(order_details)
         return order_details
 
