@@ -1,10 +1,11 @@
 ﻿try:
-    from src.trade_execution.order_utils import get_open_orders   
+    from src.trade_execution.order_utils import get_open_orders
     from binance.enums import SIDE_BUY, SIDE_SELL, ORDER_TYPE_MARKET
     from src.trade_execution.correlation_monitor import CorrelationMonitor
     from src.trade_execution.trade_analyzer import TradeAnalyzer
     from src.monitoring.metrics import get_current_atr
-    from src.trade_execution.ultra_aggressive_trailing import TrailingStopManager, get_average_fill_price
+    from src.trade_execution.ultra_aggressive_trailing import TrailingStopManager, format_price, format_quantity
+    from src.database.db_handler import get_db_connection, release_db_connection, wait_until_order_finalized
 except ImportError:
     SIDE_BUY = 'BUY'
     SIDE_SELL = 'SELL'
@@ -13,12 +14,10 @@ except ImportError:
 import time
 import logging
 import yaml
-import talib
 import numpy as np
 import pandas as pd
 from pathlib import Path
 from tabulate import tabulate
-import inspect
 from binance.um_futures import UMFutures
 from src.monitoring.alerting import send_telegram_alert
 import psycopg2
@@ -28,9 +27,9 @@ import asyncio
 from rich.table import Table
 from rich.console import Console
 import json
+from src.trade_execution.market_crash_protector import MarketCrashProtector
 
 console = Console()
-
 logger = logging.getLogger(__name__)
 
 # Load global configuration
@@ -42,9 +41,6 @@ with open(CONFIG_PATH, "r", encoding="utf-8-sig") as f:
 BINANCE_API_KEY = config["binance"]["api_key"]
 BINANCE_API_SECRET = config["binance"]["api_secret"]
 SYMBOLS = config["binance"]["symbols"]
-
-# Import market crash protector
-from src.trade_execution.market_crash_protector import MarketCrashProtector
 
 # Initialize global trailing stop manager and crash protector
 ts_manager = None
@@ -89,7 +85,7 @@ def init_trailing_stop_manager(client):
         query = """
         SELECT trade_id, symbol, side, quantity, price, stop_loss
         FROM trades
-        WHERE is_trailing = TRUE AND status = 'new'
+        WHERE is_trailing = TRUE AND status IN ('new', 'OPEN')
         """
         cursor.execute(query)
         trades = cursor.fetchall()
@@ -114,154 +110,6 @@ def init_trailing_stop_manager(client):
         if conn:
             release_db_connection(conn)
     return ts_manager
-
-async def trailing_stop_monitor(client):
-    """Monitor and update trailing stops for all open trades."""
-    while True:
-        try:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            query = """
-            SELECT trade_id, symbol, side, quantity, price, stop_loss
-            FROM trades
-            WHERE is_trailing = TRUE AND (status = 'new' OR status = 'OPEN')
-            """
-            cursor.execute(query)
-            trades = cursor.fetchall()
-            for trade in trades:
-                trade_id, symbol, side, quantity, entry_price, stop_loss = trade
-                try:
-                    # Use synchronous client for price fetch if async not available
-                    ticker = client.ticker_price(symbol=symbol)
-                    current_price = float(ticker['price'])
-                    position_type = 'long' if side.upper() == 'BUY' else 'short'
-                    ts_id = ts_manager.update_trailing_stop(symbol, current_price, trade_id=str(trade_id))
-                    if ts_id:
-                        # Update stop_loss in trades table
-                        new_stop_loss = ts_manager.get_current_stop_price(symbol, trade_id=str(trade_id))
-                        if new_stop_loss:
-                            update_query = """
-                            UPDATE trades
-                            SET stop_loss = %s, timestamp = %s
-                            WHERE trade_id = %s
-                            """
-                            cursor.execute(update_query, (new_stop_loss, int(time.time() * 1000), trade_id))
-                            conn.commit()
-                            logger.info(f"[TrailingStopMonitor] Updated trailing stop for {symbol}, trade_id={trade_id}, new_stop_loss={new_stop_loss}")
-                        # Check if stop loss triggered
-                        if position_type == 'long' and current_price <= new_stop_loss:
-                            order = client.create_order(
-                                symbol=symbol,
-                                side=SIDE_SELL,
-                                type=ORDER_TYPE_MARKET,
-                                quantity=quantity
-                            )
-                            update_query = """
-                            UPDATE trades
-                            SET status = 'CLOSED', exit_price = %s, timestamp = %s
-                            WHERE trade_id = %s
-                            """
-                            cursor.execute(update_query, (current_price, int(time.time() * 1000), trade_id))
-                            conn.commit()
-                            logger.info(f"[TrailingStopMonitor] Stop loss triggered for {symbol}, trade_id={trade_id} at {current_price}")
-                            ts_manager.remove_trailing_stop(symbol, trade_id=str(trade_id))
-                        elif position_type == 'short' and current_price >= new_stop_loss:
-                            order = client.create_order(
-                                symbol=symbol,
-                                side=SIDE_BUY,
-                                type=ORDER_TYPE_MARKET,
-                                quantity=quantity
-                            )
-                            update_query = """
-                            UPDATE trades
-                            SET status = 'CLOSED', exit_price = %s, timestamp = %s
-                            WHERE trade_id = %s
-                            """
-                            cursor.execute(update_query, (current_price, int(time.time() * 1000), trade_id))
-                            conn.commit()
-                            logger.info(f"[TrailingStopMonitor] Stop loss triggered for {symbol}, trade_id={trade_id} at {current_price}")
-                            ts_manager.remove_trailing_stop(symbol, trade_id=str(trade_id))
-                except Exception as e:
-                    logger.error(f"[TrailingStopMonitor] Error updating trailing stop for {symbol}, trade_id={trade_id}: {e}")
-            await asyncio.sleep(30)  # Check every 30 seconds
-        except Exception as e:
-            logger.error(f"[TrailingStopMonitor] Error in monitor loop: {e}")
-            await asyncio.sleep(60)
-        finally:
-            if conn:
-                release_db_connection(conn)
-
-def get_tick_info(client, symbol):
-    try:
-        exchange_info = client.get_exchange_info()
-        symbol_info = next((s for s in exchange_info["symbols"] if s["symbol"] == symbol), None)
-        if not symbol_info:
-            logger.error(f"[OrderManager] Symbol {symbol} not found in exchange info.")
-            return 0.0001, 8  # Fallback values
-
-        # Find PRICE_FILTER explicitly
-        price_filter = next((f for f in symbol_info['filters'] if f['filterType'] == 'PRICE_FILTER'), None)
-        if not price_filter:
-            logger.error(f"[OrderManager] PRICE_FILTER not found for {symbol}. Using fallback tick size.")
-            return 0.0001, 8  # Fallback values
-
-        # Find LOT_SIZE filter for quantity precision
-        lot_size_filter = next((f for f in symbol_info['filters'] if f['filterType'] == 'LOT_SIZE'), None)
-        if not lot_size_filter:
-            logger.error(f"[OrderManager] LOT_SIZE filter not found for {symbol}. Using fallback precision.")
-            return 0.0001, 8  # Fallback values
-
-        tick_size = float(price_filter['tickSize'])
-        quantity_precision = int(symbol_info.get('quantityPrecision', 8))  # Use exchange-provided precision or default
-        return tick_size, quantity_precision
-    except Exception as e:
-        logger.error(f"[OrderManager] Error getting tick info for {symbol}: {e}")
-        return 0.0001, 8  # Fallback values
-
-def round_to_tick(value, tick_size):
-    return round(round(value / tick_size) * tick_size, 8)
-
-def check_open_position(client, symbol, side, current_positions):
-    """
-    Vérifie si une position est ouverte avec une gestion robuste des erreurs.
-    Retourne (has_position: bool, position_qty: float)
-    """
-    position_qty = 0.0
-    has_position = False
-
-    try:
-        # Vérification via le tracker interne
-        current_position = current_positions.get(symbol)
-        if isinstance(current_position, dict):
-            position_qty = float(current_position.get('quantity', 0.0))
-            has_position = position_qty != 0.0
-            logger.debug(f"[Position Check] Using dict position for {symbol}: qty={position_qty}")
-        elif current_position is not None:
-            logger.warning(f"[Position Check] Invalid position format for {symbol}: {current_position}")
-
-        # Vérification via l'API Binance
-        try:
-            position_info = client.get_position_risk(symbol=symbol)
-            for pos in position_info:
-                if pos['symbol'] == symbol:
-                    qty = float(pos['positionAmt'])
-                    if qty != 0:
-                        api_position_side = 'long' if qty > 0 else 'short'
-                        has_position = True
-                        position_qty = abs(qty)
-                        # Log en cas de divergence entre tracker et API
-                        if isinstance(current_position, dict) and current_position.get('side') != api_position_side:
-                            logger.warning(f"[Position Mismatch] {symbol}: tracker={current_position.get('side')}, API={api_position_side}")
-                        break
-        except Exception as api_error:
-            logger.warning(f"[API Position Error] For {symbol}, using tracker value: {api_error}")
-
-        logger.debug(f"[Position Result] {symbol}: has_position={has_position}, qty={position_qty}")
-        return has_position, position_qty
-
-    except Exception as e:
-        logger.error(f"[Position Check Error] For {symbol}: {str(e)}")
-        return False, 0.0  # Fallback safe
 
 def get_exchange_precision(client, symbol):
     """Récupère les règles de précision exactes depuis l'API Binance"""
@@ -294,21 +142,15 @@ def place_order(signal, price, atr, client, symbol, capital, leverage, trade_id=
         rules = get_exchange_precision(client, symbol)
         logger.info(f"Precision rules for {symbol}: {rules}")
 
-        price = round(price / rules['price_tick']) * rules['price_tick']
-        price = round(price, rules['price_precision'])
-
+        price = format_price(symbol, price)
         qty = (capital * leverage) / price
-        qty = math.floor(qty / rules['qty_step']) * rules['qty_step']
+        qty = format_quantity(symbol, qty)
         qty = max(qty, rules['min_qty'])
-        qty = round(qty, rules['qty_precision'])
-
-        if symbol == 'XRPUSDT':
-            qty = int(qty)
 
         logger.info(f"""
 Order details for {symbol}:
 Original Price: {price}
-Rounded Price: {round(price / rules['price_tick']) * rules['price_tick']}
+Rounded Price: {format_price(symbol, price)}
 Capital: {capital}
 Leverage: {leverage}
 Raw Qty: {(capital * leverage) / price}
@@ -338,7 +180,7 @@ Rules: {rules}
             logger.warning(f"[OrderManager] Partial fill: {order_status['executedQty']}/{order_status['origQty']}")
             qty = float(order_status["executedQty"])
 
-        avg_price = get_average_fill_price(client, symbol, order_id) or price
+        avg_price = float(order_status.get('avgPrice', price))
         position_type = "long" if signal == "buy" else "short"
 
         # Store trade in database
@@ -358,7 +200,7 @@ Rules: {rules}
             timestamp = EXCLUDED.timestamp
         """
         cursor.execute(query, (
-            str(order_id), symbol, signal.upper(), qty, avg_price, None, False, trade_id, 'OPEN', int(time.time() * 1000)
+            str(order_id), symbol, signal.upper(), qty, avg_price, None, False, trade_id, 'new', int(time.time() * 1000)
         ))
         conn.commit()
         release_db_connection(conn)
@@ -366,7 +208,7 @@ Rules: {rules}
         # Initialize trailing stop
         ts_id = None
         stop_loss = None
-        has_position, position_qty = check_open_position(client, symbol, signal)
+        has_position, position_qty = EnhancedOrderManager(client, [symbol]).check_open_position(symbol, signal, {})
         if has_position:
             ts_id = ts_manager.initialize_trailing_stop(
                 symbol=symbol,
@@ -430,28 +272,22 @@ Rules: {rules}
 
 def update_trailing_stop(client, symbol, signal, current_price, atr, base_qty, existing_sl_order_id, trade_id=None):
     global ts_manager
-
     if ts_manager is None:
         ts_manager = init_trailing_stop_manager(client)
 
     try:
-        # Vérifier si une position est ouverte
-        has_position, position_qty = check_open_position(client, symbol, signal)
+        has_position, position_qty = EnhancedOrderManager(client, [symbol]).check_open_position(symbol, signal, {})
         if not has_position:
             logger.info(f"[Trailing Stop] No open position for {symbol} on side {signal}. Skipping trailing stop update.")
             return None
 
-        # Normalize trade_id
         trade_id = str(trade_id or existing_sl_order_id).replace('trade_', '')
-
-        # Vérifier si un trailing stop existe déjà
         open_orders = client.get_open_orders(symbol=symbol)
         for order in open_orders:
             if order['clientOrderId'].startswith(f"trailing_stop_{symbol}_{trade_id}"):
                 logger.info(f"[Trailing Stop] Trailing stop already exists for {symbol} trade {trade_id}. Updating.")
                 return ts_manager.update_trailing_stop(symbol, current_price, trade_id=trade_id)
 
-        # Initialiser un nouveau trailing stop si aucun n'existe
         if existing_sl_order_id in (-1, None):
             position_type = "long" if signal == "buy" else "short"
             return ts_manager.initialize_trailing_stop(
@@ -476,8 +312,8 @@ def place_scaled_take_profits(client, symbol, entry_price, quantity, position_ty
         ]
         trade_id = str(trade_id or int(time.time())).replace('trade_', '')
         for level in tp_levels:
-            tp_price = entry_price + (level["factor"] * atr) if position_type == "long" else entry_price - (level["factor"] * atr)
-            partial_qty = quantity * level["percent"]
+            tp_price = format_price(symbol, entry_price + (level["factor"] * atr) if position_type == "long" else entry_price - (level["factor"] * atr))
+            partial_qty = format_quantity(symbol, quantity * level["percent"])
             client.create_order(
                 symbol=symbol,
                 side=SIDE_SELL if position_type == "long" else SIDE_BUY,
@@ -489,7 +325,7 @@ def place_scaled_take_profits(client, symbol, entry_price, quantity, position_ty
                 newClientOrderId=f"tp_{symbol}_{trade_id}"
             )
             if level.get("reduce_ts"):
-                ts_manager.adjust_quantity(symbol, quantity * (1 - level["percent"]), trade_id=trade_id)
+                ts_manager.adjust_quantity(symbol, format_quantity(symbol, quantity * (1 - level["percent"])), trade_id=trade_id)
         logger.info(f"[OrderManager] Placed scaled take-profits for {symbol}, trade_id={trade_id}")
     except Exception as e:
         logger.error(f"[OrderManager] Error placing take-profits for {symbol}: {e}")
@@ -507,7 +343,7 @@ def log_order_as_table(signal, symbol, price, atr, qty, order_result=None):
     logger.info("Order Details:\n%s", tabulate(table_data, headers=["Metric", "Value"], tablefmt="grid"))
 
 def log_order_details(symbol, price, capital, leverage, quantity, rules):
-    rounded_price = round(price / rules['price_tick']) * rules['price_tick']
+    rounded_price = format_price(symbol, price)
     raw_qty = (capital * leverage) / price
 
     table = Table(title=f"🧾 Order Details for {symbol}", show_lines=True)
@@ -544,6 +380,7 @@ class EnhancedOrderManager:
     def __init__(self, client: UMFutures, symbols):
         self.client = client
         self.symbols = symbols
+        self.current_positions = {symbol: None for symbol in symbols}
 
     def get_current_price(self, symbol):
         try:
@@ -580,43 +417,19 @@ class EnhancedOrderManager:
                 logger.error(f"[EnhancedOrderManager] Failed to get current price for {symbol}")
                 return None
 
-            # Get exchange precision rules
             rules = get_exchange_precision(self.client, symbol)
             logger.info(f"[EnhancedOrderManager] Precision rules for {symbol}: {rules}")
 
-            # Calculate and adjust quantity
-            quantity = (capital * leverage) / price
-            quantity = math.floor(quantity / rules['qty_step']) * rules['qty_step']
+            quantity = format_quantity(symbol, (capital * leverage) / price)
             quantity = max(quantity, rules['min_qty'])
-            quantity = round(quantity, rules['qty_precision'])
+            price = format_price(symbol, price)
 
-            # Special handling for specific symbols (e.g., XRPUSDT)
-            if symbol == 'XRPUSDT':
-                quantity = int(quantity)
-
-            # Adjust price to tick size
-            price = round(price / rules['price_tick']) * rules['price_tick']
-            price = round(price, rules['price_precision'])
-
-            # Log order details
-            logger.info(f"""
-[EnhancedOrderManager] Order details for {symbol}:
-Original Price: {price}
-Rounded Price: {round(price / rules['price_tick']) * rules['price_tick']}
-Capital: {capital}
-Leverage: {leverage}
-Raw Quantity: {(capital * leverage) / price}
-Adjusted Quantity: {quantity}
-Rules: {rules}
-""")
-
-            # Check margin
             if not self.check_margin(symbol, quantity, price, leverage):
                 logger.error(f"[EnhancedOrderManager] Cancellation - margin problem for {symbol}")
                 return None
 
             side = 'BUY' if action == 'buy' else 'SELL'
-            trade_id = str(trade_id).replace('trade_', '')  # Normalize trade_id
+            trade_id = str(trade_id).replace('trade_', '')
             order = self.client.new_order(
                 symbol=symbol,
                 side=side,
@@ -645,6 +458,43 @@ Rules: {rules}
             logger.error(f"[EnhancedOrderManager] Failed to place {action} order for {symbol}: {e}")
             return None
 
+    def check_open_position(self, symbol, side, current_positions):
+        position_qty = 0.0
+        has_position = False
+        try:
+            position_info = self.client.get_position_risk(symbol=symbol)
+            for pos in position_info:
+                if pos['symbol'] == symbol:
+                    qty = float(pos['positionAmt'])
+                    if qty != 0:
+                        api_position_side = 'long' if qty > 0 else 'short'
+                        has_position = True
+                        position_qty = abs(qty)
+                        current_positions[symbol] = {
+                            'side': api_position_side,
+                            'quantity': position_qty,
+                            'price': float(pos['entryPrice']),
+                            'trade_id': current_positions[symbol]['trade_id'] if current_positions.get(symbol) and 'trade_id' in current_positions[symbol] else None
+
+                        }
+                        logger.debug(f"[Position Check] Updated current_positions for {symbol}: {current_positions[symbol]}")
+                        break
+            if not has_position and current_positions.get(symbol):
+                logger.info(f"[Position Check] No active position for {symbol}, clearing current_positions")
+                current_positions[symbol] = None
+            return has_position, position_qty
+        except Exception as e:
+            logger.error(f"[Position Check Error] For {symbol}: {str(e)}")
+            return False, 0.0
+
+    def clean_orphaned_trailing_stops(self, ts_manager):
+        for symbol in self.symbols:
+            has_position, _ = self.check_open_position(symbol, None, self.current_positions)
+            if not has_position and ts_manager.has_trailing_stop(symbol):
+                logger.warning(f"[OrderManager] No position found for {symbol}, removing trailing stop")
+                ts_manager.close_position(symbol)
+                self.current_positions[symbol] = None
+
 def wait_until_order_finalized(client, symbol, order_id, max_retries=5, sleep_seconds=1):
     for _ in range(max_retries):
         order_status = client.get_order(symbol=symbol, orderId=order_id)
@@ -671,13 +521,13 @@ def monitor_and_update_trailing_stop(client, symbol, order_id, ts_manager, trade
 
 def check_margin(client, symbol, capital, leverage):
     try:
-        account_info = client.get_account()
-        available_balance = float(account_info['availableBalance'])
+        account_info = client.account()
+        balance = float(account_info['availableBalance'])
         required_margin = float(capital)
-        logger.info(f"[Margin Check] Available Balance: {available_balance} USDT, Required Margin: {required_margin} USDT")
-        send_telegram_alert(f"Margin verification for {symbol} - Available Balance: {available_balance} USDT, Required Margin: {required_margin} USDT")
-        if available_balance < required_margin:
-            logger.error(f"[Margin Check] Insufficient margin. Available: {available_balance} USDT, Required: {required_margin} USDT")
+        logger.info(f"[Margin Check] Available Balance: {balance} USDT, Required Margin: {required_margin} USDT")
+        send_telegram_alert(f"Margin verification for {symbol} - Available Balance: {balance} USDT, Required Margin: {required_margin} USDT")
+        if balance < required_margin:
+            logger.error(f"[Margin Check] Insufficient margin. Available: {balance} USDT, Required: {required_margin} USDT")
             send_telegram_alert(f"Margin {symbol} - Insufficient margin.")
             return False
         return True
@@ -687,7 +537,7 @@ def check_margin(client, symbol, capital, leverage):
 
 def get_min_qty(client, symbol):
     try:
-        info = client.get_exchange_info()
+        info = client.exchange_info()
         for s in info['symbols']:
             if s['symbol'] == symbol:
                 for f in s['filters']:
@@ -709,35 +559,15 @@ for symbol in SYMBOLS:
     except Exception as e:
         logger.error(f"[OrderManager] Failed to process {symbol}: {e}")
 
-def get_db_connection():
-    try:
-        conn = connection_pool.getconn()
-        conn.set_client_encoding('UTF8')
-        logger.debug(f"[DEBUG] Client encoding: UTF8")
-        return conn
-    except Exception as e:
-        logger.error(f"[db_handler] Error getting database connection: {e}")
-        raise
-
-def release_db_connection(conn):
-    try:
-        connection_pool.putconn(conn)
-    except Exception as e:
-        logger.error(f"[db_handler] Error releasing database connection: {e}")
-
 def insert_or_update_order(order):
     conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-
-        # Validation robuste de l'order_id
         order_id = str(order.get('orderId', '')) or str(order.get('order_id', ''))
         if not order_id:
             logger.error("No valid orderId found in order data")
             return
-
-        # Validation des autres champs
         symbol = str(order.get('symbol', ''))
         status = str(order.get('status', 'UNKNOWN'))
         side = str(order.get('side', 'UNKNOWN')).upper()
@@ -745,7 +575,6 @@ def insert_or_update_order(order):
         price = float(order.get('price', 0))
         timestamp = int(order.get('time', order.get('timestamp', time.time() * 1000)))
         client_order_id = str(order.get('clientOrderId', order.get('client_order_id', '')))
-
         query = """
         INSERT INTO orders (order_id, symbol, status, side, quantity, price, timestamp, client_order_id)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s)

@@ -12,7 +12,7 @@ from confluent_kafka import Consumer
 from src.data_ingestion.data_formatter import format_candle
 from src.processing_core.lstm_model import train_or_load_model
 from src.processing_core.signal_generator import check_signal
-from src.trade_execution.order_manager import place_order, init_trailing_stop_manager, EnhancedOrderManager, check_open_position
+from src.trade_execution.order_manager import place_order, init_trailing_stop_manager, EnhancedOrderManager
 from src.trade_execution.sync_orders import get_current_atr, sync_binance_trades_with_postgres
 from src.database.db_handler import insert_trade, insert_signal, insert_metrics, create_tables, insert_price_data, clean_old_data, update_trade_on_close
 from src.processing_core.signal_generator import prepare_lstm_input, select_strategy_mode
@@ -158,20 +158,63 @@ def handle_order_update(message):
             }
             logger.debug(f"[WebSocket] Processing order update for {order_data['symbol']}: order_id={order_data['order_id']}, trade_id={order_data['trade_id']}, status={order_data['status']}")
             if order_data['status'] == 'filled':
-                trade_data = {
-                    'order_id': order_data['order_id'],
-                    'symbol': order_data['symbol'],
-                    'side': order_data['side'],
-                    'quantity': order_data['quantity'],
-                    'price': order_data['price'],
-                    'stop_loss': None,
-                    'take_profit': None,
-                    'timestamp': order_data['timestamp'],
-                    'pnl': 0.0,
-                    'is_trailing': order_data['is_trailing'],
-                    'trade_id': order_data['trade_id']
-                }
-                insert_trade(trade_data)
+                if order_data['is_trailing']:
+                    # Trailing stop exécuté
+                    symbol = order_data['symbol']
+                    trade_id = order_data['trade_id']
+                    exit_price = order_data['price']
+                    if symbol in ts_manager.stops and ts_manager.stops[symbol].trade_id == trade_id:
+                        qty = ts_manager.stops[symbol].quantity
+                        entry_price = ts_manager.stops[symbol].entry_price
+                        position_type = ts_manager.stops[symbol].position_type
+                        if position_type == 'long':
+                            pnl = (exit_price - entry_price) * qty
+                        else:
+                            pnl = (entry_price - exit_price) * qty
+                        connection_pool.execute_query(
+                            "UPDATE trades SET status = 'CLOSED', exit_price = %s, realized_pnl = %s, close_timestamp = %s WHERE trade_id = %s",
+                            (exit_price, pnl, int(time.time()), trade_id)
+                        )
+                        ts_manager.close_position(symbol)
+                        current_positions[symbol] = None
+                        logger.info(f"[WebSocket] Trailing stop executed for {symbol}, trade_id={trade_id}, PNL={pnl}")
+                    else:
+                        logger.warning(f"[WebSocket] Trailing stop mismatch for {symbol}, trade_id={trade_id}")
+                else:
+                    # Ordre normal (non trailing stop)
+                    trade_data = {
+                        'order_id': order_data['order_id'],
+                        'symbol': order_data['symbol'],
+                        'side': order_data['side'],
+                        'quantity': order_data['quantity'],
+                        'price': order_data['price'],
+                        'stop_loss': None,
+                        'take_profit': None,
+                        'timestamp': order_data['timestamp'],
+                        'pnl': 0.0,
+                        'is_trailing': order_data['is_trailing'],
+                        'trade_id': order_data['trade_id']
+                    }
+                    insert_trade(trade_data)
+                    current_positions[order_data['symbol']] = {
+                        'side': order_data['side'],
+                        'quantity': order_data['quantity'],
+                        'price': order_data['price'],
+                        'trade_id': order_data['trade_id']
+                    }
+                    atr = get_current_atr(client, order_data['symbol'])
+                    if atr > 0:
+                        ts_manager.initialize_trailing_stop(
+                            symbol=order_data['symbol'],
+                            entry_price=order_data['price'],
+                            position_type='long' if order_data['side'] == 'buy' else 'short',
+                            quantity=order_data['quantity'],
+                            atr=atr,
+                            trade_id=order_data['trade_id']
+                        )
+                        trade_data['is_trailing'] = True
+                        insert_trade(trade_data)
+                        logger.info(f"[WebSocket] Initialized trailing stop for {order_data['symbol']}, trade_id={order_data['trade_id']}")
                 
                 # Create a table for the trade
                 table = Table(title=f"Trade Executed for {order_data['symbol']}")
@@ -185,35 +228,37 @@ def handle_order_update(message):
                 table.add_row("Timestamp", str(order_data['timestamp']))
                 table.add_row("Trade ID", order_data['trade_id'])
                 console.log(table)
-                
-                if not order_data['is_trailing']:
-                    atr = get_current_atr(client, order_data['symbol'])
-                    if atr <= 0:
-                        logger.error(f"❌ [Trailing Stop] Invalid ATR for {order_data['symbol']}: {atr}")
-                        return
-                    position_type = 'long' if order_data['side'] == 'buy' else 'short'
-                    ts_manager.initialize_trailing_stop(
-                        symbol=order_data['symbol'],
-                        entry_price=order_data['price'],
-                        position_type=position_type,
-                        quantity=order_data['quantity'],
-                        atr=atr,
-                        trade_id=order_data['trade_id']
+            
+            elif order_data['status'] in ['canceled', 'rejected', 'expired']:
+                if order_data['is_trailing'] and ts_manager.has_trailing_stop(order_data['symbol']):
+                    ts_manager.close_position(order_data['symbol'])
+                    logger.info(f"[WebSocket] Trailing stop order {order_data['order_id']} for {order_data['symbol']} {order_data['status']}")
+            
+            # Vérifier si la position est toujours ouverte sur Binance
+            positions = client.get_position_risk(symbol=order_data['symbol'])
+            position = next((p for p in positions if p['symbol'] == order_data['symbol'] and float(p['positionAmt']) != 0), None)
+            if not position and current_positions.get(order_data['symbol']):
+                trade_id = current_positions[order_data['symbol']].get('trade_id')
+                if trade_id:
+                    ticker = client.get_symbol_ticker(symbol=order_data['symbol'])
+                    exit_price = float(ticker['price'])
+                    qty = float(current_positions[order_data['symbol']]['quantity'])
+                    entry_price = float(current_positions[order_data['symbol']]['price'])
+                    side = current_positions[order_data['symbol']]['side']
+                    if side == 'long':
+                        pnl = (exit_price - entry_price) * qty
+                    else:
+                        pnl = (entry_price - exit_price) * qty
+                    connection_pool.execute_query(
+                        "UPDATE trades SET status = 'CLOSED', exit_price = %s, realized_pnl = %s, close_timestamp = %s WHERE trade_id = %s",
+                        (exit_price, pnl, int(time.time()), trade_id)
                     )
-                    current_positions[order_data['symbol']] = {
-                        'side': order_data['side'],
-                        'quantity': order_data['quantity'],
-                        'price': order_data['price'],
-                        'trade_id': order_data['trade_id']
-                    }
-                    logger.info(f"[WebSocket] Initialized trailing stop for {order_data['order_id']} ({order_data['symbol']}), trade_id={order_data['trade_id']} 📈")
-                if order_data['is_trailing']:
-                    current_price = order_manager.get_current_price(order_data['symbol'])
-                    if current_price:
-                        ts_manager.update_trailing_stop(order_data['symbol'], current_price, trade_id=order_data['trade_id'])
-                        logger.info(f"[WebSocket] Updated trailing stop for {order_data['symbol']} at price {current_price:.4f}, trade_id={order_data['trade_id']} 🔄")
+                    ts_manager.close_position(order_data['symbol'])
+                    current_positions[order_data['symbol']] = None
+                    logger.info(f"[WebSocket] Position closed for {order_data['symbol']}, trade_id={trade_id}, PNL={pnl}")
     except Exception as e:
         logger.error(f"❌ [WebSocket] Error handling order update: {str(e)}")
+        send_telegram_alert(f"WebSocket order update error: {str(e)}")
 
 def start_websocket():
     max_retries = 5
@@ -258,29 +303,34 @@ async def trailing_stop_updater():
             logger.debug(f"[Trailing Stop] Current positions: {current_positions}")
             logger.debug(f"[Trailing Stop] Trailing stops: {ts_manager.stops}")
             for symbol in SYMBOLS:
-                # Check for open positions using check_open_position
-                side = current_positions[symbol]['side'] if current_positions[symbol] else None
-                try:
-                    has_position, position_qty = check_open_position(client, symbol, side, current_positions)
-                    logger.debug(f"[Trailing Stop] Position check for {symbol}: has_position={has_position}, qty={position_qty}")
-                except Exception as e:
-                    logger.error(f"❌ [Trailing Stop] Failed to check position for {symbol}: {e}")
-                    send_telegram_alert(f"Failed to check position for {symbol}: {str(e)}")
-                    has_position = False
-                    position_qty = 0.0
-
-                if current_positions[symbol] is not None and not has_position:
-                    logger.warning(f"[Trailing Stop] No open position on Binance for {symbol}, clearing position")
-                    current_positions[symbol] = None
-                    if ts_manager.has_trailing_stop(symbol):
+                # Vérifier si la position existe sur Binance
+                positions = client.get_position_risk(symbol=symbol)
+                position = next((p for p in positions if p['symbol'] == symbol and float(p['positionAmt']) != 0), None)
+                if current_positions.get(symbol) and not position:
+                    # Position fermée sur Binance
+                    trade_id = current_positions[symbol].get('trade_id')
+                    if trade_id:
+                        ticker = client.get_symbol_ticker(symbol=symbol)
+                        exit_price = float(ticker['price'])
+                        qty = float(current_positions[symbol]['quantity'])
+                        entry_price = float(current_positions[symbol]['price'])
+                        side = current_positions[symbol]['side']
+                        if side == 'long':
+                            pnl = (exit_price - entry_price) * qty
+                        else:
+                            pnl = (entry_price - exit_price) * qty
+                        connection_pool.execute_query(
+                            "UPDATE trades SET status = 'CLOSED', exit_price = %s, realized_pnl = %s, close_timestamp = %s WHERE trade_id = %s",
+                            (exit_price, pnl, int(time.time()), trade_id)
+                        )
                         ts_manager.close_position(symbol)
-                        logger.info(f"[Trailing Stop] Closed trailing stop for {symbol}")
+                        current_positions[symbol] = None
+                        logger.info(f"[Trailing Stop] Position closed for {symbol}, trade_id={trade_id}, PNL={pnl}")
                     continue
                 
-                if current_positions[symbol] is not None:
+                if current_positions.get(symbol) and position:
                     trade_id = current_positions[symbol].get('trade_id')
                     if not trade_id and ts_manager.has_trailing_stop(symbol):
-                        # Fallback to trade_id from ts_manager.stops
                         trade_id = ts_manager.stops[symbol].trade_id
                         logger.warning(f"[Trailing Stop] Missing trade_id in current_positions for {symbol}, using ts_manager trade_id={trade_id}")
                     if not trade_id:
@@ -290,23 +340,18 @@ async def trailing_stop_updater():
                     current_price = order_manager.get_current_price(symbol)
                     if current_price:
                         ts_manager.update_trailing_stop(symbol, current_price, trade_id=trade_id)
-                        # Create a table for trailing stop update
-                        table = Table(title=f"Trailing Stop Update for {symbol}")
-                        table.add_column("Field", style="cyan")
-                        table.add_column("Value", style="magenta")
-                        table.add_row("Symbol", symbol)
-                        table.add_row("Current Price", f"{current_price:.4f}")
-                        table.add_row("Stop Price", f"{ts_manager.stops[symbol].current_stop_price:.4f}")
-                        table.add_row("Trade ID", trade_id)
-                        console.log(table)
-                        logger.info(f"[Trailing Stop] Updated trailing stop for {symbol} at price {current_price:.4f}, trade_id={trade_id} 🔄")
+                        if ts_manager.has_trailing_stop(symbol):
+                            table = Table(title=f"Trailing Stop Update for {symbol}")
+                            table.add_column("Field", style="cyan")
+                            table.add_column("Value", style="magenta")
+                            table.add_row("Symbol", symbol)
+                            table.add_row("Current Price", f"{current_price:.4f}")
+                            table.add_row("Stop Price", f"{ts_manager.stops[symbol].current_stop_price:.4f}")
+                            table.add_row("Trade ID", trade_id)
+                            console.log(table)
+                            logger.info(f"[Trailing Stop] Updated trailing stop for {symbol} at price {current_price:.4f}, trade_id={trade_id} 🔄")
                     else:
                         logger.warning(f"[Trailing Stop] Failed to get current price for {symbol}")
-                    # Verify order execution
-                    if ts_manager.has_trailing_stop(symbol):
-                        if ts_manager.stops[symbol].verify_order_execution():
-                            current_positions[symbol] = None  # Clear position after execution
-                            logger.info(f"[Trailing Stop] Position closed for {symbol}, trade_id={trade_id}")
                 elif ts_manager.has_trailing_stop(symbol):
                     logger.warning(f"[Trailing Stop] Inconsistent state: trailing stop exists for {symbol} but no position in current_positions")
                     ts_manager.close_position(symbol)
@@ -355,7 +400,7 @@ async def main():
     models = {symbol: None for symbol in SYMBOLS}
     scalers = {symbol: None for symbol in SYMBOLS}
     last_sync_time = time.time()
-    sync_interval = 120  # Increased to 2 minutes to reduce race conditions
+    sync_interval = 120  # 2 minutes
     last_metrics_update = {symbol: 0 for symbol in SYMBOLS}
 
     try:
@@ -406,16 +451,15 @@ async def main():
                                                   "close_time", "quote_asset_vol", "num_trades", "taker_buy_base_vol",
                                                   "taker_buy_quote_vol", "ignore"])
         data_hist = data_hist[["open_time", "open", "high", "low", "close", "volume"]].astype(float)
-        dataframes[symbol] = data_hist.rename(columns={"open_time": "timestamp"})
-        dataframes[symbol]["timestamp"] = pd.to_datetime(dataframes[symbol]["timestamp"], unit="ms")
-        dataframes[symbol].set_index("timestamp", inplace=True)
-        dataframes[symbol] = dataframes[symbol].tail(500)
-        df = calculate_indicators(dataframes[symbol], symbol)
+        data_hist["timestamp"] = pd.to_datetime(data_hist["open_time"], unit="ms")
+        data_hist.set_index("timestamp", inplace=True)
+        dataframes[symbol] = data_hist.tail(500)
+        dataframes[symbol] = calculate_indicators(dataframes[symbol], symbol)
         required_cols = ['close', 'volume', 'RSI', 'MACD', 'ADX']
-        if df is not None and not df.empty and all(col in df.columns for col in required_cols):
+        if dataframes[symbol] is not None and not dataframes[symbol].empty and all(col in dataframes[symbol].columns for col in required_cols):
             logger.info(f"[Main] Indicators calculated successfully for {symbol}")
         else:
-            logger.error(f"[Main] Failed to calculate indicators for {symbol}, DataFrame: {df.columns.tolist() if df is not None else 'None'}")
+            logger.error(f"[Main] Failed to calculate indicators for {symbol}, DataFrame: {dataframes[symbol].columns.tolist() if dataframes[symbol] is not None else 'None'}")
 
         logger.info(f"[Main] Training or loading LSTM model for {symbol} 🤖")
         models[symbol], scalers[symbol] = train_or_load_model(dataframes[symbol], symbol)
@@ -462,10 +506,14 @@ async def main():
                 logger.info("[MainBot] Running periodic trade sync... 🚀")
                 try:
                     sync_binance_trades_with_postgres(client, SYMBOLS, ts_manager, current_positions)
+                    order_manager.clean_orphaned_trailing_stops(ts_manager)  # Nettoyer les trailing stops orphelins
                     logger.debug(f"[MainBot] Current positions after sync: {current_positions}")
                 except psycopg2.pool.PoolError as e:
                     logger.error(f"❌ [MainBot] Failed to sync trades due to connection pool exhaustion: {e}")
                     send_telegram_alert(f"Failed to sync trades: connection pool exhausted")
+                    # Réessayer après un délai
+                    await asyncio.sleep(60)
+                    continue
                 last_sync_time = current_time
 
             if iteration_count % 10 == 0:
@@ -564,7 +612,6 @@ async def main():
                             if order_details[symbol]:
                                 logger.debug(f"[main_bot] New position from signal: {new_position}")
                                 logger.debug(f"[main_bot] Order details: {order_details[symbol]}")
-                                # Update current_positions with order_details to ensure trade_id and price
                                 current_positions[symbol] = {
                                     'side': 'long' if action == 'buy' else 'short',
                                     'quantity': order_details[symbol]['quantity'],
@@ -625,8 +672,20 @@ async def main():
                                     close_price = float(order_details[symbol]["price"])
                                     side = last_order_details[symbol]["side"]
                                     qty = float(last_order_details[symbol]["quantity"])
-                                    pnl = (close_price - open_price) * qty if side == "buy" else (open_price - close_price) * qty
+                                    if side == "buy":
+                                        pnl = (close_price - open_price) * qty
+                                    else:
+                                        pnl = (open_price - close_price) * qty
                                     order_details[symbol]["pnl"] = pnl
+                                    trade_id = last_order_details[symbol].get("trade_id")
+                                    if trade_id:
+                                        connection_pool.execute_query(
+                                            "UPDATE trades SET status = 'CLOSED', exit_price = %s, realized_pnl = %s, close_timestamp = %s WHERE trade_id = %s",
+                                            (close_price, pnl, int(time.time()), trade_id)
+                                        )
+                                        ts_manager.close_position(symbol)
+                                        current_positions[symbol] = None
+                                        logger.info(f"[Main] Position closed for {symbol}, trade_id={trade_id}, PNL={pnl}")
                                 table = Table(title=f"Trade Closed for {symbol}")
                                 table.add_column("Field", style="cyan")
                                 table.add_column("Value", style="magenta")
@@ -638,7 +697,8 @@ async def main():
                                 table.add_row("Confidence Score", f"{confidence:.2f}")
                                 table.add_row("Confidence Factors", ", ".join(confidence_factors) if confidence_factors else "None")
                                 console.log(table)
-                            current_positions[symbol] = None
+                            else:
+                                logger.error(f"❌ [Order] Failed to place {close_side} order for {symbol}")
                         except (TypeError, ValueError, IndexError, psycopg2.pool.PoolError) as e:
                             logger.error(f"❌ [Order] Error closing {action} order for {symbol}: {e}")
                             send_telegram_alert(f"Error closing {action} order for {symbol}: {str(e)}")
@@ -684,9 +744,6 @@ else:
         finally:
             loop.close()
 
-import asyncio
-import signal
-
 def handle_shutdown(loop):
     logger.info("Shutdown initiated. Cancelling all tasks...")
     tasks = [task for task in asyncio.all_tasks(loop) if task is not asyncio.current_task()]
@@ -696,29 +753,6 @@ def handle_shutdown(loop):
     loop.run_until_complete(loop.shutdown_asyncgens())
     loop.close()
     logger.info("Shutdown completed gracefully.")
-
-async def main():
-    try:
-        # Existing main logic here
-        await asyncio.gather(
-            trailing_stop_updater(),
-            fetch_price_data_fallback(),
-            # Add other coroutines if needed
-        )
-    except KeyboardInterrupt:
-        logger.info("Received KeyboardInterrupt, shutting down...")
-        handle_shutdown(asyncio.get_event_loop())
-    finally:
-        # Close Kafka consumer, WebSocket client, etc.
-        logger.info("Closing resources...")
-        try:
-            consumer.close()
-        except Exception:
-            pass
-        try:
-            connection_pool.closeall()
-        except Exception:
-            pass
 
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
