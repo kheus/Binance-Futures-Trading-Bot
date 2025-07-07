@@ -240,6 +240,7 @@ Open an issue on GitHub or reach out via your configured Telegram bot.
 
 **Happy Trading 🚀**
 
+```bash
 git add C:\Users\Cheikh\binance-trading-bot\src\database\db_handler.py 
 git add C:\Users\Cheikh\binance-trading-bot\src\database\schema.sql 
 git add C:\Users\Cheikh\binance-trading-bot\src\performance\tracker.py 
@@ -257,3 +258,4 @@ git add C:\Users\Cheikh\binance-trading-bot\Readme.md
 git add C:\Users\Cheikh\binance-trading-bot\src\processing_core\indicators.py
 git commit -m "Updates" 
 git push -u origin master
+```
