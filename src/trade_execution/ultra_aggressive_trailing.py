@@ -104,11 +104,11 @@ class UltraAgressiveTrailingStop:
             logger.error(f"[{self.symbol}] ❌ Invalid current_price: {current_price}")
             return None
 
-        # Use ATR-based trailing distance for adaptability
-        trailing_distance = max(self.trailing_distance, atr * 2 / current_price)
+        # Use ATR-based trailing distance with min 0.1% and max 2%
+        atr_trailing = min(max(atr / self.entry_price, 0.001), 0.02)
         stop_price = (
-            current_price * (1 - trailing_distance) if position_type == 'long'
-            else current_price * (1 + trailing_distance)
+            current_price * (1 - atr_trailing) if position_type == 'long'
+            else current_price * (1 + atr_trailing)
         )
         stop_price = round(stop_price, self.price_precision)
 
@@ -143,8 +143,8 @@ class UltraAgressiveTrailingStop:
                 )
                 self.trailing_stop_order_id = order['orderId']
                 self.current_stop_price = stop_price
-                logger.info(f"[{self.symbol}] ✅ Trailing stop placed (order {self.trailing_stop_order_id}) at {stop_price} (Qty: {self.quantity}, trade_id: {self.trade_id})")
-                send_telegram_alert(f"Trailing stop placed for {self.symbol} at {stop_price:.2f}, Qty: {self.quantity:.4f}, trade_id: {self.trade_id}")
+                logger.info(f"[{self.symbol}] ✅ Trailing stop placed (order {self.trailing_stop_order_id}) at {stop_price} (Qty: {self.quantity}, trade_id: {self.trade_id}, atr_trailing: {atr_trailing:.4f})")
+                send_telegram_alert(f"Trailing stop placed for {self.symbol} at {stop_price:.2f}, Qty: {self.quantity:.4f}, trade_id: {self.trade_id}, ATR trailing: {atr_trailing:.4f}")
                 return self.trailing_stop_order_id
             except BinanceAPIException as e:
                 if e.code == -2021:  # Order would immediately trigger
@@ -187,11 +187,12 @@ class UltraAgressiveTrailingStop:
                 logger.error(f"[{self.symbol}] ❌ Invalid current_price: {current_price}")
                 return
 
+            # Use ATR-based trailing distance with min 0.1% and max 2%
             atr = get_current_atr(self.client, self.symbol)
-            trailing_distance = max(self.trailing_distance, atr * 2 / current_price) if atr else self.trailing_distance
+            atr_trailing = min(max(atr / self.entry_price, 0.001), 0.02) if atr else self.trailing_distance
             new_stop = (
-                current_price * (1 - trailing_distance) if self.position_type == 'long'
-                else current_price * (1 + trailing_distance)
+                current_price * (1 - atr_trailing) if self.position_type == 'long'
+                else current_price * (1 + atr_trailing)
             )
             new_stop = round(new_stop, self.price_precision)
 
@@ -201,7 +202,7 @@ class UltraAgressiveTrailingStop:
             )
 
             logger.debug(f"[{self.symbol}] Checking update: new_stop={new_stop}, current_stop_price={self.current_stop_price}, "
-                        f"should_update={should_update}, position_type={self.position_type}, price_tick={self.price_tick}")
+                        f"should_update={should_update}, position_type={self.position_type}, price_tick={self.price_tick}, atr_trailing={atr_trailing:.4f}")
 
             if should_update:
                 for attempt in range(self.max_retries):
@@ -221,8 +222,8 @@ class UltraAgressiveTrailingStop:
                         )
                         self.trailing_stop_order_id = order['orderId']
                         self.current_stop_price = new_stop
-                        logger.info(f"[{self.symbol}] 🔄 Trailing stop updated to {new_stop} (order {self.trailing_stop_order_id}, trade_id: {self.trade_id})")
-                        send_telegram_alert(f"Trailing stop updated for {self.symbol} to {new_stop:.2f}, trade_id: {self.trade_id}")
+                        logger.info(f"[{self.symbol}] 🔄 Trailing stop updated to {new_stop} (order {self.trailing_stop_order_id}, trade_id: {self.trade_id}, atr_trailing: {atr_trailing:.4f})")
+                        send_telegram_alert(f"Trailing stop updated for {self.symbol} to {new_stop:.2f}, trade_id: {self.trade_id}, ATR trailing: {atr_trailing:.4f}")
                         return
                     except BinanceAPIException as e:
                         if e.code == -2021:
