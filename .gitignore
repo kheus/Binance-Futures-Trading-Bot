@@ -1,4 +1,4 @@
-# virtual environment
+﻿# virtual environment
 .venv/
 venv/
 env/
@@ -17,3 +17,4 @@ config/kafka_config_local.yaml
 *.log
 *.h5
 *.keras
+

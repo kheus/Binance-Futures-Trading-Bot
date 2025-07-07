@@ -13,7 +13,7 @@ postgresql:
   port: 5432
   database: 'trading_bot'
   user: 'postgres'
-  password: 'Cheikh12'
+  password: 'postgres'
 "@ | Out-File -FilePath config/db_config.yaml -Encoding utf8
 
 # Create database if it doesn't exist

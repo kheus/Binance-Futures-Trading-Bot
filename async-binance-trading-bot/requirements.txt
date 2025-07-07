@@ -1,0 +1,8 @@
+asyncio
+binance
+pyyaml
+pandas
+logging
+aiohttp
+numpy
+rich

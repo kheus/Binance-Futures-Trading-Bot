@@ -9,6 +9,32 @@ from src.monitoring.alerting import send_telegram_alert
 
 logger = logging.getLogger(__name__)
 
+def get_exchange_precision(client, symbol):
+    """Récupère les règles de précision exactes depuis l'API Binance"""
+    try:
+        info = client.exchange_info()
+        symbol_info = next((s for s in info['symbols'] if s['symbol'] == symbol), None)
+        if not symbol_info:
+            raise ValueError(f"Symbol {symbol} not found")
+        filters = {f['filterType']: f for f in symbol_info['filters']}
+        return {
+            'price_tick': float(filters['PRICE_FILTER']['tickSize']),
+            'qty_step': float(filters['LOT_SIZE']['stepSize']),
+            'min_qty': float(filters['LOT_SIZE']['minQty']),
+            'price_precision': symbol_info['pricePrecision'],
+            'qty_precision': symbol_info['quantityPrecision']
+        }
+    except Exception as e:
+        logger.error(f"Error getting precision for {symbol}: {e}")
+        # Valeurs par défaut pour XRP/USDT
+        return {
+            'price_tick': 0.0001,
+            'qty_step': 1.0,
+            'min_qty': 1.0,
+            'price_precision': 4,
+            'qty_precision': 0
+        }
+
 class UltraAgressiveTrailingStop:
     def __init__(self, client, symbol, trailing_distance=0.001):  # 0.1% trailing distance
         self.client = client
@@ -29,16 +55,10 @@ class UltraAgressiveTrailingStop:
     def _get_price_tick(self):
         """Fetch price tick size and precision for the symbol from Binance exchange info."""
         try:
-            exchange_info = self.client.exchange_info()
-            for symbol_info in exchange_info['symbols']:
-                if symbol_info['symbol'] == self.symbol:
-                    price_filter = next(f for f in symbol_info['filters'] if f['filterType'] == 'PRICE_FILTER')
-                    qty_filter = next(f for f in symbol_info['filters'] if f['filterType'] == 'LOT_SIZE')
-                    self.price_precision = symbol_info['pricePrecision']
-                    self.qty_precision = symbol_info['quantityPrecision']
-                    return float(price_filter['tickSize'])
-            logger.warning(f"[{self.symbol}] ⚠️ Symbol not found in exchange info. Using default tick size 0.0001")
-            return 0.0001
+            rules = get_exchange_precision(self.client, self.symbol)
+            self.price_precision = rules['price_precision']
+            self.qty_precision = rules['qty_precision']
+            return rules['price_tick']
         except Exception as e:
             logger.warning(f"[{self.symbol}] ⚠️ Could not fetch price tick: {e}. Using default 0.0001")
             return 0.0001
@@ -58,7 +78,7 @@ class UltraAgressiveTrailingStop:
     def initialize_trailing_stop(self, entry_price, position_type, quantity, atr, trade_id):
         self.entry_price = float(entry_price)
         self.position_type = position_type
-        self.quantity = format_quantity(self.symbol, float(quantity))
+        self.quantity = format_quantity(self.client, self.symbol, float(quantity))
         self.trade_id = str(trade_id).replace('trade_', '')  # Normalize trade_id
         self.active = True
 
@@ -287,7 +307,7 @@ class UltraAgressiveTrailingStop:
             logger.error(f"[{self.symbol}] ❌ No active trailing stop to adjust")
             return
 
-        new_quantity = format_quantity(self.symbol, float(new_quantity))
+        new_quantity = format_quantity(self.client, self.symbol, float(new_quantity))
         if new_quantity <= 0:
             logger.error(f"[{self.symbol}] ❌ Invalid new quantity: {new_quantity}")
             return
@@ -351,12 +371,22 @@ class TrailingStopManager:
 def init_trailing_stop_manager(client):
     return TrailingStopManager(client)
 
-def format_price(symbol, price):
-    if symbol in ['BTCUSDT', 'ETHUSDT']:
-        return round(float(price), 2)
-    return round(float(price), 4)
+def format_price(client, symbol, price):
+    try:
+        rules = get_exchange_precision(client, symbol)
+        return round(float(price), rules['price_precision'])
+    except Exception as e:
+        logger.warning(f"[{symbol}] ⚠️ Could not fetch price precision: {e}. Using default precision.")
+        if symbol in ['BTCUSDT', 'ETHUSDT']:
+            return round(float(price), 2)
+        return round(float(price), 4)
 
-def format_quantity(symbol, quantity):
-    if symbol in ['BTCUSDT', 'ETHUSDT']:
-        return round(float(quantity), 3)
-    return round(float(quantity), 2)
+def format_quantity(client, symbol, quantity):
+    try:
+        rules = get_exchange_precision(client, symbol)
+        return round(float(quantity), rules['qty_precision'])
+    except Exception as e:
+        logger.warning(f"[{symbol}] ⚠️ Could not fetch quantity precision: {e}. Using default precision.")
+        if symbol in ['BTCUSDT', 'ETHUSDT']:
+            return round(float(quantity), 3)
+        return round(float(quantity), 2)

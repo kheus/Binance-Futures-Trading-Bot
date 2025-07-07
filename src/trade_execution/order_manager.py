@@ -4,7 +4,7 @@
     from src.trade_execution.correlation_monitor import CorrelationMonitor
     from src.trade_execution.trade_analyzer import TradeAnalyzer
     from src.monitoring.metrics import get_current_atr
-    from src.trade_execution.ultra_aggressive_trailing import TrailingStopManager, format_price, format_quantity
+    from src.trade_execution.ultra_aggressive_trailing import TrailingStopManager, format_price, format_quantity, get_exchange_precision
     from src.database.db_handler import get_db_connection, release_db_connection, wait_until_order_finalized
 except ImportError:
     SIDE_BUY = 'BUY'
@@ -28,6 +28,7 @@ from rich.table import Table
 from rich.console import Console
 import json
 from src.trade_execution.market_crash_protector import MarketCrashProtector
+from binance.exceptions import BinanceAPIException
 
 console = Console()
 logger = logging.getLogger(__name__)
@@ -111,46 +112,20 @@ def init_trailing_stop_manager(client):
             release_db_connection(conn)
     return ts_manager
 
-def get_exchange_precision(client, symbol):
-    """Récupère les règles de précision exactes depuis l'API Binance"""
-    try:
-        info = client.exchange_info()
-        symbol_info = next((s for s in info['symbols'] if s['symbol'] == symbol), None)
-        if not symbol_info:
-            raise ValueError(f"Symbol {symbol} not found")
-        filters = {f['filterType']: f for f in symbol_info['filters']}
-        return {
-            'price_tick': float(filters['PRICE_FILTER']['tickSize']),
-            'qty_step': float(filters['LOT_SIZE']['stepSize']),
-            'min_qty': float(filters['LOT_SIZE']['minQty']),
-            'price_precision': symbol_info['pricePrecision'],
-            'qty_precision': symbol_info['quantityPrecision']
-        }
-    except Exception as e:
-        logger.error(f"Error getting precision for {symbol}: {e}")
-        # Valeurs par défaut pour XRP/USDT
-        return {
-            'price_tick': 0.0001,
-            'qty_step': 1.0,
-            'min_qty': 1.0,
-            'price_precision': 4,
-            'qty_precision': 0
-        }
-
 def place_order(signal, price, atr, client, symbol, capital, leverage, trade_id=None):
     try:
         rules = get_exchange_precision(client, symbol)
         logger.info(f"Precision rules for {symbol}: {rules}")
 
-        price = format_price(symbol, price)
+        price = format_price(client, symbol, price)
         qty = (capital * leverage) / price
-        qty = format_quantity(symbol, qty)
+        qty = format_quantity(client, symbol, qty)
         qty = max(qty, rules['min_qty'])
 
         logger.info(f"""
 Order details for {symbol}:
 Original Price: {price}
-Rounded Price: {format_price(symbol, price)}
+Rounded Price: {format_price(client, symbol, price)}
 Capital: {capital}
 Leverage: {leverage}
 Raw Qty: {(capital * leverage) / price}
@@ -183,8 +158,37 @@ Rules: {rules}
         avg_price = float(order_status.get('avgPrice', price))
         position_type = "long" if signal == "buy" else "short"
 
-        # Store trade in database
+        # Initialize trailing stop
+        ts_id = None
+        stop_loss = None
         trade_id = trade_id or str(int(time.time()))
+        has_position, position_qty = EnhancedOrderManager(client, [symbol]).check_open_position(symbol, signal, {})
+        if has_position:
+            ts_id = ts_manager.initialize_trailing_stop(
+                symbol=symbol,
+                entry_price=avg_price,
+                position_type=position_type,
+                quantity=qty,
+                atr=atr,
+                trade_id=trade_id
+            )
+            if ts_id:
+                stop_loss = ts_manager.get_current_stop_price(symbol, trade_id=trade_id)
+                logger.info(f"[OrderManager] Initialized trailing stop for {symbol}, trade_id={trade_id}, stop_loss={stop_loss}")
+            else:
+                logger.error(f"[OrderManager] Trailing stop init failed for {symbol}, trade_id={trade_id}. Canceling order.")
+                try:
+                    client.cancel_order(symbol=symbol, orderId=order_id)
+                    conn = get_db_connection()
+                    cursor = conn.cursor()
+                    cursor.execute("UPDATE trades SET status = 'CANCELED' WHERE trade_id = %s", (trade_id,))
+                    conn.commit()
+                    release_db_connection(conn)
+                except Exception as e:
+                    logger.error(f"[OrderManager] Failed to cancel order {order_id} for {symbol}: {e}")
+                return None
+
+        # Store trade in database with trailing stop details
         conn = get_db_connection()
         cursor = conn.cursor()
         query = """
@@ -200,48 +204,10 @@ Rules: {rules}
             timestamp = EXCLUDED.timestamp
         """
         cursor.execute(query, (
-            str(order_id), symbol, signal.upper(), qty, avg_price, None, False, trade_id, 'new', int(time.time() * 1000)
+            str(order_id), symbol, signal.upper(), qty, avg_price, stop_loss, bool(ts_id), trade_id, 'OPEN' if ts_id else 'new', int(time.time() * 1000)
         ))
         conn.commit()
         release_db_connection(conn)
-
-        # Initialize trailing stop
-        ts_id = None
-        stop_loss = None
-        has_position, position_qty = EnhancedOrderManager(client, [symbol]).check_open_position(symbol, signal, {})
-        if has_position:
-            ts_id = ts_manager.initialize_trailing_stop(
-                symbol=symbol,
-                entry_price=avg_price,
-                position_type=position_type,
-                quantity=qty,
-                atr=atr,
-                trade_id=trade_id
-            )
-            if ts_id:
-                # Update trades table with trailing stop details
-                conn = get_db_connection()
-                cursor = conn.cursor()
-                stop_loss = ts_manager.get_current_stop_price(symbol, trade_id=trade_id)
-                cursor.execute(
-                    "UPDATE trades SET is_trailing = %s, stop_loss = %s, status = %s WHERE trade_id = %s",
-                    (True, stop_loss, 'OPEN', trade_id)
-                )
-                conn.commit()
-                release_db_connection(conn)
-                logger.info(f"[OrderManager] Initialized trailing stop for {symbol}, trade_id={trade_id}, stop_loss={stop_loss}")
-            else:
-                logger.error(f"[OrderManager] Trailing stop init failed for {symbol}, trade_id={trade_id}. Canceling order.")
-                try:
-                    client.cancel_order(symbol=symbol, orderId=order_id)
-                    conn = get_db_connection()
-                    cursor = conn.cursor()
-                    cursor.execute("UPDATE trades SET status = 'CANCELED' WHERE trade_id = %s", (trade_id,))
-                    conn.commit()
-                    release_db_connection(conn)
-                except Exception as e:
-                    logger.error(f"[OrderManager] Failed to cancel order {order_id} for {symbol}: {e}")
-                return None
 
         order_details = {
             "order_id": str(order_id),
@@ -312,8 +278,8 @@ def place_scaled_take_profits(client, symbol, entry_price, quantity, position_ty
         ]
         trade_id = str(trade_id or int(time.time())).replace('trade_', '')
         for level in tp_levels:
-            tp_price = format_price(symbol, entry_price + (level["factor"] * atr) if position_type == "long" else entry_price - (level["factor"] * atr))
-            partial_qty = format_quantity(symbol, quantity * level["percent"])
+            tp_price = format_price(client, symbol, entry_price + (level["factor"] * atr) if position_type == "long" else entry_price - (level["factor"] * atr))
+            partial_qty = format_quantity(client, symbol, quantity * level["percent"])
             client.create_order(
                 symbol=symbol,
                 side=SIDE_SELL if position_type == "long" else SIDE_BUY,
@@ -325,7 +291,7 @@ def place_scaled_take_profits(client, symbol, entry_price, quantity, position_ty
                 newClientOrderId=f"tp_{symbol}_{trade_id}"
             )
             if level.get("reduce_ts"):
-                ts_manager.adjust_quantity(symbol, format_quantity(symbol, quantity * (1 - level["percent"])), trade_id=trade_id)
+                ts_manager.adjust_quantity(symbol, format_quantity(client, symbol, quantity * (1 - level["percent"])), trade_id=trade_id)
         logger.info(f"[OrderManager] Placed scaled take-profits for {symbol}, trade_id={trade_id}")
     except Exception as e:
         logger.error(f"[OrderManager] Error placing take-profits for {symbol}: {e}")
@@ -343,7 +309,7 @@ def log_order_as_table(signal, symbol, price, atr, qty, order_result=None):
     logger.info("Order Details:\n%s", tabulate(table_data, headers=["Metric", "Value"], tablefmt="grid"))
 
 def log_order_details(symbol, price, capital, leverage, quantity, rules):
-    rounded_price = format_price(symbol, price)
+    rounded_price = format_price(client, symbol, price)
     raw_qty = (capital * leverage) / price
 
     table = Table(title=f"🧾 Order Details for {symbol}", show_lines=True)
@@ -388,7 +354,7 @@ class EnhancedOrderManager:
             price = float(ticker['price'])
             logger.debug(f"[OrderManager] Fetched price for {symbol}: {price}")
             return price
-        except Exception as e:
+        except BinanceAPIException as e:
             logger.error(f"[EnhancedOrderManager] Failed to get price for {symbol}: {e}")
             return None
 
@@ -401,7 +367,7 @@ class EnhancedOrderManager:
                 logger.error(f"[Margin Check] Insufficient margin for {symbol}: available={balance}, required={required_margin}")
                 return False
             return True
-        except Exception as e:
+        except BinanceAPIException as e:
             logger.error(f"[Margin Check] Error for {symbol}: {e}")
             return False
 
@@ -420,9 +386,9 @@ class EnhancedOrderManager:
             rules = get_exchange_precision(self.client, symbol)
             logger.info(f"[EnhancedOrderManager] Precision rules for {symbol}: {rules}")
 
-            quantity = format_quantity(symbol, (capital * leverage) / price)
+            quantity = format_quantity(self.client, symbol, (capital * leverage) / price)
             quantity = max(quantity, rules['min_qty'])
-            price = format_price(symbol, price)
+            price = format_price(self.client, symbol, price)
 
             if not self.check_margin(symbol, quantity, price, leverage):
                 logger.error(f"[EnhancedOrderManager] Cancellation - margin problem for {symbol}")
@@ -454,7 +420,7 @@ class EnhancedOrderManager:
             }
             logger.info(f"[EnhancedOrderManager] Order placed for {symbol}: {order_data['order_id']}")
             return order_data
-        except Exception as e:
+        except BinanceAPIException as e:
             logger.error(f"[EnhancedOrderManager] Failed to place {action} order for {symbol}: {e}")
             return None
 
@@ -463,6 +429,9 @@ class EnhancedOrderManager:
         has_position = False
         try:
             position_info = self.client.get_position_risk(symbol=symbol)
+            if position_info is None:
+                logger.warning(f"[Position Check] No position data returned for {symbol}")
+                return False, 0.0
             for pos in position_info:
                 if pos['symbol'] == symbol:
                     qty = float(pos['positionAmt'])
@@ -483,6 +452,9 @@ class EnhancedOrderManager:
                 logger.info(f"[Position Check] No active position for {symbol}, clearing current_positions")
                 current_positions[symbol] = None
             return has_position, position_qty
+        except BinanceAPIException as e:
+            logger.error(f"[Position Check Error] For {symbol}: {e}")
+            return False, 0.0
         except Exception as e:
             logger.error(f"[Position Check Error] For {symbol}: {str(e)}")
             return False, 0.0
@@ -497,12 +469,20 @@ class EnhancedOrderManager:
 
 def wait_until_order_finalized(client, symbol, order_id, max_retries=5, sleep_seconds=1):
     for _ in range(max_retries):
-        order_status = client.get_order(symbol=symbol, orderId=order_id)
-        status = order_status.get("status")
-        if status in ["FILLED", "PARTIALLY_FILLED", "REJECTED", "CANCELED"]:
-            return order_status
-        time.sleep(sleep_seconds)
-    return client.get_order(symbol=symbol, orderId=order_id)
+        try:
+            order_status = client.get_order(symbol=symbol, orderId=order_id)
+            status = order_status.get("status")
+            if status in ["FILLED", "PARTIALLY_FILLED", "REJECTED", "CANCELED"]:
+                return order_status
+            time.sleep(sleep_seconds)
+        except BinanceAPIException as e:
+            logger.error(f"[OrderManager] Failed to check order status for {order_id}: {e}")
+            time.sleep(sleep_seconds)
+    try:
+        return client.get_order(symbol=symbol, orderId=order_id)
+    except BinanceAPIException as e:
+        logger.error(f"[OrderManager] Final attempt to check order status failed for {order_id}: {e}")
+        return None
 
 def monitor_and_update_trailing_stop(client, symbol, order_id, ts_manager, trade_id=None):
     try:
@@ -515,7 +495,7 @@ def monitor_and_update_trailing_stop(client, symbol, order_id, ts_manager, trade
             ts_manager.update_trailing_stop(symbol, current_price, trade_id=trade_id)
             logger.info(f"[OrderManager] Trailing stop updated for {symbol} at price {current_price}")
         return status
-    except Exception as e:
+    except BinanceAPIException as e:
         logger.error(f"[OrderManager] Error monitoring order {order_id} for {symbol}: {e}")
         return None
 
@@ -543,7 +523,7 @@ def get_min_qty(client, symbol):
                 for f in s['filters']:
                     if f['filterType'] == 'LOT_SIZE':
                         return float(f['minQty'])
-    except Exception as e:
+    except BinanceAPIException as e:
         logger.error(f"[OrderManager] Error retrieving minQty for {symbol}: {e}")
     return 0.001
 
@@ -556,7 +536,7 @@ for symbol in SYMBOLS:
         if current_price is not None and crash_protector.check_market_crash(symbol, current_price):
             ts_manager.close_position(symbol)
             send_telegram_alert(f"⚠️ CRASH DETECTED - Position closed for {symbol}")
-    except Exception as e:
+    except BinanceAPIException as e:
         logger.error(f"[OrderManager] Failed to process {symbol}: {e}")
 
 def insert_or_update_order(order):

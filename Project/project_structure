@@ -1,50 +1,50 @@
-Binance Futures Trading Bot Project Structure
+﻿Binance Futures Trading Bot Project Structure
 This project structure organizes the components of a Binance Futures trading bot, integrating real-time data ingestion (Kafka), processing core (technical analysis and LSTM), trade execution, PostgreSQL for data storage, and monitoring/alerting with Prometheus, Grafana, and Telegram.
 binance-trading-bot/
-├── config/
-│   ├── config.yaml               # Configuration: API keys, symbols, timeframes, etc.
-│   ├── kafka_config.yaml         # Kafka broker settings
-│   ├── db_config.yaml            # PostgreSQL connection settings
-│   └── alerting_config.yaml      # Telegram and monitoring configurations
-├── src/
-│   ├── data_ingestion/
-│   │   ├── __init__.py
-│   │   ├── kafka_consumer.py     # Consumes real-time price data from Binance via Kafka
-│   │   └── data_formatter.py     # Formats incoming WebSocket data for processing
-│   ├── processing_core/
-│   │   ├── __init__.py
-│   │   ├── indicators.py         # Technical analysis indicators (EMA, MACD, RSI, etc.)
-│   │   ├── lstm_model.py         # LSTM model for price prediction
-│   │   ├── signal_generator.py   # Combines TA and LSTM for buy/sell signals
-│   │   └── main_bot.py           # Core bot logic (integrates indicators and signals)
-│   ├── trade_execution/
-│   │   ├── __init__.py
-│   │   ├── binance_client.py     # Binance Futures API client (using python-binance)
-│   │   └── order_manager.py     # Handles order placement with retry logic
-│   ├── database/
-│   │   ├── __init__.py
-│   │   ├── schema.sql            # PostgreSQL schema for trades, signals, PnL
-│   │   └── db_handler.py         # Database operations (insert trades, query PnL)
-│   └── monitoring/
-│       ├── __init__.py
-│       ├── metrics.py            # Prometheus metrics (trades, PnL, latency)
-│       ├── alerting.py           # Telegram alerts for trades and errors
-│       └── grafana_dashboard.json # Grafana dashboard configuration
-├── models/
-│   └── lstm_model.h5             # Pre-trained LSTM model
-├── logs/
-│   └── trading_bot.log           # Application logs
-├── scripts/
-│   ├── start_kafka_consumer.sh   # Script to start Kafka consumer
-│   ├── start_bot.sh              # Script to start main bot
-│   └── setup_db.sh               # Script to initialize PostgreSQL database
-├── tests/
-│   ├── test_indicators.py        # Unit tests for technical indicators
-│   ├── test_lstm_model.py        # Unit tests for LSTM predictions
-│   └── test_order_execution.py   # Unit tests for trade execution
-├── requirements.txt              # Python dependencies (pandas, talib, tensorflow, etc.)
-├── Dockerfile                    # Docker configuration for deployment
-└── README.md                     # Project documentation
+â”œâ”€â”€ config/
+â”‚   â”œâ”€â”€ config.yaml               # Configuration: API keys, symbols, timeframes, etc.
+â”‚   â”œâ”€â”€ kafka_config.yaml         # Kafka broker settings
+â”‚   â”œâ”€â”€ db_config.yaml            # PostgreSQL connection settings
+â”‚   â””â”€â”€ alerting_config.yaml      # Telegram and monitoring configurations
+â”œâ”€â”€ src/
+â”‚   â”œâ”€â”€ data_ingestion/
+â”‚   â”‚   â”œâ”€â”€ __init__.py
+â”‚   â”‚   â”œâ”€â”€ kafka_consumer.py     # Consumes real-time price data from Binance via Kafka
+â”‚   â”‚   â””â”€â”€ data_formatter.py     # Formats incoming WebSocket data for processing
+â”‚   â”œâ”€â”€ processing_core/
+â”‚   â”‚   â”œâ”€â”€ __init__.py
+â”‚   â”‚   â”œâ”€â”€ indicators.py         # Technical analysis indicators (EMA, MACD, RSI, etc.)
+â”‚   â”‚   â”œâ”€â”€ lstm_model.py         # LSTM model for price prediction
+â”‚   â”‚   â”œâ”€â”€ signal_generator.py   # Combines TA and LSTM for buy/sell signals
+â”‚   â”‚   â””â”€â”€ main_bot.py           # Core bot logic (integrates indicators and signals)
+â”‚   â”œâ”€â”€ trade_execution/
+â”‚   â”‚   â”œâ”€â”€ __init__.py
+â”‚   â”‚   â”œâ”€â”€ binance_client.py     # Binance Futures API client (using python-binance)
+â”‚   â”‚   â””â”€â”€ order_manager.py     # Handles order placement with retry logic
+â”‚   â”œâ”€â”€ database/
+â”‚   â”‚   â”œâ”€â”€ __init__.py
+â”‚   â”‚   â”œâ”€â”€ schema.sql            # SQLite/PostgreSQL schema for trades, signals, PnL
+â”‚   â”‚   â””â”€â”€ db_handler.py         # Database operations (insert trades, query PnL)
+â”‚   â””â”€â”€ monitoring/
+â”‚       â”œâ”€â”€ __init__.py
+â”‚       â”œâ”€â”€ metrics.py            # Prometheus metrics (trades, PnL, latency)
+â”‚       â”œâ”€â”€ alerting.py           # Telegram alerts for trades and errors
+â”‚       â””â”€â”€ grafana_dashboard.json # Grafana dashboard configuration
+â”œâ”€â”€ models/
+â”‚   â””â”€â”€ lstm_model.h5             # Pre-trained LSTM model
+â”œâ”€â”€ logs/
+â”‚   â””â”€â”€ trading_bot.log           # Application logs
+â”œâ”€â”€ scripts/
+â”‚   â”œâ”€â”€ start_kafka_consumer.sh   # Script to start Kafka consumer
+â”‚   â”œâ”€â”€ start_bot.sh              # Script to start main bot
+â”‚   â””â”€â”€ setup_db.sh               # Script to initialize PostgreSQL database
+â”œâ”€â”€ tests/
+â”‚   â”œâ”€â”€ test_indicators.py        # Unit tests for technical indicators
+â”‚   â”œâ”€â”€ test_lstm_model.py        # Unit tests for LSTM predictions
+â”‚   â””â”€â”€ test_order_execution.py   # Unit tests for trade execution
+â”œâ”€â”€ requirements.txt              # Python dependencies (pandas, talib, tensorflow, etc.)
+â”œâ”€â”€ Dockerfile                    # Docker configuration for deployment
+â””â”€â”€ README.md                     # Project documentation
 
 Directory and File Descriptions
 config/

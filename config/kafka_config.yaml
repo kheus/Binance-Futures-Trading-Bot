@@ -1,0 +1,3 @@
+﻿kafka:
+  bootstrap_servers: kafka:9092
+  topic: binance_btcusdt_kline_1m

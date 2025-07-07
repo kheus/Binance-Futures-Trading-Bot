@@ -1,0 +1,13 @@
+api_key: "YOUR_API_KEY"
+api_secret: "YOUR_API_SECRET"
+base_url: "https://api.binance.com"
+symbols:
+  - "BTCUSDT"
+  - "ETHUSDT"
+timeframe: "1m"
+capital: 1000
+leverage: 10
+trailing_update_interval: 10
+price_fetch_interval: 60
+model_update_interval: 900
+metrics_update_interval: 300

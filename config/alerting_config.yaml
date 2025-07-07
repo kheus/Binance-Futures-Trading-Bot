@@ -1,0 +1,13 @@
+﻿# Alerting configuration for the application
+
+telegram: 
+
+  enabled: true
+
+prometheus:
+
+  port: 8000
+
+grafana:
+
+  url: "http://localhost:3000"

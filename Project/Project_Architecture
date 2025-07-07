@@ -1,16 +1,16 @@
-+---------------------------+
-|   Binance Futures API     | <-- (Données prix + exécution des ordres)
-+---------------------------+
-           |
-+---------------------------+
-|     Data Ingestion        | <-- (Kafka : ingestion des prix en temps réel)
+﻿+---------------------------+
+|   Binance Futures API     | <-- (Donnees prix + execution des ordres)
 +---------------------------+
            |
 +---------------------------+
-|     Processing Core       | <-- (Python bot avec stratégie + signaux)
+|     Data Ingestion        | <-- (Kafka : ingestion des prix en temps reel)
++---------------------------+
+           |
++---------------------------+
+|     Processing Core       | <-- (Python bot avec strategie + signaux)
 | - Indicateurs TA          |
 | - Machine Learning (LSTM) |
-| - Décision Buy/Sell       |
+| - Decision Buy/Sell       |
 +---------------------------+
            |
 +---------------------------+
@@ -24,3 +24,43 @@
 +---------------------------+
 |  Monitoring & Alerting    | <-- (Prometheus + Grafana + Telegram)
 +---------------------------+
+
+
+rm models/lstm_model.keras
+
+
+         +------------------+        +---------------------+
+         |   Binance API    |        |     Kafka Broker    |
+         |  (Price Stream)  |------->|   Topic: btcusdt_5m  |
+         +------------------+        +---------------------+
+                   |                          |
+                   v                          v
+        +--------------------+       +-----------------------+
+        | Kafka Consumer     |       | Data Formatter        |
+        | + Pandas DataFrame |       | (Clean & Normalize)   |
+        +--------------------+       +-----------------------+
+                   |                          |
+                   v                          v
+       +-------------------------------------------------+
+       |                 Processing Core                 |
+       |   + Indicators (EMA, RSI, MACD, ADX, ATR)       |
+       |   + LSTM Prediction Model                       |
+       |   + Signal Generator (strategy: trend/scalp)    |
+       +-------------------------------------------------+
+                           |
+                           v
+                +-------------------------+
+                | Order Manager (Binance) |
+                | + SL/TP + Trailing Stop |
+                +-------------------------+
+                           |
+                           v
+               +-----------------------------+
+               | PostgreSQL Trade Database   |
+               +-----------------------------+
+                           |
+                           v
+               +------------------------------+
+               | Telegram Alerts + Prometheus |
+               +------------------------------+
+
