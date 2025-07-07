@@ -199,7 +199,7 @@ def insert_trade(trade_data):
                 float(trade_data.get('pnl', 0.0)),
                 bool(trade_data.get('is_trailing', False)),
                 str(trade_data['trade_id']),
-                str(trade_data.get('status', 'OPEN'))
+                str(trade_data.get('status', 'new'))  # Default to 'new' if not provided
             )
             logger.debug(f"[insert_trade] Executing for {trade_data['symbol']}, order_id: {trade_data['order_id']}, trade_id: {trade_data['trade_id']}")
             cur.execute(query, params)

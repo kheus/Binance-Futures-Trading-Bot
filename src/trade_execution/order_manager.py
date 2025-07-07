@@ -25,6 +25,11 @@ import psycopg2
 from psycopg2 import pool
 import math
 import asyncio
+from rich.table import Table
+from rich.console import Console
+import json
+
+console = Console()
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +89,7 @@ def init_trailing_stop_manager(client):
         query = """
         SELECT trade_id, symbol, side, quantity, price, stop_loss
         FROM trades
-        WHERE is_trailing = TRUE AND status = 'OPEN'
+        WHERE is_trailing = TRUE AND status = 'new'
         """
         cursor.execute(query)
         trades = cursor.fetchall()
@@ -119,7 +124,7 @@ async def trailing_stop_monitor(client):
             query = """
             SELECT trade_id, symbol, side, quantity, price, stop_loss
             FROM trades
-            WHERE is_trailing = TRUE AND status = 'OPEN'
+            WHERE is_trailing = TRUE AND (status = 'new' OR status = 'OPEN')
             """
             cursor.execute(query)
             trades = cursor.fetchall()
@@ -500,6 +505,24 @@ def log_order_as_table(signal, symbol, price, atr, qty, order_result=None):
         ["Status", order_result.get("status", "PENDING") if order_result else "FAILED"]
     ]
     logger.info("Order Details:\n%s", tabulate(table_data, headers=["Metric", "Value"], tablefmt="grid"))
+
+def log_order_details(symbol, price, capital, leverage, quantity, rules):
+    rounded_price = round(price / rules['price_tick']) * rules['price_tick']
+    raw_qty = (capital * leverage) / price
+
+    table = Table(title=f"🧾 Order Details for {symbol}", show_lines=True)
+    table.add_column("Field", style="cyan", no_wrap=True)
+    table.add_column("Value", style="magenta")
+
+    table.add_row("Original Price", f"{price:.4f}")
+    table.add_row("Rounded Price", f"{rounded_price:.4f}")
+    table.add_row("Capital", f"{capital}")
+    table.add_row("Leverage", f"{leverage}")
+    table.add_row("Raw Quantity", f"{raw_qty:.4f}")
+    table.add_row("Adjusted Quantity", f"{quantity}")
+    table.add_row("Rules", json.dumps(rules, indent=2))
+
+    console.log(table)
 
 order_tracking = {}
 

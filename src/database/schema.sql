@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS trades (
     pnl DECIMAL,
     is_trailing BOOLEAN,
     trade_id VARCHAR(64) UNIQUE NOT NULL,
-    status VARCHAR(20) DEFAULT 'OPEN'
+    status VARCHAR(20) DEFAULT 'new'
 );
 CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp);
 CREATE INDEX IF NOT EXISTS idx_trades_trade_id ON trades(trade_id);

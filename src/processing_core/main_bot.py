@@ -14,8 +14,9 @@ from src.processing_core.lstm_model import train_or_load_model
 from src.processing_core.signal_generator import check_signal
 from src.trade_execution.order_manager import place_order, init_trailing_stop_manager, EnhancedOrderManager, check_open_position
 from src.trade_execution.sync_orders import get_current_atr, sync_binance_trades_with_postgres
-from src.database.db_handler import insert_trade, insert_signal, insert_metrics, create_tables, insert_price_data, clean_old_data
+from src.database.db_handler import insert_trade, insert_signal, insert_metrics, create_tables, insert_price_data, clean_old_data, update_trade_on_close
 from src.processing_core.signal_generator import prepare_lstm_input, select_strategy_mode
+from src.trade_execution.ultra_aggressive_trailing import TrailingStopManager
 from src.monitoring.metrics import record_trade_metric
 from src.monitoring.alerting import send_telegram_alert
 from src.performance.tracker import performance_tracker_loop
@@ -257,7 +258,7 @@ async def trailing_stop_updater():
             logger.debug(f"[Trailing Stop] Current positions: {current_positions}")
             logger.debug(f"[Trailing Stop] Trailing stops: {ts_manager.stops}")
             for symbol in SYMBOLS:
-                # Check for open positions using check_open_position from order_manager
+                # Check for open positions using check_open_position
                 side = current_positions[symbol]['side'] if current_positions[symbol] else None
                 try:
                     has_position, position_qty = check_open_position(client, symbol, side, current_positions)

@@ -254,5 +254,6 @@ git add C:\Users\Cheikh\binance-trading-bot\src\data_ingestion\kafka_consumer.py
 git add C:\Users\Cheikh\binance-trading-bot\src\monitoring\metrics.py
 git add C:\Users\Cheikh\binance-trading-bot\src\monitoring\alerting.py
 git add C:\Users\Cheikh\binance-trading-bot\Readme.md 
+git add C:\Users\Cheikh\binance-trading-bot\src\processing_core\indicators.py
 git commit -m "Updates" 
 git push -u origin master
