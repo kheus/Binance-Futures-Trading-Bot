@@ -1,6 +1,7 @@
 # File: src/trade_execution/ultra_aggressive_trailing.py
 import logging
 import time
+import random
 from binance.um_futures import UMFutures
 from binance.exceptions import BinanceAPIException
 from src.database.db_handler import update_trade_on_close, connection_pool
@@ -40,7 +41,7 @@ class UltraAgressiveTrailingStop:
         self.client = client
         self.symbol = symbol
         self.trailing_distance = trailing_distance
-        self.max_retries = 3
+        self.max_retries = 5
         self.trailing_stop_order_id = None
         self.entry_price = 0.0
         self.current_stop_price = 0.0
@@ -62,6 +63,10 @@ class UltraAgressiveTrailingStop:
         except Exception as e:
             logger.warning(f"[{self.symbol}] ⚠️ Could not fetch price tick: {e}. Using default 0.0001")
             return 0.0001
+
+    def _generate_client_order_id(self):
+        """Generate unique client order ID using timestamp and random number"""
+        return f"TS_{time.time_ns()}_{random.randint(1000,9999)}"
 
     def _check_position(self):
         """Check if an active position exists for the symbol."""
@@ -131,6 +136,7 @@ class UltraAgressiveTrailingStop:
 
         for attempt in range(self.max_retries):
             try:
+                client_order_id = self._generate_client_order_id()
                 order = self.client.new_order(
                     symbol=self.symbol,
                     side='SELL' if position_type == 'long' else 'BUY',
@@ -139,7 +145,7 @@ class UltraAgressiveTrailingStop:
                     stopPrice=str(stop_price),
                     priceProtect=True,
                     reduceOnly=True,
-                    newClientOrderId=f"trailing_stop_{self.symbol}_{self.trade_id}"
+                    newClientOrderId=client_order_id
                 )
                 self.trailing_stop_order_id = order['orderId']
                 self.current_stop_price = stop_price
@@ -210,6 +216,7 @@ class UltraAgressiveTrailingStop:
                         self.client.cancel_order(symbol=self.symbol, orderId=self.trailing_stop_order_id)
                         logger.info(f"[{self.symbol}] ❌ Old trailing stop order {self.trailing_stop_order_id} canceled.")
 
+                        client_order_id = self._generate_client_order_id()
                         order = self.client.new_order(
                             symbol=self.symbol,
                             side='SELL' if self.position_type == 'long' else 'BUY',
@@ -218,7 +225,7 @@ class UltraAgressiveTrailingStop:
                             stopPrice=str(new_stop),
                             priceProtect=True,
                             reduceOnly=True,
-                            newClientOrderId=f"trailing_stop_{self.symbol}_{self.trade_id}"
+                            newClientOrderId=client_order_id
                         )
                         self.trailing_stop_order_id = order['orderId']
                         self.current_stop_price = new_stop
@@ -319,6 +326,7 @@ class UltraAgressiveTrailingStop:
             logger.info(f"[{self.symbol}] ❌ Old trailing stop order {self.trailing_stop_order_id} canceled for quantity adjustment")
 
             # Place new stop order with updated quantity
+            client_order_id = self._generate_client_order_id()
             order = self.client.new_order(
                 symbol=self.symbol,
                 side='SELL' if self.position_type == 'long' else 'BUY',
@@ -327,7 +335,7 @@ class UltraAgressiveTrailingStop:
                 stopPrice=str(self.current_stop_price),
                 priceProtect=True,
                 reduceOnly=True,
-                newClientOrderId=f"trailing_stop_{self.symbol}_{self.trade_id}"
+                newClientOrderId=client_order_id
             )
             self.trailing_stop_order_id = order['orderId']
             self.quantity = new_quantity
