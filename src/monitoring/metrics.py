@@ -28,6 +28,42 @@ def record_trade_metric(order_details):
     except Exception as e:
         logger.error(f"Metrics recording error: {e}")
 
+# Note : Pense à implémenter la fonction `get_current_adx(client, symbol)` dans src.monitoring.metrics,
+# qui récupère la valeur ADX en temps réel, similaire à ta fonction `get_current_atr`.
+
+def get_current_adx(client: UMFutures, symbol: str) -> float:
+    """
+    Calcule l'ADX à partir des bougies 1h récentes.
+    """
+    try:
+        logger.debug(f"[{symbol}] 📊 Récupération des bougies pour ADX...")
+        klines = client.klines(symbol=symbol, interval='5m', limit=50)  # 50 bougies pour une meilleure précision
+
+        if len(klines) < 15:
+            logger.warning(f"[{symbol}] ⚠️ Données insuffisantes pour ADX (seulement {len(klines)} bougies). Fallback: ADX = 20")
+            return 20  # valeur par défaut modérée
+
+        df = pd.DataFrame(klines, columns=[
+            "open_time", "open", "high", "low", "close", "volume",
+            "close_time", "quote_asset_vol", "num_trades", "taker_buy_base_vol",
+            "taker_buy_quote_vol", "ignore"
+        ])
+        df = df[["high", "low", "close"]].astype(float)
+
+        adx_series = talib.ADX(df["high"], df["low"], df["close"], timeperiod=14)
+        latest_adx = adx_series.iloc[-1]
+
+        if pd.isna(latest_adx) or latest_adx <= 0:
+            logger.warning(f"[{symbol}] ⚠️ ADX invalide ({latest_adx}). Fallback: ADX = 20")
+            return 20
+
+        logger.debug(f"[{symbol}] ✅ ADX = {latest_adx:.2f}")
+        return round(float(latest_adx), 2)
+
+    except Exception as e:
+        logger.error(f"[{symbol}] ❌ Erreur ADX: {e}")
+        return 20  # fallback modéré si tout échoue
+
 def get_current_atr(client: UMFutures, symbol: str) -> float:
     """
     Calcule l'ATR sur 14 périodes 1h. Utilise une approximation si les données sont insuffisantes.
@@ -35,7 +71,7 @@ def get_current_atr(client: UMFutures, symbol: str) -> float:
     """
     try:
         logger.debug(f"[{symbol}] 📊 Récupération des bougies pour ATR...")
-        klines = client.klines(symbol=symbol, interval='1h', limit=21)  # 21 pour lisser talib.ATR
+        klines = client.klines(symbol=symbol, interval='5m', limit=50)  # 50 pour lisser talib.ATR
 
         if len(klines) < 15:
             logger.warning(f"[{symbol}] ⚠️ Données insuffisantes pour ATR (seulement {len(klines)} bougies). Fallback: 1% du prix.")

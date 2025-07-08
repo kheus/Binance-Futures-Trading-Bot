@@ -3,7 +3,7 @@
     from binance.enums import SIDE_BUY, SIDE_SELL, ORDER_TYPE_MARKET
     from src.trade_execution.correlation_monitor import CorrelationMonitor
     from src.trade_execution.trade_analyzer import TradeAnalyzer
-    from src.monitoring.metrics import get_current_atr
+    from src.monitoring.metrics import get_current_atr, get_current_adx
     from src.trade_execution.ultra_aggressive_trailing import TrailingStopManager, format_price, format_quantity, get_exchange_precision
     from src.database.db_handler import get_db_connection, release_db_connection, wait_until_order_finalized
 except ImportError:
@@ -99,6 +99,7 @@ def init_trailing_stop_manager(client):
                 position_type=position_type,
                 quantity=float(quantity),
                 atr=get_current_atr(client, symbol),
+                adx=get_current_adx(client, symbol),
                 trade_id=str(trade_id)
             )
             if ts_id:
@@ -376,6 +377,11 @@ class EnhancedOrderManager:
             atr = get_current_atr(self.client, symbol)
             if atr is None or atr <= 0:
                 logger.error(f"[EnhancedOrderManager] Failed to calculate ATR for {symbol}: {atr}")
+                return None
+
+            adx = get_current_adx(self.client, symbol)
+            if adx is None or adx <= 0:
+                logger.error(f"[EnhancedOrderManager] Failed to calculate ADX for {symbol}: {adx}")
                 return None
 
             price = self.get_current_price(symbol)

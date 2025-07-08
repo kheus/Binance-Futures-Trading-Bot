@@ -13,7 +13,7 @@ from src.data_ingestion.data_formatter import format_candle
 from src.processing_core.lstm_model import train_or_load_model
 from src.processing_core.signal_generator import check_signal
 from src.trade_execution.order_manager import place_order, init_trailing_stop_manager, EnhancedOrderManager
-from src.trade_execution.sync_orders import get_current_atr, sync_binance_trades_with_postgres
+from src.trade_execution.sync_orders import get_current_atr, get_current_adx, sync_binance_trades_with_postgres
 from src.database.db_handler import insert_trade, insert_signal, insert_metrics, create_tables, insert_price_data, clean_old_data, update_trade_on_close
 from src.processing_core.signal_generator import prepare_lstm_input, select_strategy_mode
 from src.trade_execution.ultra_aggressive_trailing import TrailingStopManager
@@ -204,6 +204,16 @@ def handle_order_update(message):
                     }
                     atr = get_current_atr(client, order_data['symbol'])
                     if atr > 0:
+                        ts_manager.initialize_trailing_stop(
+                            symbol=order_data['symbol'],
+                            entry_price=order_data['price'],
+                            position_type='long' if order_data['side'] == 'buy' else 'short',
+                            quantity=order_data['quantity'],
+                            atr=atr,
+                            trade_id=order_data['trade_id']
+                        )
+                    adx = get_current_adx(client, order_data['symbol'])
+                    if adx > 0:
                         ts_manager.initialize_trailing_stop(
                             symbol=order_data['symbol'],
                             entry_price=order_data['price'],
@@ -604,7 +614,8 @@ async def main():
                     if action in ["buy", "sell"]:
                         try:
                             price = float(candle_df["close"].iloc[-1])
-                            atr = float(dataframes[symbol]["ATR"].iloc[-1]) if 'ATR' in dataframes[symbol].columns and not np.isnan(dataframes[symbol]["ATR"].iloc[-1]) else 0
+                            adx = get_current_adx(client, symbol)
+                            atr = get_current_atr(client, symbol)
                             if atr <= 0:
                                 logger.error(f"❌ [Order] Invalid ATR for {symbol}: {atr}")
                                 continue
@@ -635,6 +646,7 @@ async def main():
                                         position_type='long' if action == 'buy' else 'short',
                                         quantity=order_details[symbol]['quantity'],
                                         atr=atr,
+                                        adx=adx,
                                         trade_id=order_details[symbol]['trade_id']
                                     )
                                     if last_sl_order_ids[symbol]:

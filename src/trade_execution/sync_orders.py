@@ -3,7 +3,7 @@
 import logging
 import time
 from binance.um_futures import UMFutures
-from src.monitoring.metrics import get_current_atr
+from src.monitoring.metrics import get_current_atr, get_current_adx
 from src.trade_execution.ultra_aggressive_trailing import TrailingStopManager
 from src.database.db_handler import insert_or_update_order, update_trade_on_close, insert_trade, execute_query
 from src.trade_execution.order_manager import EnhancedOrderManager
@@ -163,18 +163,21 @@ def sync_binance_trades_with_postgres(client: UMFutures, symbols, ts_manager: Tr
                         }
                         logger.debug(f"[sync_orders] Updated current_positions for {symbol}: {current_positions[symbol]}")
                         atr = get_current_atr(client, symbol)
-                        if atr and atr > 0:
-                            ts_manager.initialize_trailing_stop(
-                                symbol=symbol,
-                                entry_price=trade_data['price'],
-                                position_type='long' if order['side'].lower() == 'buy' else 'short',
-                                quantity=trade_data['quantity'],
-                                atr=atr,
-                                trade_id=trade_id
-                            )
-                            trade_data['is_trailing'] = True
-                            insert_trade(trade_data)
-                            logger.info(f"[sync_orders] Initialized trailing stop for {symbol}, trade_id={trade_id}")
+                        adx = get_current_adx(client, symbol)
+
+                        if atr and atr > 0 and adx and adx > 0:
+                           ts_manager.initialize_trailing_stop(
+                               symbol=symbol,
+                               entry_price=trade_data['price'],
+                               position_type='long' if order['side'].lower() == 'buy' else 'short',
+                               quantity=trade_data['quantity'],
+                               atr=atr,
+                               adx=adx,
+                               trade_id=trade_id
+                           )
+                           trade_data['is_trailing'] = True
+                           insert_trade(trade_data)
+                           logger.info(f"[sync_orders] Initialized trailing stop for {symbol}, trade_id={trade_id}")
 
                 except Exception as e:
                     logger.error(f"[sync_orders] Processing error for order {effective_id}: {e}")
