@@ -5,7 +5,7 @@
     port: 5432
     database: "trading_bot_db"
     user: "postgres"
-    password: ".."
+    password: "Cheikh12"
   sqlite:
     path: "trading_bot.db"
 trading:

@@ -182,8 +182,8 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
         logger.error(f"[check_signal] Config is None for {symbol}, cannot calculate quantity")
         return "hold", current_position, 0.0, []
 
-    capital = config["binance"].get("capital", 1000.0)
-    leverage = config["binance"].get("leverage", 1.0)
+    capital = config["binance"].get("capital", 100.0)
+    leverage = config["binance"].get("leverage", 50.0)
     quantity = (capital * leverage) / close if close > 0 else 0.0
 
     if strategy_mode == "scalp" and rsi_strong:

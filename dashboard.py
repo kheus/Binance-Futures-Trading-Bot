@@ -77,7 +77,7 @@ def get_trades():
         conn = psycopg2.connect(**config["database"]["postgresql"])
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT order_id, order_id AS trade_id, symbol, side, quantity, price, stop_loss, take_profit, (timestamp::double precision * 1000)::bigint AS timestamp, pnl
+            SELECT order_id, order_id AS trade_id, symbol, side, quantity, price, exit_price, status, (timestamp::double precision * 1000)::bigint AS timestamp, realized_pnl
             FROM trades ORDER BY timestamp DESC LIMIT 20
         """)
         trades = cursor.fetchall()
@@ -92,12 +92,12 @@ def get_signals():
         conn = psycopg2.connect(**config["database"]["postgresql"])
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT id AS signal_id, symbol, signal_type, price, quantity, strategy_mode, timestamp, confidence
+            SELECT id AS signal_id, symbol, signal_type, price, quantity, strategy, timestamp, confidence_score, created_at
             FROM signals ORDER BY timestamp DESC LIMIT 20
         """)
         signals_df = pd.DataFrame(
             cursor.fetchall(),
-            columns=["signal_id", "symbol", "signal_type", "price", "quantity", "strategy_mode", "timestamp", "confidence"]
+            columns=["signal_id", "symbol", "signal_type", "price", "quantity", "strategy", "timestamp", "confidence_score", "created_at"]
         )
         signals_df = signals_df.drop_duplicates(subset=["signal_id", "timestamp"], inplace=False)
         conn.close()
@@ -137,12 +137,12 @@ def get_latest_data():
         conn = psycopg2.connect(**config["database"]["postgresql"])
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT order_id, order_id AS trade_id, symbol, side, quantity, price, stop_loss, take_profit, timestamp, pnl
+            SELECT order_id, order_id AS trade_id, symbol, side, quantity, price, exit_price, status, timestamp, realized_pnl
             FROM trades ORDER BY timestamp DESC LIMIT 20
         """)
         trade_rows = cursor.fetchall()
         if trade_rows:
-            columns = ["order_id", "trade_id", "symbol", "side", "quantity", "price", "stop_loss", "take_profit", "timestamp", "pnl"]
+            columns = ["order_id", "trade_id", "symbol", "side", "quantity", "price", "exit_price", "status", "timestamp", "realized_pnl"]
             df = pd.DataFrame(trade_rows, columns=columns).drop_duplicates()
             logger.info(f"Last 5 trades: {df.tail(5).to_dict(orient='records')}")
             data["trades"] = df.tail(5).to_dict(orient='records')
@@ -155,12 +155,12 @@ def get_latest_data():
         conn = psycopg2.connect(**config["database"]["postgresql"])
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT id AS signal_id, symbol, signal_type, price, quantity, strategy_mode, timestamp, confidence
+            SELECT id AS signal_id, symbol, signal_type, price, strategy, timestamp, confidence_score, created_at
             FROM signals ORDER BY timestamp DESC LIMIT 20
         """)
         signals_df = pd.DataFrame(
             cursor.fetchall(),
-            columns=["signal_id", "symbol", "signal_type", "price", "quantity", "strategy_mode", "timestamp", "confidence"]
+            columns=["signal_id", "symbol", "signal_type", "price", "strategy", "timestamp", "confidence_score", "created_at"]
         )
         if not signals_df.empty:
             logger.info(f"Last 5 signals: {signals_df.tail(5).to_dict(orient='records')}")

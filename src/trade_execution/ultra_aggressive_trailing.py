@@ -192,7 +192,7 @@ class UltraAgressiveTrailingStop:
                 self.current_stop_price = stop_price
                 logger.info(f"[{self.symbol}] ✅ Trailing stop placed (order {self.trailing_stop_order_id}) at {stop_price} "
                             f"(Qty: {self.quantity}, trade_id: {self.trade_id}, trailing_dist: {trailing_dist:.6f})")
-                send_telegram_alert(f"Trailing stop placed for {self.symbol} at {stop_price:.4f}, Qty: {self.quantity:.4f}, trade_id: {self.trade_id}")
+                # send_telegram_alert(f"Trailing stop placed for {self.symbol} at {stop_price:.4f}, Qty: {self.quantity:.4f}, trade_id: {self.trade_id}")
                 return self.trailing_stop_order_id
             except BinanceAPIException as e:
                 if e.code == -2021:
@@ -299,16 +299,16 @@ class UltraAgressiveTrailingStop:
     def verify_order_execution(self):
         try:
             if not self.trailing_stop_order_id:
-                logger.error(f"[{self.symbol}] ❌ No trailing stop order to verify")
-                return False
+               logger.error(f"[{self.symbol}] ❌ No trailing stop order to verify")
+               return False
+
             order = self.client.query_order(symbol=self.symbol, orderId=self.trailing_stop_order_id)
             status = order.get('status')
+
             if status == 'FILLED':
                 exit_price = float(order.get('avgPrice', self.current_stop_price))
-                if self.position_type == 'long':
-                    pnl = (exit_price - self.entry_price) * self.quantity
-                else:
-                    pnl = (self.entry_price - exit_price) * self.quantity
+                pnl = (exit_price - self.entry_price) * self.quantity if self.position_type == 'long' else (self.entry_price - exit_price) * self.quantity
+
                 success = update_trade_on_close(
                     symbol=self.symbol,
                     order_id=self.trade_id,
@@ -317,22 +317,48 @@ class UltraAgressiveTrailingStop:
                     side='BUY' if self.position_type == 'long' else 'SELL',
                     leverage=50
                 )
+
                 if success:
-                    logger.info(f"[{self.symbol}] ✅ Trailing stop order {self.trailing_stop_order_id} executed at {exit_price}, PNL: {pnl}")
-                    send_telegram_alert(f"Trailing stop executed for {self.symbol} at {exit_price:.4f}, PNL: {pnl:.4f}, trade_id: {self.trade_id}")
-                    self.close_position()
-                    return True
+                     logger.info(f"[{self.symbol}] ✅ Trailing stop order {self.trailing_stop_order_id} executed at {exit_price}, PNL: {pnl:.4f}")
+                     send_telegram_alert(f"Trailing stop executed for {self.symbol} at {exit_price:.4f}, PNL: {pnl:.4f}, trade_id: {self.trade_id}")
+                     self.close_position()
+                     return True
                 else:
                     logger.error(f"[{self.symbol}] ❌ Failed to update trade on close for trade_id {self.trade_id}")
                     return False
+
             elif status in ['CANCELED', 'REJECTED', 'EXPIRED']:
-                logger.warning(f"[{self.symbol}] ⚠️ Trailing stop order {self.trailing_stop_order_id} {status.lower()}")
-                self.close_position()
-                return False
+                 logger.warning(f"[{self.symbol}] ⚠️ Trailing stop order {self.trailing_stop_order_id} {status.lower()}")
+                 self.close_position()
+                 return False
+
             return False
-        except Exception as e:
+
+        except BinanceAPIException as e:
+            if e.code == -2011:
+            # Order not found = sûrement exécuté
+               logger.warning(f"[{self.symbol}] ⚠️ Order not found, checking fallback logic (likely filled)")
+               has_position, _ = self._check_position()
+               if not has_position:
+                   logger.info(f"[{self.symbol}] ✅ Position closed on Binance; confirming trailing execution for trade_id {self.trade_id}")
+                   update_trade_on_close(
+                       symbol=self.symbol,
+                       order_id=self.trade_id,
+                       exit_price=self.current_stop_price,
+                       quantity=self.quantity,
+                       side='BUY' if self.position_type == 'long' else 'SELL',
+                       leverage= 50
+                   )
+                   send_telegram_alert(f"Trailing stop likely executed for {self.symbol} at {self.current_stop_price:.4f} (order missing but position closed)")
+                   self.close_position()
+                   return True
             logger.error(f"[{self.symbol}] ❌ Failed to verify order execution: {e}")
             return False
+
+        except Exception as e:
+            logger.error(f"[{self.symbol}] ❌ Unexpected error in verify_order_execution: {e}")
+            return False
+
 
     def close_position(self):
         if self.active:

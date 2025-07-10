@@ -167,13 +167,14 @@ def handle_order_update(message):
                         qty = ts_manager.stops[symbol].quantity
                         entry_price = ts_manager.stops[symbol].entry_price
                         position_type = ts_manager.stops[symbol].position_type
+                        leverage = ts_manager.stops[symbol].leverage
                         if position_type == 'long':
-                            pnl = (exit_price - entry_price) * qty
+                            pnl = (exit_price - entry_price) * qty * leverage
                         else:
-                            pnl = (entry_price - exit_price) * qty
+                            pnl = (entry_price - exit_price) * qty * leverage
                         connection_pool.execute_query(
-                            "UPDATE trades SET status = 'CLOSED', exit_price = %s, realized_pnl = %s, close_timestamp = %s WHERE trade_id = %s",
-                            (exit_price, pnl, int(time.time()), trade_id)
+                            "UPDATE trades SET status = 'CLOSED', exit_price = %s, realized_pnl = %s, close_timestamp = %s, leverage = %s WHERE trade_id = %s",
+                            (exit_price, pnl, int(time.time()), leverage, trade_id)
                         )
                         ts_manager.close_position(symbol)
                         current_positions[symbol] = None
@@ -254,14 +255,16 @@ def handle_order_update(message):
                     exit_price = float(ticker['price'])
                     qty = float(current_positions[order_data['symbol']]['quantity'])
                     entry_price = float(current_positions[order_data['symbol']]['price'])
+                    leverage = current_positions[order_data['symbol']].get('leverage', LEVERAGE)
                     side = current_positions[order_data['symbol']]['side']
                     if side == 'long':
-                        pnl = (exit_price - entry_price) * qty
+                        pnl = (exit_price - entry_price) * qty * leverage
+
                     else:
-                        pnl = (entry_price - exit_price) * qty
+                        pnl = (entry_price - exit_price) * qty * leverage
                     connection_pool.execute_query(
-                        "UPDATE trades SET status = 'CLOSED', exit_price = %s, realized_pnl = %s, close_timestamp = %s WHERE trade_id = %s",
-                        (exit_price, pnl, int(time.time()), trade_id)
+                        "UPDATE trades SET status = 'CLOSED', exit_price = %s, realized_pnl = %s, close_timestamp = %s, leverage = %s WHERE trade_id = %s",
+                        (exit_price, pnl, int(time.time()), leverage, trade_id)
                     )
                     ts_manager.close_position(order_data['symbol'])
                     current_positions[order_data['symbol']] = None
@@ -324,14 +327,15 @@ async def trailing_stop_updater():
                         exit_price = float(ticker['price'])
                         qty = float(current_positions[symbol]['quantity'])
                         entry_price = float(current_positions[symbol]['price'])
+                        leverage = current_positions[symbol].get('leverage', LEVERAGE)
                         side = current_positions[symbol]['side']
                         if side == 'long':
-                            pnl = (exit_price - entry_price) * qty
+                            pnl = (exit_price - entry_price) * qty * leverage
                         else:
-                            pnl = (entry_price - exit_price) * qty
+                            pnl = (entry_price - exit_price) * qty * leverage
                         connection_pool.execute_query(
-                            "UPDATE trades SET status = 'CLOSED', exit_price = %s, realized_pnl = %s, close_timestamp = %s WHERE trade_id = %s",
-                            (exit_price, pnl, int(time.time()), trade_id)
+                            "UPDATE trades SET status = 'CLOSED', exit_price = %s, realized_pnl = %s, close_timestamp = %s, leverage = %s WHERE trade_id = %s",
+                            (exit_price, pnl, int(time.time()), leverage, trade_id)
                         )
                         ts_manager.close_position(symbol)
                         current_positions[symbol] = None
@@ -684,16 +688,17 @@ async def main():
                                     close_price = float(order_details[symbol]["price"])
                                     side = last_order_details[symbol]["side"]
                                     qty = float(last_order_details[symbol]["quantity"])
+                                    leverage = current_positions[symbol].get('leverage', LEVERAGE)
                                     if side == "buy":
-                                        pnl = (close_price - open_price) * qty
+                                        pnl = (close_price - open_price) * qty * leverage
                                     else:
-                                        pnl = (open_price - close_price) * qty
+                                        pnl = (open_price - close_price) * qty * leverage
                                     order_details[symbol]["pnl"] = pnl
                                     trade_id = last_order_details[symbol].get("trade_id")
                                     if trade_id:
                                         connection_pool.execute_query(
-                                            "UPDATE trades SET status = 'CLOSED', exit_price = %s, realized_pnl = %s, close_timestamp = %s WHERE trade_id = %s",
-                                            (close_price, pnl, int(time.time()), trade_id)
+                                            "UPDATE trades SET status = 'CLOSED', exit_price = %s, realized_pnl = %s, close_timestamp = %s, leverage = %s WHERE trade_id = %s",
+                                            (close_price, pnl, int(time.time()), leverage, trade_id)
                                         )
                                         ts_manager.close_position(symbol)
                                         current_positions[symbol] = None
