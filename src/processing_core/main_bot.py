@@ -45,18 +45,36 @@ console = Console()
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8-sig")
 sys.stderr.reconfigure(encoding="utf-8-sig")
 
-# Set up logging
+
+# === Dossier de logs ===
 os.makedirs("logs", exist_ok=True)
-log_level = logging.DEBUG if os.getenv("DEBUG_MODE") == "true" else logging.INFO
+
+# === Fichier log spécifique à main_bot ===
+log_file = "logs/main_bot.log"
+file_handler = RotatingFileHandler(log_file, maxBytes=2_000_000, backupCount=5)
+file_formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+file_handler.setFormatter(file_formatter)
+
+# === Console avec couleurs (via rich) ===
+console_handler = RichHandler(rich_tracebacks=True, markup=True)
+console_formatter = logging.Formatter("%(message)s")
+console_handler.setFormatter(console_formatter)
+
+# === Configuration globale du logging ===
 logging.basicConfig(
-    level=log_level,
-    format='%(asctime)s - %(levelname)s - [%(name)s] %(message)s',
-    handlers=[
-        RotatingFileHandler('logs/trading_bot.log', maxBytes=1_000_000, backupCount=3, encoding="utf-8-sig"),
-        RichHandler(console=console, rich_tracebacks=True)
-    ]
+    level=logging.DEBUG,  # ← Affiche tout, même DEBUG
+    handlers=[file_handler, console_handler],
+    encoding="utf-8-sig"
 )
-logger = logging.getLogger(__name__)
+
+# === Logger spécifique à ce module ===
+logger = logging.getLogger("main_bot")
+
+# Réduction du bruit de certains modules
+logging.getLogger('socketio').setLevel(logging.CRITICAL)
+logging.getLogger('werkzeug').setLevel(logging.WARNING)
+logging.getLogger('engineio').setLevel(logging.CRITICAL)
+
 
 # Load configuration
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
