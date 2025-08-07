@@ -4,62 +4,244 @@ import pandas as pd
 import numpy as np
 import datetime
 import logging
-import json
+import os
+import yaml
+from pathlib import Path
+import talib
 from scipy.stats import norm
 
-# Configuration du logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s: %(message)s')
+# === Create a logs folder if it doesn't exist ===
+log_dir = "logs"
+os.makedirs(log_dir, exist_ok=True)
+
+# === Format filename with timestamp ===
+log_filename = datetime.datetime.now().strftime("backtest_%Y%m%d_%H%M%S.log")
+log_path = os.path.join(log_dir, log_filename)
+
+# === Configure the logger ===
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s: %(message)s",
+    handlers=[
+        logging.FileHandler(log_path),
+        logging.StreamHandler()
+    ]
+)
+
 logger = logging.getLogger(__name__)
+
+# === Load configuration ===
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+config_path = os.path.join(project_root, 'config', 'config.yaml')
+if not os.path.exists(config_path):
+    logger.error(f"Configuration file not found: {config_path}")
+    raise FileNotFoundError(f"Configuration file not found: {config_path}")
+
+with open(config_path, 'r', encoding='utf-8') as f:
+    config = yaml.safe_load(f)
+
+binance_config = config.get("binance", {})
+SYMBOLS = binance_config.get("symbols", ['BTCUSDT', 'ETHUSDT', 'XRPUSDT'])
+CAPITAL = binance_config.get("capital", 10000.0)
+LEVERAGE = binance_config.get("leverage", 50.0)
+TIMEFRAME = binance_config.get("timeframe", "1m")
+TRAILING_UPDATE_INTERVAL = binance_config.get("trailing_update_interval", 10)
+MAX_CONCURRENT_TRADES = binance_config.get("max_concurrent_trades", 1)
+MAX_DRAWDOWN = 0.05 * CAPITAL
+
+class UltraAgressiveTrailingStop:
+    def __init__(self, symbol, trailing_distance_range=(0.002, 0.03), smoothing_alpha=0.3):
+        self.symbol = symbol
+        self.trailing_distance_range = trailing_distance_range
+        self.smoothing_alpha = smoothing_alpha
+        self.entry_price = 0.0
+        self.current_stop_price = 0.0
+        self.position_type = None
+        self.quantity = 0.0
+        self.trade_id = None
+        self.active = False
+        self.initial_stop_loss = 0.02
+        self.smoothed_atr = None
+        self.price_precision = 4 if symbol not in ['BTCUSDT', 'ETHUSDT'] else 2
+        self.qty_precision = 2 if symbol not in ['BTCUSDT', 'ETHUSDT'] else 3
+        self.price_tick = 0.0001
+
+    def _update_smoothed_atr(self, new_atr):
+        if self.smoothed_atr is None:
+            self.smoothed_atr = new_atr
+        else:
+            self.smoothed_atr = (
+                self.smoothing_alpha * new_atr + (1 - self.smoothing_alpha) * self.smoothed_atr
+            )
+        return self.smoothed_atr
+
+    def _compute_trailing_distance(self, atr, adx, current_price):
+        if atr is None or atr <= 0 or current_price <= 0:
+            logger.warning(f"[{self.symbol}] ⚠️ Invalid ATR or price for trailing stop calculation.")
+            return self.trailing_distance_range[0]
+        
+        atr_smooth = self._update_smoothed_atr(atr)
+        spread = 0.0001  # Simplified for backtest
+        base_trail = max((atr_smooth / current_price) * 1.5, spread / current_price + 0.5 * atr_smooth / current_price)
+        adx_factor = max(0.2, min(1.0, 1.2 - (adx / 100)))
+        trail = base_trail * adx_factor
+        trail = max(self.trailing_distance_range[0], min(trail, self.trailing_distance_range[1]))
+        logger.debug(
+            f"[{self.symbol}] ATR={atr:.5f}, ATR_Smooth={atr_smooth:.5f}, ADX={adx:.2f}, "
+            f"Spread={spread:.5f}, Base={base_trail:.5f}, ADX_Factor={adx_factor:.2f}, Final Trailing Distance={trail:.5f}"
+        )
+        return trail
+
+    def initialize_trailing_stop(self, entry_price, position_type, quantity, atr, adx, trade_id):
+        self.entry_price = float(entry_price)
+        self.position_type = position_type
+        self.quantity = float(quantity)
+        self.trade_id = str(trade_id)
+        self.active = True
+
+        if self.entry_price <= 0:
+            logger.error(f"[{self.symbol}] ❌ Invalid entry_price: {self.entry_price}")
+            return None
+
+        current_price = entry_price  # Use entry price initially for backtest
+        trailing_dist = self._compute_trailing_distance(atr, adx, current_price)
+        initial_stop_dist = self.initial_stop_loss
+
+        if self.position_type == 'long':
+            stop_price = current_price * (1 - initial_stop_dist)
+            self.current_stop_price = stop_price
+        else:
+            stop_price = current_price * (1 + initial_stop_dist)
+            self.current_stop_price = stop_price
+
+        logger.info(f"[{self.symbol}] ✅ Initial stop-loss placed at {stop_price} "
+                    f"(Qty: {self.quantity}, trade_id: {self.trade_id}, trailing_dist: {trailing_dist:.6f})")
+        return self.trade_id
+
+    def update_trailing_stop(self, current_price, atr, adx):
+        if not self.active or not self.entry_price:
+            logger.error(f"[{self.symbol}] ❌ No active trailing stop or invalid entry_price")
+            return
+
+        current_price = float(current_price)
+        if current_price <= 0:
+            logger.error(f"[{self.symbol}] ❌ Invalid current_price: {current_price}")
+            return
+
+        trailing_dist = self._compute_trailing_distance(atr, adx, current_price)
+
+        if self.position_type == 'long':
+            new_stop = current_price * (1 - trailing_dist)
+            should_update = new_stop > self.current_stop_price
+        else:
+            new_stop = current_price * (1 + trailing_dist)
+            should_update = new_stop < self.current_stop_price
+
+        if should_update:
+            self.current_stop_price = new_stop
+            logger.info(f"[{self.symbol}] 🔄 Trailing stop updated to {new_stop} (trade_id: {self.trade_id})")
+
+    def verify_order_execution(self, current_price):
+        if not self.active:
+            return False
+
+        if self.position_type == 'long' and current_price <= self.current_stop_price:
+            exit_price = self.current_stop_price
+            pnl = (exit_price - self.entry_price) * self.quantity
+            logger.info(f"[{self.symbol}] ✅ Trailing stop executed at {exit_price}, PNL: {pnl:.4f}")
+            self.close_position()
+            return True
+        elif self.position_type == 'short' and current_price >= self.current_stop_price:
+            exit_price = self.current_stop_price
+            pnl = (self.entry_price - exit_price) * self.quantity
+            logger.info(f"[{self.symbol}] ✅ Trailing stop executed at {exit_price}, PNL: {pnl:.4f}")
+            self.close_position()
+            return True
+        return False
+
+    def close_position(self):
+        if self.active:
+            self.active = False
+            self.current_stop_price = 0.0
+            logger.info(f"[{self.symbol}] ✅ Position closed and trailing stop removed for trade_id: {self.trade_id}")
+
+class TrailingStopManager:
+    def __init__(self):
+        self.stops = {}
+
+    def has_trailing_stop(self, symbol):
+        return symbol in self.stops and self.stops[symbol].active
+
+    def initialize_trailing_stop(self, symbol, entry_price, position_type, quantity, atr, adx, trade_id):
+        if symbol not in self.stops:
+            self.stops[symbol] = UltraAgressiveTrailingStop(symbol)
+        return self.stops[symbol].initialize_trailing_stop(entry_price, position_type, quantity, atr, adx, trade_id)
+
+    def update_trailing_stop(self, symbol, current_price, atr, adx):
+        if symbol in self.stops and self.stops[symbol].active:
+            self.stops[symbol].update_trailing_stop(current_price, atr, adx)
+            if self.stops[symbol].verify_order_execution(current_price):
+                self.close_position(symbol)
+
+    def close_position(self, symbol):
+        if symbol in self.stops and self.stops[symbol].active:
+            self.stops[symbol].close_position()
+            del self.stops[symbol]
+            logger.info(f"[{symbol}] ✅ Trailing stop manager closed position")
+
+    def get_current_stop_price(self, symbol, trade_id=None):
+        if symbol in self.stops and self.stops[symbol].active:
+            return self.stops[symbol].current_stop_price
+        return None
 
 class MyTradingStrategy(bt.Strategy):
     params = (
-        ('initial_stop_loss_pct', 0.02),  # Stop-loss initial de 2%
-        ('take_profit_multiples', [1.5, 3.0, 5.0]),  # Multiples ATR pour TPs
-        ('trailing_atr_multiplier', 0.8),  # Multiplicateur pour trailing stop
-        ('trailing_min_pct', 0.002),  # Trailing stop minimum de 0.2%
-        ('trailing_max_pct', 0.03),  # Trailing stop maximum de 3%
-        ('adx_trend_threshold', 30),  # Seuil ADX pour tendance
-        ('adx_range_threshold', 15),  # Seuil ADX pour range
-        ('rsi_range_low', 40),  # Seuil bas RSI pour range
-        ('rsi_range_high', 60),  # Seuil haut RSI pour range
-        ('atr_range_threshold', 30),  # Seuil ATR pour range
-        ('position_size_ratio', 0.95),  # Ratio du capital par position
-        ('leverage', 10),  # Effet de levier
-        ('max_concurrent_trades', 3),  # Maximum de trades simultanés
-        ('var_confidence_level', 0.95),  # Niveau de confiance pour VaR (95%)
-        ('kelly_fraction', 0.5),  # Fraction du Kelly Criterion pour sizing
-        ('min_volume_threshold', 1000),  # Volume minimum pour valider un trade
+        ('capital', CAPITAL),
+        ('leverage', LEVERAGE),
+        ('max_concurrent_trades', MAX_CONCURRENT_TRADES),
+        ('trailing_distance_range', (0.002, 0.03)),
+        ('smoothing_alpha', 0.3),
+        ('adx_trend_threshold', 30),
+        ('adx_range_threshold', 15),
+        ('rsi_range_low', 40),
+        ('rsi_range_high', 60),
+        ('atr_range_threshold', 30),
+        ('min_volume_threshold', 5),
+        ('atr_period', 14),
+        ('adx_period', 14),
     )
 
     def __init__(self):
-        self.active_positions = {}  # Dictionnaire pour suivre les positions par actif
-        self.orders = {}  # Dictionnaire pour suivre les ordres par actif
-        self.stop_loss_orders = {}  # Dictionnaire pour stop-loss par actif
-        self.take_profit_orders = {}  # Dictionnaire pour take-profits par actif
-        self.entry_prices = {}  # Prix d'entrée par actif
-        self.open_trades_count = 0  # Compteur de trades ouverts
+        self.orders = {}
+        self.active_positions = {}
+        self.ts_manager = TrailingStopManager()
+        self.atr = {}
+        self.adx = {}
+        self.rsi = {}
+        self.macd = {}
+        self.ema20 = {}
+        self.ema50 = {}
+        self.roc = {}
+        self.last_signal = {}
+        self.open_trades_count = 0
+        self.current_positions = {symbol: None for symbol in SYMBOLS}
+        self.last_order_details = {symbol: None for symbol in SYMBOLS}
+        self.last_action_sent = {symbol: None for symbol in SYMBOLS}
 
-        # Initialisation des indicateurs par actif
         for data in self.datas:
             symbol = data._name
-            self.active_positions[symbol] = None
             self.orders[symbol] = None
-            self.stop_loss_orders[symbol] = None
-            self.take_profit_orders[symbol] = []
-            self.entry_prices[symbol] = 0.0
+            self.active_positions[symbol] = None
+            self.atr[symbol] = btind.ATR(data, period=self.p.atr_period)
+            self.adx[symbol] = btind.ADX(data, period=self.p.adx_period)
+            self.rsi[symbol] = btind.RSI(data, period=14)
+            self.macd[symbol] = btind.MACD(data, period_me1=12, period_me2=26, period_signal=9)
+            self.ema20[symbol] = btind.EMA(data, period=20)
+            self.ema50[symbol] = btind.EMA(data, period=50)
+            self.roc[symbol] = btind.ROC(data, period=5)
+            self.last_signal[symbol] = None
 
-            # Indicateurs
-            setattr(self, f'rsi_{symbol}', btind.RSI(data, period=14))
-            setattr(self, f'macd_{symbol}', btind.MACD(data))
-            setattr(self, f'macd_signal_{symbol}', getattr(self, f'macd_{symbol}').signal)
-            setattr(self, f'adx_{symbol}', btind.ADX(data, period=14))
-            setattr(self, f'ema20_{symbol}', btind.EMA(data, period=20))
-            setattr(self, f'ema50_{symbol}', btind.EMA(data, period=50))
-            setattr(self, f'atr_{symbol}', btind.ATR(data, period=14))
-            setattr(self, f'roc_{symbol}', btind.ROC(data, period=5))
-
-        self.last_signal = {}  # Dernier signal par actif
-        logger.info("Stratégie initialisée pour backtest multi-actifs.")
+        logger.info("Strategy initialized for multi-asset backtest.")
 
     def log(self, txt, dt=None, symbol=None):
         dt = dt or self.datas[0].datetime.datetime(0)
@@ -68,58 +250,67 @@ class MyTradingStrategy(bt.Strategy):
 
     def notify_order(self, order):
         symbol = order.data._name
-
-        # Ignore until order is completed
         if order.status in [order.Submitted, order.Accepted]:
             return
 
-        # === ORDER COMPLETED ===
         if order.status == order.Completed:
             if order.isbuy():
-                self.log(f'BUY EXÉCUTÉ, Prix: {order.executed.price:.2f}, Coût: {order.executed.value:.2f}, Comm: {order.executed.comm:.2f}', symbol=symbol)
-                self.entry_prices[symbol] = order.executed.price
+                self.log(f'BUY EXECUTED, Price: {order.executed.price:.2f}, Cost: {order.executed.value:.2f}, Comm: {order.executed.comm:.2f}', symbol=symbol)
                 self.active_positions[symbol] = 'long'
-                self.open_trades_count += 1
-
+                self.current_positions[symbol] = {
+                    'side': 'long',
+                    'quantity': order.executed.size,
+                    'price': order.executed.price,
+                    'trade_id': order.ref
+                }
+                atr = self.atr[symbol][0]
+                adx = self.adx[symbol][0]
+                self.ts_manager.initialize_trailing_stop(
+                    symbol=symbol,
+                    entry_price=order.executed.price,
+                    position_type='long',
+                    quantity=order.executed.size,
+                    atr=atr,
+                    adx=adx,
+                    trade_id=str(order.ref)
+                )
             elif order.issell():
-                self.log(f'SELL EXÉCUTÉ, Prix: {order.executed.price:.2f}, Coût: {order.executed.value:.2f}, Comm: {order.executed.comm:.2f}', symbol=symbol)
-                self.entry_prices[symbol] = order.executed.price
+                self.log(f'SELL EXECUTED, Price: {order.executed.price:.2f}, Cost: {order.executed.value:.2f}, Comm: {order.executed.comm:.2f}', symbol=symbol)
                 self.active_positions[symbol] = 'short'
-                self.open_trades_count += 1
+                self.current_positions[symbol] = {
+                    'side': 'short',
+                    'quantity': abs(order.executed.size),
+                    'price': order.executed.price,
+                    'trade_id': order.ref
+                }
+                atr = self.atr[symbol][0]
+                adx = self.adx[symbol][0]
+                self.ts_manager.initialize_trailing_stop(
+                    symbol=symbol,
+                    entry_price=order.executed.price,
+                    position_type='short',
+                    quantity=abs(order.executed.size),
+                    atr=atr,
+                    adx=adx,
+                    trade_id=str(order.ref)
+                )
 
-            # If no open position after execution, it was a closing order
             if not self.getposition(data=order.data).size:
-                self.log('ORDRE DE CLÔTURE EXÉCUTÉ. Position fermée.', symbol=symbol)
+                self.log('CLOSURE ORDER EXECUTED. Position closed.', symbol=symbol)
                 self.active_positions[symbol] = None
-                self.entry_prices[symbol] = 0.0
+                self.current_positions[symbol] = None
                 self.open_trades_count -= 1
-                self.cancel_all_pending_orders(symbol)
-                self.stop_loss_orders[symbol] = None
-                self.take_profit_orders[symbol] = []
+                self.ts_manager.close_position(symbol)
 
-        # === ORDER FAILED ===
         elif order.status in [order.Canceled, order.Margin, order.Rejected]:
-            self.log(f'ORDRE ANNULÉ/MARGE/REJETÉ: Type={order.getordername()}, Status={order.getstatusname()}, Info={order.info}', symbol=symbol)
-            if order == self.orders.get(symbol):
-                self.orders[symbol] = None
+            self.log(f'ORDER CANCELED/MARGIN/REJECTED: Type={order.getordername()}, Status={order.getstatusname()}', symbol=symbol)
+            self.orders[symbol] = None
 
-        # Clean up order tracking
         self.orders[symbol] = None
-
 
     def notify_trade(self, trade):
         if trade.isclosed:
-            self.log(f'TRADE CLÔTURÉ: Brute PnL: {trade.pnl:.2f}, Net PnL: {trade.pnlcomm:.2f}', symbol=trade.data._name)
-
-    def cancel_all_pending_orders(self, symbol):
-        if self.stop_loss_orders.get(symbol) and self.stop_loss_orders[symbol].status == bt.Order.Submitted:
-            self.cancel(self.stop_loss_orders[symbol])
-            self.log("Ancien stop-loss annulé.", symbol=symbol)
-        for tp_order in self.take_profit_orders.get(symbol, []):
-            if tp_order.status == bt.Order.Submitted:
-                self.cancel(tp_order)
-                self.log("Ancien take-profit annulé.", symbol=symbol)
-        self.take_profit_orders[symbol] = []
+            self.log(f'TRADE CLOSED ({trade.data._name}): Gross PnL: {trade.pnl:.2f}, Net PnL: {trade.pnlcomm:.2f}', symbol=trade.data._name)
 
     def prepare_lstm_input(self, data):
         if len(data) < 100:
@@ -127,14 +318,15 @@ class MyTradingStrategy(bt.Strategy):
         df = pd.DataFrame({
             'close': data.close.get(size=100),
             'volume': data.volume.get(size=100),
-            'RSI': getattr(self, f'rsi_{data._name}').get(size=100),
-            'MACD': getattr(self, f'macd_{data._name}').macd.get(size=100),
-            'ADX': getattr(self, f'adx_{data._name}').get(size=100)
+            'RSI': self.rsi[data._name].get(size=100),
+            'MACD': self.macd[data._name].macd.get(size=100),
+            'ADX': self.adx[data._name].get(size=100)
         })
-        df = df.ffill().bfill()
-        data_array = df.values.astype(float)
-        data_array = np.nan_to_num(data_array, nan=0.0, posinf=0.0, neginf=0.0)
-        return data_array.reshape(1, 100, 5)
+        data = df.values.astype(float)
+        if np.isnan(data).any():
+            df = df.ffill().bfill()
+            data = np.nan_to_num(df.values.astype(float), nan=0.0, posinf=0.0, neginf=0.0)
+        return data.reshape(1, 100, 5)
 
     def simulate_lstm_prediction(self, data):
         if len(data) < 100:
@@ -142,11 +334,10 @@ class MyTradingStrategy(bt.Strategy):
         lstm_input = self.prepare_lstm_input(data)
         if lstm_input is None:
             return 0.5
-        # Simulation simple : combinaison pondérée des indicateurs
-        rsi_val = getattr(self, f'rsi_{data._name}')[0]
-        macd_val = getattr(self, f'macd_{data._name}').macd[0]
-        macd_signal_val = getattr(self, f'macd_signal_{data._name}')[0]
-        adx_val = getattr(self, f'adx_{data._name}')[0]
+        rsi_val = self.rsi[data._name][0]
+        macd_val = self.macd[data._name].macd[0]
+        macd_signal_val = self.macd[data._name].signal[0]
+        adx_val = self.adx[data._name][0]
         prediction = 0.5
         if rsi_val > 55 and macd_val > macd_signal_val and adx_val > 20:
             prediction = 0.7
@@ -154,292 +345,275 @@ class MyTradingStrategy(bt.Strategy):
             prediction = 0.3
         return prediction
 
+    def calculate_dynamic_thresholds(self, adx, strategy_mode):
+        base_up, base_down = {
+            "trend": (0.60, 0.40),
+            "scalp": (0.65, 0.35),
+            "range": (0.55, 0.45)
+        }.get(strategy_mode, (0.55, 0.45))
+        adj = (adx / 1000)
+        up = max(base_up - adj, base_down + 0.05)
+        down = min(base_down + adj, up - 0.05)
+        return round(up, 3), round(down, 3)
+
+    def select_strategy_mode(self, adx, rsi, atr):
+        if adx > self.p.adx_trend_threshold:
+            return "trend"
+        elif adx < self.p.adx_range_threshold and self.p.rsi_range_low < rsi < self.p.rsi_range_high and atr < self.p.atr_range_threshold:
+            return "range"
+        return "scalp"
+
+    def log_indicator_summary(self, symbol, rsi, macd, adx, ema20, ema50, atr, roc, confidence_factors):
+        table = f"""
+        Indicator Summary for {symbol}:
+        RSI: {rsi:.2f} ({'Near oversold' if rsi < 30 else 'Near overbought' if rsi > 70 else 'Neutral'})
+        MACD: {macd:.4f} ({'Bullish' if macd > 0.5 else 'Bearish' if macd < -0.5 else 'Neutral'})
+        ADX: {adx:.2f} ({'Strong trend' if adx >= 50 else 'Moderate trend' if adx >= 25 else 'Weak trend'})
+        EMA20 vs EMA50: {ema20:.4f} {'>' if ema20 > ema50 else '<'} {ema50:.4f} ({'Bullish' if ema20 > ema50 else 'Bearish'})
+        ROC: {roc:.2f}% ({'Strong bullish' if roc > 1 else 'Strong bearish' if roc < -1 else 'Neutral'})
+        Confidence Factors: {', '.join(confidence_factors) if confidence_factors else 'None'}
+        """
+        self.log(table, symbol=symbol)
+
     def backtest_signal(self, data, action, threshold):
-        past_data = pd.DataFrame({
-            'close': data.close.get(size=100)
-        })
-        past_signals = past_data[past_data['close'].shift(1) > threshold if action == 'buy' else past_data['close'].shift(1) < threshold]
-        if len(past_signals) < 5:
-            self.log(f"[Backtest] Insufficient signals ({len(past_signals)}) for {action}", symbol=data._name)
+        try:
+            returns = pd.Series(data.close.get(size=100)).pct_change().dropna()
+            if len(returns) < 5:
+                return False
+            sharpe_ratio = returns.mean() / returns.std() * np.sqrt(252) if returns.std() != 0 else 0
+            return sharpe_ratio > 0.5
+        except Exception as e:
+            self.log(f"Error in backtest_signal: {e}", symbol=data._name)
             return False
-        returns = past_signals['close'].pct_change().dropna()
-        sharpe_ratio = (returns.mean() / returns.std()) * np.sqrt(252) if returns.std() != 0 else 0
-        self.log(f"[Backtest] Sharpe ratio for {action}: {sharpe_ratio:.2f}", symbol=data._name)
-        return sharpe_ratio > 0.5
-
-    def calculate_var(self, data, position_size, confidence_level=0.95):
-        returns = pd.Series(data.close.get(size=100)).pct_change().dropna()
-        mean_return = returns.mean()
-        std_return = returns.std()
-        var = norm.ppf(1 - confidence_level, mean_return, std_return) * position_size
-        return abs(var)
-
-    def calculate_kelly_size(self, data, win_prob, win_loss_ratio):
-        if win_prob <= 0 or win_loss_ratio <= 0:
-            return 0.0
-        kelly = (win_prob - (1 - win_prob) / win_loss_ratio) * self.p.kelly_fraction
-        return max(0.0, min(self.p.position_size_ratio, kelly))
 
     def generate_trading_signal(self, data):
         symbol = data._name
         if len(data) < 100:
-            return "hold"
+            self.log(f"Not enough data for {symbol}: {len(data)} rows", symbol=symbol)
+            return "hold", None, 0.0, []
 
-        current_adx = getattr(self, f'adx_{symbol}')[0]
-        current_rsi = getattr(self, f'rsi_{symbol}')[0]
-        current_macd = getattr(self, f'macd_{symbol}').macd[0]
-        current_macd_signal = getattr(self, f'macd_signal_{symbol}')[0]
-        current_ema20 = getattr(self, f'ema20_{symbol}')[0]
-        current_ema50 = getattr(self, f'ema50_{symbol}')[0]
-        current_atr = getattr(self, f'atr_{symbol}')[0]
-        current_roc = getattr(self, f'roc_{symbol}')[0] * 100
         current_price = data.close[0]
-        current_volume = data.volume[0]
+        rsi = self.rsi[symbol][0]
+        macd = self.macd[symbol].macd[0]
+        signal_line = self.macd[symbol].signal[0]
+        adx = self.adx[symbol][0]
+        ema20 = self.ema20[symbol][0]
+        ema50 = self.ema50[symbol][0]
+        atr = self.atr[symbol][0]
+        roc = self.roc[symbol][0] * 100
+        volume = data.volume[0]
 
-        # Validation du volume
-        if current_volume < self.p.min_volume_threshold:
-            self.log(f"Volume trop faible ({current_volume:.2f}) pour {symbol}, signal ignoré.", symbol=symbol)
-            return "hold"
+        if volume < self.p.min_volume_threshold:
+            self.log(f"Volume too low ({volume:.2f}) for {symbol}, signal ignored.", symbol=symbol)
+            return "hold", None, 0.0, []
 
-        # Détection du régime de marché
-        strategy_mode = "scalp"
-        if current_adx > self.p.adx_trend_threshold:
-            strategy_mode = "trend"
-        elif current_adx < self.p.adx_range_threshold and self.p.rsi_range_low < current_rsi < self.p.rsi_range_high and current_atr < self.p.atr_range_threshold:
-            strategy_mode = "range"
+        strategy_mode = self.select_strategy_mode(adx, rsi, atr)
+        self.log(f"Switched to {strategy_mode}, ADX: {adx:.2f}, RSI: {rsi:.2f}, ATR: {atr:.2f}, ROC: {roc:.2f}", symbol=symbol)
 
-        # Seuil dynamique basé sur l'ADX
-        base_up, base_down = {"trend": (0.60, 0.40), "scalp": (0.65, 0.35), "range": (0.55, 0.45)}.get(strategy_mode, (0.55, 0.45))
-        adj = (current_adx / 1000)
-        dynamic_up = max(base_up - adj, base_down + 0.05)
-        dynamic_down = min(base_down + adj, dynamic_up - 0.05)
-
-        # Prédiction LSTM simulée
         prediction = self.simulate_lstm_prediction(data)
+        self.log(f"LSTM prediction for {symbol}: {prediction:.4f}", symbol=symbol)
 
-        # Conditions de signal
-        trend_up = current_ema20 > current_ema50
-        trend_down = current_ema20 < current_ema50
-        macd_bullish = current_macd > current_macd_signal
-        rsi_strong = (trend_up and current_rsi > 50) or (trend_down and current_rsi < 45) or (abs(current_rsi - 50) > 15)
-        rolling_high = max(data.high.get(size=20))
-        rolling_low = min(data.low.get(size=20))
-        breakout_up = current_price > (rolling_high - 0.1 * current_atr)
-        breakout_down = current_price < (rolling_low + 0.1 * current_atr)
-        bullish_divergence = (data.close[0] < data.close[-3] and current_rsi > getattr(self, f'rsi_{symbol}')[-3])
-        bearish_divergence = (data.close[0] > data.close[-3] and current_rsi < getattr(self, f'rsi_{symbol}')[-3])
+        dynamic_up, dynamic_down = self.calculate_dynamic_thresholds(adx, strategy_mode)
+        self.log(f"Thresholds → Prediction: {prediction:.4f}, Dynamic Down: {dynamic_down:.4f}, Dynamic Up: {dynamic_up:.4f}", symbol=symbol)
+
+        trend_up = ema20 > ema50
+        trend_down = ema20 < ema50
+        macd_bullish = macd > signal_line
+        rsi_strong = (trend_up and rsi > 50) or (trend_down and rsi < 45) or (abs(rsi - 50) > 15)
+        rolling_high = pd.Series(data.high.get(size=20)).max()
+        rolling_low = pd.Series(data.low.get(size=20)).min()
+        breakout_up = current_price > (rolling_high - 0.1 * atr)
+        breakout_down = current_price < (rolling_low + 0.1 * atr)
+        bullish_divergence = (data.close[0] < data.close[-3] and self.rsi[symbol][0] > self.rsi[symbol][-3])
+        bearish_divergence = (data.close[0] > data.close[-3] and self.rsi[symbol][0] < self.rsi[symbol][-3])
 
         confidence_factors = []
         if prediction > 0.55 or prediction < 0.45:
             confidence_factors.append("LSTM strong")
-        if (trend_up and current_macd > current_macd_signal) or (trend_down and current_macd < current_macd_signal):
+        if (trend_up and macd > signal_line) or (trend_down and macd < signal_line):
             confidence_factors.append("MACD aligned")
-        if current_rsi > 50 or current_rsi < 50:
+        if rsi > 50 or rsi < 50:
             confidence_factors.append("RSI strong")
-        if (trend_up and current_ema20 > current_ema50) or (trend_down and current_ema20 < current_ema50):
+        if (trend_up and ema20 > ema50) or (trend_down and ema20 < ema50):
             confidence_factors.append("EMA trend")
-        if abs(current_roc) > 0.5:
+        if abs(roc) > 0.5:
             confidence_factors.append("ROC momentum")
         if breakout_up or breakout_down:
             confidence_factors.append("Breakout detected")
 
-        self.log(f"Indicateurs: RSI={current_rsi:.2f}, MACD={current_macd:.4f}, ADX={current_adx:.2f}, ROC={current_roc:.2f}, Mode={strategy_mode}, Confiance={len(confidence_factors)}/6", symbol=symbol)
+        self.log_indicator_summary(symbol, rsi, macd, adx, ema20, ema50, atr, roc, confidence_factors)
 
-        # Validation du signal
         action = "hold"
-        if len(confidence_factors) < 3:
-            self.log(f"Signal rejeté: Confiance insuffisante ({len(confidence_factors)}/6)", symbol=symbol)
-            return action
+        new_position = None
+        signal_timestamp = int(data.datetime.datetime(0).timestamp() * 1000)
+
+        expected_pnl = atr * 2 if atr > 1 else current_price * 0.01
+        risk_reward_ratio = expected_pnl / atr if atr > 0 else 0
+        if len(confidence_factors) < 3 or risk_reward_ratio < 1.5:
+            self.log(f"Signal rejected: Insufficient confidence ({len(confidence_factors)}/6) or risk/reward ratio ({risk_reward_ratio:.2f} < 1.5)", symbol=symbol)
+            return "hold", None, 0.0, confidence_factors
+
+        if action in ["buy", "sell"] and not self.backtest_signal(data, action, dynamic_up if action == 'buy' else dynamic_down):
+            self.log(f"Signal rejected: Backtest failed for {action}", symbol=symbol)
+            return "hold", None, 0.0, confidence_factors
 
         if strategy_mode == "scalp" and rsi_strong:
-            if prediction > dynamic_up and current_roc > 0.5 and self.backtest_signal(data, "buy", dynamic_up):
-                action = "buy"
-            elif prediction < dynamic_down and current_roc < -0.5 and self.backtest_signal(data, "sell", dynamic_down):
+            if prediction > dynamic_up and roc > 0.5:
                 action = "sell"
+                new_position = "short"
+            elif prediction < dynamic_down and roc < -0.5:
+                action = "buy"
+                new_position = "long"
         elif strategy_mode == "trend":
-            if trend_up and macd_bullish and prediction > dynamic_up and current_roc > 0.5 and self.backtest_signal(data, "buy", dynamic_up):
+            if trend_up and macd_bullish and prediction > dynamic_up and roc > 0.5:
                 action = "buy"
-            elif trend_down and not macd_bullish and prediction < dynamic_down and current_roc < -0.5 and self.backtest_signal(data, "sell", dynamic_down):
+                new_position = "long"
+            elif trend_down and not macd_bullish and prediction < dynamic_down and roc < -0.5:
                 action = "sell"
+                new_position = "short"
         elif strategy_mode == "range":
-            if current_price <= (rolling_low + 0.1 * current_atr) and prediction > dynamic_up and current_roc > 0.3 and self.backtest_signal(data, "buy", dynamic_up):
+            if current_price <= (rolling_low + 0.1 * atr) and prediction > dynamic_up and roc > 0.3:
                 action = "buy"
-            elif current_price >= (rolling_high - 0.1 * current_atr) and prediction < dynamic_down and current_roc < -0.3 and self.backtest_signal(data, "sell", dynamic_down):
+                new_position = "long"
+            elif current_price >= (rolling_high - 0.1 * atr) and prediction < dynamic_down and roc < -0.3:
                 action = "sell"
+                new_position = "short"
 
-        if bullish_divergence and prediction > 0.65 and current_roc > 0.5 and self.backtest_signal(data, "buy", dynamic_up):
+        if bullish_divergence and prediction > 0.65 and roc > 0.5:
             action = "buy"
-        elif bearish_divergence and prediction < 0.35 and current_roc < -0.5 and self.backtest_signal(data, "sell", dynamic_down):
+            new_position = "long"
+        elif bearish_divergence and prediction < 0.35 and roc < -0.5:
             action = "sell"
+            new_position = "short"
 
-        if self.active_positions[symbol] == "long" and (trend_down or not macd_bullish or current_roc < -0.5):
+        current_position = self.current_positions.get(symbol)
+        if current_position == "long" and (trend_down or not macd_bullish or roc < -0.5):
             action = "close_buy"
-        elif self.active_positions[symbol] == "short" and (trend_up or macd_bullish or current_roc > 0.5):
+            new_position = None
+        elif current_position == "short" and (trend_up or macd_bullish or roc > 0.5):
             action = "close_sell"
+            new_position = None
+        elif current_position is None and action in ["buy", "sell"]:
+            quantity = (self.p.capital * self.p.leverage) / current_price if current_price > 0 else 0.0
+            new_position = {
+                "side": "long" if action == "buy" else "short",
+                "quantity": quantity,
+                "price": current_price,
+                "trade_id": str(signal_timestamp)
+            }
 
-        if action == self.last_signal.get(symbol):
-            self.log(f"Signal {action} ignoré (répétition).", symbol=symbol)
-            return "hold"
+        weights = {
+            "LSTM strong": 0.30,
+            "MACD aligned": 0.20,
+            "RSI strong": 0.20,
+            "EMA trend": 0.15,
+            "ROC momentum": 0.15,
+            "Breakout detected": 0.10
+        }
+        confidence = sum(weights[f] for f in confidence_factors if f in weights)
 
-        return action
+        if action != "hold":
+            self.log(f"Action generated: {action}, Confidence: {len(confidence_factors)}/6, Prediction: {prediction:.4f}, Risk/Reward: {risk_reward_ratio:.2f}", symbol=symbol)
+
+        if self.last_action_sent.get(symbol) and isinstance(self.last_action_sent[symbol], tuple) and action == self.last_action_sent[symbol][0]:
+            self.log(f"Signal {action} ignored as it was sent previously.", symbol=symbol)
+            return "hold", None, 0.0, []
+
+        if action != "hold":
+            self.last_action_sent[symbol] = (action, signal_timestamp)
+
+        return action, new_position, confidence, confidence_factors
 
     def next(self):
         for data in self.datas:
             symbol = data._name
-            if self.open_trades_count >= self.p.max_concurrent_trades and not self.active_positions[symbol]:
-                self.log(f"Max trades atteint ({self.open_trades_count}/{self.p.max_concurrent_trades}), pas de nouveau trade pour {symbol}.", symbol=symbol)
-                continue
-
-            action = self.generate_trading_signal(data)
             current_price = data.close[0]
-            current_atr = getattr(self, f'atr_{symbol}')[0]
-            current_adx = getattr(self, f'adx_{symbol}')[0]
+            position = self.getposition(data=data)
 
-            if action == "hold":
-                self.update_trailing_stop(data, symbol, current_price, current_atr, current_adx)
+            if self.open_trades_count >= self.p.max_concurrent_trades and not position.size:
+                self.log(f"Max concurrent trades ({self.open_trades_count}/{self.p.max_concurrent_trades}) reached, skipping {symbol}", symbol=symbol)
                 continue
 
-            # Calcul de la taille de la position
-            capital = self.broker.getcash()
-            position_value = capital * self.p.position_size_ratio / self.p.max_concurrent_trades
-            var = self.calculate_var(data, position_value, self.p.var_confidence_level)
-            win_prob = 0.6 if action == "buy" else 0.4  # Simplification
-            win_loss_ratio = 2.0  # Simplification
-            kelly_size = self.calculate_kelly_size(data, win_prob, win_loss_ratio)
-            size = min(position_value / current_price, (capital * kelly_size) / current_price)
-            size = max(0, size / self.p.leverage)
+            action, new_position, confidence, confidence_factors = self.generate_trading_signal(data)
 
-            self.cancel_all_pending_orders(symbol)
+            if action == "hold" or confidence < 0.5:
+                self.ts_manager.update_trailing_stop(symbol, current_price, self.atr[symbol][0], self.adx[symbol][0])
+                continue
 
-            if action == "buy":
-                self.log(f"Signal BUY détecté, taille: {size:.4f}", symbol=symbol)
-                self.orders[symbol] = self.buy(data=data, size=size, exectype=bt.Order.Market)
-                sl_price = current_price * (1 - self.p.initial_stop_loss_pct)
-                self.stop_loss_orders[symbol] = self.sell(data=data, size=size, exectype=bt.Order.Stop, price=sl_price)
-                for i, tp_multiple in enumerate(self.p.take_profit_multiples):
-                    tp_size = size / len(self.p.take_profit_multiples)
-                    tp_price = current_price * (1 + tp_multiple * current_atr / current_price)
-                    tp_order = self.sell(data=data, size=tp_size, exectype=bt.Order.Limit, price=tp_price)
-                    self.take_profit_orders[symbol].append(tp_order)
-                    self.log(f"Take-Profit {i+1} placé à {tp_price:.2f} pour {tp_size:.4f}", symbol=symbol)
-            elif action == "sell":
-                self.log(f"Signal SELL détecté, taille: {size:.4f}", symbol=symbol)
-                self.orders[symbol] = self.sell(data=data, size=size, exectype=bt.Order.Market)
-                sl_price = current_price * (1 + self.p.initial_stop_loss_pct)
-                self.stop_loss_orders[symbol] = self.buy(data=data, size=size, exectype=bt.Order.Stop, price=sl_price)
-                for i, tp_multiple in enumerate(self.p.take_profit_multiples):
-                    tp_size = size / len(self.p.take_profit_multiples)
-                    tp_price = current_price * (1 - tp_multiple * current_atr / current_price)
-                    tp_order = self.buy(data=data, size=tp_size, exectype=bt.Order.Limit, price=tp_price)
-                    self.take_profit_orders[symbol].append(tp_order)
-                    self.log(f"Take-Profit {i+1} placé à {tp_price:.2f} pour {tp_size:.4f}", symbol=symbol)
-            elif action in ["close_buy", "close_sell"]:
-                position = self.getposition(data=data)
-                if position.size != 0:
-                    self.orders[symbol] = self.close(data=data, exectype=bt.Order.Market)
-                    self.log(f"Clôture de la position ({action})", symbol=symbol)
+            if action in ["buy", "sell"] and not position.size:
+                qty = (self.p.capital * self.p.leverage) / current_price
+                qty = max(qty, 0.001)  # Simulate min_qty
+                if self.broker.getcash() < qty * current_price / self.p.leverage:
+                    self.log(f"Insufficient margin for {symbol}", symbol=symbol)
+                    continue
 
-            self.last_signal[symbol] = action
+                if action == "buy":
+                    order = self.buy(data=data, size=qty)
+                else:
+                    order = self.sell(data=data, size=qty)
+                self.orders[symbol] = order
+                self.open_trades_count += 1
+                self.log(f"Placed {action} order for {symbol}, Qty: {qty:.4f}, Price: {current_price:.2f}", symbol=symbol)
 
-    def update_trailing_stop(self, data, symbol, current_price, current_atr, current_adx):
-        position = self.getposition(data=data)
-        if position.size == 0:
-            return
+            elif action in ["close_buy", "close_sell"] and position.size:
+                self.close(data=data)
+                self.log(f"Closing position for {symbol}", symbol=symbol)
 
-        remaining_size = abs(position.size)
-        if len(self.take_profit_orders[symbol]) > 0:
-            closed_tp = sum(tp.size for tp in self.take_profit_orders[symbol] if tp.status != bt.Order.Submitted)
-            remaining_size = max(0, abs(position.size) - closed_tp)
+            self.ts_manager.update_trailing_stop(symbol, current_price, self.atr[symbol][0], self.adx[symbol][0])
 
-        if remaining_size == 0:
-            return
-
-        dynamic_trailing_distance = current_atr * self.p.trailing_atr_multiplier
-        if current_adx > self.p.adx_trend_threshold:
-            dynamic_trailing_distance *= 0.8
-        elif current_adx < self.p.adx_range_threshold:
-            dynamic_trailing_distance *= 1.2
-
-        trailing_pct = dynamic_trailing_distance / current_price
-        trailing_pct = max(self.p.trailing_min_pct, min(self.p.trailing_max_pct, trailing_pct))
-        calculated_trailing_price = current_price * trailing_pct
-
-        new_sl_price = 0.0
-        if position.size > 0:  # Long
-            new_sl_price = max(self.entry_prices[symbol] * (1 - self.p.initial_stop_loss_pct), current_price - calculated_trailing_price)
-            if self.stop_loss_orders[symbol] and self.stop_loss_orders[symbol].price > 0:
-                new_sl_price = max(new_sl_price, self.stop_loss_orders[symbol].price)
-        elif position.size < 0:  # Short
-            new_sl_price = min(self.entry_prices[symbol] * (1 + self.p.initial_stop_loss_pct), current_price + calculated_trailing_price)
-            if self.stop_loss_orders[symbol] and self.stop_loss_orders[symbol].price > 0:
-                new_sl_price = min(new_sl_price, self.stop_loss_orders[symbol].price)
-
-        if new_sl_price > 0 and (self.stop_loss_orders[symbol] is None or
-                                 abs(new_sl_price - self.stop_loss_orders[symbol].price) / self.stop_loss_orders[symbol].price > 0.0001):
-            self.cancel(self.stop_loss_orders[symbol])
-            self.log(f"Mise à jour du Trailing SL: {new_sl_price:.2f} pour {remaining_size:.4f}", symbol=symbol)
-            self.stop_loss_orders[symbol] = self.close(data=data, exectype=bt.Order.Stop, price=new_sl_price, size=remaining_size)
-
-def run_backtest():
+def run_backtest(symbols_data):
     cerebro = bt.Cerebro()
-
-    # Ajout de la stratégie
     cerebro.addstrategy(MyTradingStrategy)
 
-    # Chargement des données historiques
-    try:
-        df = pd.read_csv('./backtest/data.csv')
-        required_columns = ['datetime', 'open', 'high', 'low', 'close', 'volume']
-        if not all(col in df.columns for col in required_columns):
-            raise ValueError(f"Le fichier CSV doit contenir les colonnes: {required_columns}")
-        df['datetime'] = pd.to_datetime(df['datetime'])
-        df = df.ffill().bfill()
-        df.to_csv('data_cleaned.csv', index=False)
-        
-        data = bt.feeds.PandasData(
-            dataname=df,
-            datetime='datetime',
-            open='open',
-            high='high',
-            low='low',
-            close='close',
-            volume='volume',
-            timeframe=bt.TimeFrame.Minutes,
-            compression=1,
-            name='asset1'
-        )
-        cerebro.adddata(data)
-    except Exception as e:
-        logger.error(f"Erreur lors du chargement des données: {e}")
-        return
+    for symbol, data_path in symbols_data.items():
+        try:
+            df = pd.read_csv(data_path)
+            required_columns = ['datetime', 'open', 'high', 'low', 'close', 'volume']
+            if not all(col in df.columns for col in required_columns):
+                raise ValueError(f"The CSV file for {symbol} must contain the columns: {required_columns}")
+            df['datetime'] = pd.to_datetime(df['datetime'])
+            df = df.ffill().bfill()
+            df.to_csv(f'./backtest/data_cleaned_{symbol}.csv', index=False)
+            
+            data = bt.feeds.PandasData(
+                dataname=df,
+                datetime='datetime',
+                open='open',
+                high='high',
+                low='low',
+                close='close',
+                volume='volume',
+                timeframe=bt.TimeFrame.Minutes,
+                compression=1,
+                name=symbol
+            )
+            cerebro.adddata(data)
+            logger.info(f"Data loaded for {symbol} from {data_path}")
+        except Exception as e:
+            logger.error(f"Error loading data for {symbol}: {e}")
+            continue
 
-    # Configuration du broker
-    start_cash = 10000.0
-    cerebro.broker.setcash(start_cash)
+    cerebro.broker.setcash(CAPITAL)
     cerebro.broker.setcommission(commission=0.0004)
     cerebro.broker.set_slippage_perc(perc=0.0001)
 
-    # Analyseurs de performance
     cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe', timeframe=bt.TimeFrame.Days)
     cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
     cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='trades')
     cerebro.addanalyzer(bt.analyzers.SQN, _name='sqn')
 
-    # Indicateurs pour le graphique
     cerebro.addindicator(btind.RSI, period=14)
     cerebro.addindicator(btind.MACD)
     cerebro.addindicator(btind.EMA, period=20)
     cerebro.addindicator(btind.EMA, period=50)
 
-    # Exécution du backtest
-    logger.info(f'Capital initial: {cerebro.broker.getvalue():.2f}')
+    logger.info(f'Initial capital: {cerebro.broker.getvalue():.2f}')
     results = cerebro.run()
     strategy = results[0]
 
-    # Affichage des résultats
     final_value = cerebro.broker.getvalue()
-    logger.info(f'Capital final: {final_value:.2f}')
-    logger.info(f'Profit: {final_value - start_cash:.2f}')
+    logger.info(f'Final capital: {final_value:.2f}')
+    logger.info(f'Profit: {final_value - CAPITAL:.2f}')
 
     if 'sharpe' in strategy.analyzers:
         sharpe_ratio = strategy.analyzers.sharpe.get_analysis()
@@ -464,13 +638,17 @@ def run_backtest():
         sqn_value = strategy.analyzers.sqn.get_analysis()
         logger.info(f'System Quality Number (SQN): {sqn_value.get("sqn", "N/A"):.2f}')
 
-    # Génération du graphique
     try:
-        logger.info("Génération du graphique de performance...")
+        logger.info("Generating performance chart...")
         cerebro.plot(style='candlestick', iplot=False, numfigs=1, savefig=True, figpath='backtest_result.png')
-        logger.info("Graphique sauvegardé sous 'backtest_result.png'.")
+        logger.info("Chart saved as 'backtest_result.png'.")
     except Exception as e:
-        logger.error(f"Erreur lors de la génération du graphique: {e}")
+        logger.error(f"Error generating chart: {e}")
 
 if __name__ == '__main__':
-    run_backtest()
+    symbols_data = {
+        'BTCUSDT': './backtest/BTCUSDT.csv',
+        'ETHUSDT': './backtest/ETHUSDT.csv',
+        'XRPUSDT': './backtest/XRPUSDT.csv',
+    }
+    run_backtest(symbols_data)
