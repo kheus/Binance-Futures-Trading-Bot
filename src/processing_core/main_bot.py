@@ -113,10 +113,12 @@ TIMEFRAME = binance_config["timeframe"]
 CAPITAL = binance_config["capital"]
 LEVERAGE = binance_config["leverage"]
 KAFKA_BOOTSTRAP = kafka_config["kafka"]["bootstrap_servers"]
-MODEL_UPDATE_INTERVAL = 900  # 15 minutes
+MODEL_UPDATE_INTERVAL = 600  # 10 minutes pour réentraînement plus fréquent
 METRICS_UPDATE_INTERVAL = 300  # 5 minutes
 TRAILING_UPDATE_INTERVAL = binance_config.get("trailing_update_interval", 10)  # Default to 10 seconds
 PRICE_FETCH_INTERVAL = 60  # Fetch 1-minute candles every 60 seconds
+MAX_CONCURRENT_TRADES = 1  # Limite de trades simultanés
+MAX_DRAWDOWN = 0.05 * CAPITAL  # 5% drawdown max
 
 # Initialize Binance client
 try:

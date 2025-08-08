@@ -78,7 +78,6 @@ except Exception as e:
 def init_trailing_stop_manager(client):
     global ts_manager
     ts_manager = TrailingStopManager(client)
-    # Load existing trailing stops from trades table
     conn = None
     try:
         conn = get_db_connection()
@@ -134,12 +133,24 @@ Adjusted Qty: {qty}
 Rules: {rules}
 """)
 
-        order = client.create_order(
+        # Place initial stop-loss order
+        stop_loss_price = price * (1 - 0.02) if signal == 'buy' else price * (1 + 0.02)  # 2% stop-loss
+        order = client.new_order(
             symbol=symbol,
             side=SIDE_SELL if signal == 'sell' else SIDE_BUY,
             type=ORDER_TYPE_MARKET,
             quantity=qty,
             recvWindow=10000
+        )
+        stop_order = client.new_order(
+            symbol=symbol,
+            side=SIDE_SELL if signal == 'buy' else SIDE_BUY,
+            type='STOP_MARKET',
+            quantity=qty,
+            stopPrice=str(stop_loss_price),
+            priceProtect=True,
+            reduceOnly=True,
+            newClientOrderId=f"stop_{symbol}_{int(time.time())}"
         )
 
         order_id = order.get('orderId') or order.get('clientOrderId')
@@ -159,9 +170,8 @@ Rules: {rules}
         avg_price = float(order_status.get('avgPrice', price))
         position_type = "long" if signal == "buy" else "short"
 
-        # Initialize trailing stop
         ts_id = None
-        stop_loss = None
+        stop_loss = stop_loss_price
         trade_id = trade_id or str(int(time.time()))
         has_position, position_qty = EnhancedOrderManager(client, [symbol]).check_open_position(symbol, signal, {})
         if has_position:
@@ -189,7 +199,6 @@ Rules: {rules}
                     logger.error(f"[OrderManager] Failed to cancel order {order_id} for {symbol}: {e}")
                 return None
 
-        # Store trade in database with trailing stop details
         conn = get_db_connection()
         cursor = conn.cursor()
         query = """
@@ -394,7 +403,7 @@ class EnhancedOrderManager:
 
             quantity = format_quantity(self.client, symbol, (capital * leverage) / price)
             quantity = max(quantity, rules['min_qty'])
-            price = format_price(self.client, symbol, price)
+            price = format_price(client, symbol, price)
 
             if not self.check_margin(symbol, quantity, price, leverage):
                 logger.error(f"[EnhancedOrderManager] Cancellation - margin problem for {symbol}")
@@ -450,7 +459,6 @@ class EnhancedOrderManager:
                             'quantity': position_qty,
                             'price': float(pos['entryPrice']),
                             'trade_id': current_positions[symbol]['trade_id'] if current_positions.get(symbol) and 'trade_id' in current_positions[symbol] else None
-
                         }
                         logger.debug(f"[Position Check] Updated current_positions for {symbol}: {current_positions[symbol]}")
                         break
@@ -533,7 +541,7 @@ def get_min_qty(client, symbol):
         logger.error(f"[OrderManager] Error retrieving minQty for {symbol}: {e}")
     return 0.001
 
-client = UMFutures(key=BINANCE_API_KEY, secret=BINANCE_API_SECRET, base_url="https://testnet.binancefuture.com")
+client = UMFutures(key=BINANCE_API_KEY, secret=BINANCE_API_SECRET, base_url="https://fapi.binance.com")
 
 for symbol in SYMBOLS:
     try:
