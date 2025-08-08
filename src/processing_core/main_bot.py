@@ -11,11 +11,11 @@ from binance.websocket.um_futures.websocket_client import UMFuturesWebsocketClie
 from confluent_kafka import Consumer
 from src.data_ingestion.data_formatter import format_candle
 from src.processing_core.lstm_model import train_or_load_model
-from src.processing_core.signal_generator import check_signal
+## from src.processing_core.signal_generator import DataPreprocessor, check_signal,
 from src.trade_execution.order_manager import place_order, init_trailing_stop_manager, EnhancedOrderManager
 from src.trade_execution.sync_orders import get_current_atr, get_current_adx, sync_binance_trades_with_postgres
 from src.database.db_handler import insert_trade, insert_signal, insert_metrics, create_tables, insert_price_data, clean_old_data, update_trade_on_close
-from src.processing_core.signal_generator import prepare_lstm_input, select_strategy_mode
+from src.processing_core.signal_generator import DataPreprocessor, StrategySelector, check_signal
 from src.trade_execution.ultra_aggressive_trailing import TrailingStopManager
 from src.monitoring.metrics import record_trade_metric
 from src.monitoring.alerting import send_telegram_alert
@@ -573,7 +573,7 @@ async def main():
                         last_model_updates[symbol] = current_time
                         send_telegram_alert(f"Bingo ! Model updated successfully for {symbol}.")
                         if scalers[symbol]:
-                            lstm_input = prepare_lstm_input(dataframes[symbol])
+                            lstm_input = DataPreprocessor.prepare_lstm_input(dataframes[symbol])
                             pred = models[symbol].predict(lstm_input, verbose=0)[0][0]
                             logger.info(f"[Look] Prediction after update: {pred:.4f} 📈")
                             send_telegram_alert(f"[Look] Prediction after update: {pred:.4f}")
