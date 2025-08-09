@@ -248,24 +248,19 @@ def adaptive_weights(symbol, window=100):
 def check_signal(df, model, current_position, last_order_details, symbol, last_action_sent=None, config=None):
     """
     Main function to generate trading signals.
-    
-    Args:
-        df: DataFrame with market data
-        model: LSTM model for predictions
-        current_position: Current position (long/short/None)
-        last_order_details: Details of the last order
-        symbol: Trading symbol
-        last_action_sent: Last action sent to avoid repetition
-        config: Configuration dictionary
-    
-    Returns:
-        tuple: (action, new_position, confidence, confidence_factors)
+    Returns: (action, new_position, confidence, confidence_factors)
     """
+    # ✅ Compatibilité : extraire le side si current_position est un dict
+    if isinstance(current_position, dict):
+        current_side = current_position.get("side")
+    else:
+        current_side = current_position
+
     if len(df) < 100:
         logger.debug(f"[check_signal] Not enough data for {symbol}: {len(df)} rows")
         return "hold", current_position, 0.0, []
 
-    # Extract indicators
+    # === Extraction des indicateurs ===
     rsi = df['RSI'].iloc[-1]
     macd = df['MACD'].iloc[-1]
     signal_line = df['MACD_signal'].iloc[-1]
@@ -276,11 +271,11 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
     close = df['close'].iloc[-1]
     roc = talib.ROC(df['close'], timeperiod=5).iloc[-1] * 100
 
-    # Strategy selection
+    # === Sélection de stratégie ===
     strategy_mode = StrategySelector.select_strategy_mode(adx, rsi, atr)
     logger.info(f"[Strategy] Switched to {strategy_mode}, ADX: {adx:.2f}, RSI: {rsi:.2f}, ATR: {atr:.2f}, Roc: {roc:.2f} for {symbol}")
 
-    # LSTM prediction
+    # === Prédiction LSTM ===
     lstm_input = DataPreprocessor.prepare_lstm_input(df)
     try:
         prediction = model.predict(lstm_input, verbose=0)[0][0].item()
@@ -289,11 +284,11 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
         logger.error(f"[Prediction Error] {e} for {symbol}")
         return "hold", current_position, 0.0, []
 
-    # Calculate thresholds
+    # === Seuils dynamiques ===
     dynamic_up, dynamic_down = StrategySelector.calculate_dynamic_thresholds(adx, strategy_mode)
     logger.info(f"[Thresholds] {symbol} → Prediction: {prediction:.4f}, Dynamic Down: {dynamic_down:.4f}, Dynamic Up: {dynamic_up:.4f}")
 
-    # Market conditions
+    # === Conditions de marché ===
     trend_up = ema20 > ema50
     trend_down = ema20 < ema50
     macd_bullish = macd > signal_line
@@ -305,7 +300,7 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
     bullish_divergence = (df['close'].iloc[-1] < df['close'].iloc[-3] and df['RSI'].iloc[-1] > df['RSI'].iloc[-3])
     bearish_divergence = (df['close'].iloc[-1] > df['close'].iloc[-3] and df['RSI'].iloc[-1] < df['RSI'].iloc[-3])
 
-    # Confidence factors
+    # === Facteurs de confiance ===
     confidence_factors = []
     if prediction > 0.55 or prediction < 0.45:
         confidence_factors.append("LSTM strong")
@@ -322,30 +317,27 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
 
     IndicatorAnalyzer.log_indicator_summary(symbol, rsi, macd, adx, ema20, ema50, atr, roc, confidence_factors)
 
-    # Initialize action and position
+    # === Init action/position ===
     action = "hold"
     new_position = current_position
     signal_timestamp = int(df.index[-1].timestamp() * 1000)
-    logger.debug(f"[Timestamp] Using {signal_timestamp} ({datetime.utcfromtimestamp(signal_timestamp/1000)})")
 
-    # Validate config
+    # === Validation config ===
     if config is None:
-        logger.error(f"[check_signal] Config is None for {symbol}, cannot calculate quantity")
+        logger.error(f"[check_signal] Config is None for {symbol}")
         return "hold", current_position, 0.0, confidence_factors
 
-    # Calculate position size
     capital = config["binance"].get("capital", 100.0)
     leverage = config["binance"].get("leverage", 50.0)
     quantity = (capital * leverage) / close if close > 0 else 0.0
 
-    # Risk/reward calculation
     expected_pnl = atr * 2 if atr > 1 else close * 0.01
     risk_reward_ratio = expected_pnl / atr if atr > 0 else 0
     if len(confidence_factors) < 3 or risk_reward_ratio < 1.5:
-        logger.info(f"[Signal Rejected] {symbol} - Insufficient confidence ({len(confidence_factors)}/6) or risk/reward ratio ({risk_reward_ratio:.2f} < 1.5)")
         return "hold", current_position, 0.0, confidence_factors
 
-    # Signal logic
+    # === Logique de signaux ===
+    # --- Signal logic (buy/sell/close) ---
     if strategy_mode == "scalp" and rsi_strong:
         if prediction > dynamic_up and roc > 0.5:
             action = "sell"
@@ -379,10 +371,10 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
         new_position = {"side": "short", "quantity": quantity, "price": close, "trade_id": str(signal_timestamp)}
 
     # Position closure
-    if current_position == "long" and (trend_down or not macd_bullish or roc < -0.5):
+    if current_side == "long" and (trend_down or not macd_bullish or roc < -0.5):
         action = "close_buy"
         new_position = None
-    elif current_position == "short" and (trend_up or macd_bullish or roc > 0.5):
+    elif current_side == "short" and (trend_up or macd_bullish or roc > 0.5):
         action = "close_sell"
         new_position = None
 
@@ -410,4 +402,5 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
         except Exception as e:
             logger.error(f"[Signal Storage Error] {e} for {symbol}")
 
+    # === Retour final garanti ===
     return action, new_position, confidence, confidence_factors

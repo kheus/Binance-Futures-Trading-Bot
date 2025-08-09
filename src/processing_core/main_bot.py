@@ -763,39 +763,109 @@ def tracker_loop():
         except Exception as e:
             logger.error(f"[Tracker] Error in tracker loop: {e}", exc_info=True)
 
-if platform.system() == "Emscripten":
-    asyncio.ensure_future(main())
-else:
-    if __name__ == "__main__":
-        # Start threads for WebSocket and performance tracking
-        performance_thread = threading.Thread(target=performance_tracker_loop, args=(client, SYMBOLS), daemon=True)
-        performance_thread.start()
-        websocket_thread = threading.Thread(target=start_websocket, daemon=True)
-        websocket_thread.start()
-        # Create a new event loop and run tasks
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.create_task(trailing_stop_updater())
+# ---------------------------
+# MAIN RUNNER & SHUTDOWN HANDLER
+# ---------------------------
+
+from typing import List
+
+_GLOBAL_ASYNC_TASKS: List[asyncio.Task] = []
+
+def start_background_threads():
+    """Start non-async threads (websocket, performance tracker)."""
+    performance_thread = threading.Thread(target=performance_tracker_loop, args=(client, SYMBOLS), daemon=True)
+    performance_thread.start()
+    websocket_thread = threading.Thread(target=start_websocket, daemon=True)
+    websocket_thread.start()
+    logger.info("[Main] Background threads started (websocket & performance tracker).")
+
+async def _create_and_register_task(coro):
+    """Create task and register it in global list for later cancellation."""
+    task = asyncio.create_task(coro)
+    _GLOBAL_ASYNC_TASKS.append(task)
+    return task
+
+async def _shutdown(loop, reason="shutdown"):
+    """Cancel and await all tasks, close consumer and loop resources."""
+    logger.info(f"[Shutdown] Initiated ({reason}). Cancelling tasks...")
+    # Cancel our registered tasks
+    for t in list(_GLOBAL_ASYNC_TASKS):
+        if not t.done():
+            t.cancel()
+    # Also cancel any other tasks except current
+    current = asyncio.current_task()
+    others = [t for t in asyncio.all_tasks(loop) if t is not current]
+    for t in others:
+        if not t.done():
+            t.cancel()
+
+    # Wait for tasks to finish
+    await asyncio.gather(*others, return_exceptions=True)
+    # Close Kafka consumer
+    try:
+        logger.info("[Shutdown] Closing Kafka consumer...")
+        consumer.close()
+    except Exception as e:
+        logger.warning(f"[Shutdown] Error closing consumer: {e}")
+
+    # Close DB pools or connection_pool if needed
+    try:
+        if hasattr(connection_pool, "closeall"):
+            connection_pool.closeall()
+            logger.info("[Shutdown] DB connection pool closed.")
+    except Exception:
+        logger.debug("[Shutdown] No connection_pool.closeall() available or error on close.", exc_info=True)
+
+    # Shutdown async generators
+    await loop.shutdown_asyncgens()
+    logger.info("[Shutdown] All async generators shut down.")
+
+def _handle_signal(sig, frame):
+    """Synchronous signal handler that schedules the async shutdown."""
+    logger.info(f"[Signal] Received signal {sig}. Scheduling shutdown...")
+    loop = asyncio.get_event_loop()
+    asyncio.run_coroutine_threadsafe(_shutdown(loop, reason=f"signal_{sig}"), loop)
+
+def run_bot():
+    """Entrypoint to run the bot with graceful shutdown handling."""
+    # Start thread-based services first
+    start_background_threads()
+
+    # Create an asyncio event loop and register tasks
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    # Register signal handlers for graceful shutdown (works on Unix; Windows limited)
+    try:
+        for s in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(s, lambda sig=s: _handle_signal(sig, None))
+    except NotImplementedError:
+        # Some platforms (Windows) may not implement add_signal_handler for the loop
+        signal.signal(signal.SIGINT, lambda s, f: _handle_signal(s, f))
+        signal.signal(signal.SIGTERM, lambda s, f: _handle_signal(s, f))
+
+    try:
+        # Create and keep references to long-running tasks
+        loop.run_until_complete(_create_and_register_task(trailing_stop_updater()))
+        loop.run_until_complete(_create_and_register_task(fetch_price_data_fallback()))
+        # Run main; main itself is an endless loop until cancelled
+        loop.run_until_complete(main())
+    except KeyboardInterrupt:
+        logger.info("[Main] KeyboardInterrupt caught. Running shutdown...")
+        loop.run_until_complete(_shutdown(loop, reason="keyboard_interrupt"))
+    except Exception as e:
+        logger.exception(f"[Main] Unexpected exception: {e}")
+        loop.run_until_complete(_shutdown(loop, reason="exception"))
+    finally:
+        # Ensure shutdown
         try:
-            loop.run_until_complete(main())
+            if not loop.is_closed():
+                loop.run_until_complete(_shutdown(loop, reason="finalizing"))
+        except Exception:
+            logger.exception("[Main] Error during final shutdown.")
         finally:
             loop.close()
-
-def handle_shutdown(loop):
-    logger.info("Shutdown initiated. Cancelling all tasks...")
-    tasks = [task for task in asyncio.all_tasks(loop) if task is not asyncio.current_task()]
-    for task in tasks:
-        task.cancel()
-    loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
-    loop.run_until_complete(loop.shutdown_asyncgens())
-    loop.close()
-    logger.info("Shutdown completed gracefully.")
+            logger.info("[Main] Event loop closed. Bot stopped ✅")
 
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, lambda: handle_shutdown(loop))
-    try:
-        loop.run_until_complete(main())
-    except (KeyboardInterrupt, SystemExit):
-        handle_shutdown(loop)
+    run_bot()
