@@ -17,6 +17,7 @@ from rich.console import Console
 from rich.table import Table
 from src.database.db_handler import insert_signal, insert_training_data, get_future_prices, get_training_data_count
 from src.monitoring.alerting import send_telegram_alert
+from binance.client import Client
 
 # Initialize logging and console
 logger = logging.getLogger(__name__)
@@ -245,6 +246,17 @@ def adaptive_weights(symbol, window=100):
         "Breakout detected": 0.08
     }
 
+def get_available_margin(api_key, api_secret):
+    """Retourne la marge disponible en USDT sur Binance Futures."""
+    try:
+        client = Client(api_key, api_secret)
+        account_info = client.futures_account()
+        balance = next((float(b['availableBalance']) for b in account_info['assets'] if b['asset'] == 'USDT'), 0.0)
+        return balance
+    except Exception as e:
+        logger.error(f"[Binance API] Erreur récupération marge : {e}")
+        return 0.0
+
 def check_signal(df, model, current_position, last_order_details, symbol, last_action_sent=None, config=None):
     """
     Main function to generate trading signals.
@@ -327,9 +339,13 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
         logger.error(f"[check_signal] Config is None for {symbol}")
         return "hold", current_position, 0.0, confidence_factors
 
-    capital = config["binance"].get("capital", 100.0)
+    # Récupération marge réelle Binance
+    api_key = config["binance"]["api_key"]
+    api_secret = config["binance"]["api_secret"]
+    available_margin = get_available_margin(api_key, api_secret)
     leverage = config["binance"].get("leverage", 50.0)
-    quantity = (capital * leverage) / close if close > 0 else 0.0
+    max_capital = 0.95 * available_margin
+    quantity = (max_capital * leverage) / close if close > 0 else 0.0
 
     expected_pnl = atr * 2 if atr > 1 else close * 0.01
     risk_reward_ratio = expected_pnl / atr if atr > 0 else 0
