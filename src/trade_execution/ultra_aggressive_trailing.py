@@ -69,13 +69,14 @@ def get_spread(client, symbol):
 
 # === CLASSE PRINCIPALE ===
 class UltraAgressiveTrailingStop:
-    def __init__(self, client, symbol, min_trail=0.007, max_trail=0.06, smoothing_alpha=0.3, min_profit_activate=0.003):
+    def __init__(self, client, symbol, smoothing_alpha=0.3, min_profit_activate=0.05, initial_sl_multiplier=2.0, min_sl_pct=0.005):
         self.client = client
         self.symbol = symbol
-        self.min_trail = min_trail
-        self.max_trail = max_trail
         self.smoothing_alpha = smoothing_alpha
-        self.min_profit_activate = min_profit_activate
+        self.min_profit_activate = min_profit_activate  # 5% profit before trailing
+        self.initial_sl_multiplier = initial_sl_multiplier  # ATR multiplier for initial SL
+        self.min_sl_pct = min_sl_pct  # Minimum SL percentage (0.5%)
+        self.profit_lock_margin = 0.002  # 0.2% margin for profit lock
         self.max_retries = 3
         self.trailing_stop_order_id = None
         self.entry_price = 0.0
@@ -89,6 +90,13 @@ class UltraAgressiveTrailingStop:
         self.price_precision = self.rules['price_precision']
         self.qty_precision = self.rules['qty_precision']
         self.price_tick = self.rules['price_tick']
+        # Symbol-dependent min_trail and max_trail
+        if symbol in ['BTCUSDT', 'ETHUSDT']:
+            self.min_trail = 0.003  # 0.3% for BTC/ETH
+            self.max_trail = 0.03   # 3% for BTC/ETH
+        else:
+            self.min_trail = 0.007  # 0.7% for altcoins
+            self.max_trail = 0.06   # 6% for altcoins
 
     def _generate_client_order_id(self):
         millis = int(time.time() * 1000)
@@ -121,15 +129,17 @@ class UltraAgressiveTrailingStop:
             (atr_smooth / current_price) * 1.5,
             spread / current_price + 0.5 * atr_smooth / current_price
         )
-        adx_factor = max(0.2, min(1.0, 1.2 - (adx / 100)))
+        adx_factor = max(0.6, min(1.0, 1.2 - (adx / 100)))
         trail = max(self.min_trail, min(base_trail * adx_factor, self.max_trail))
         return trail
 
-    def _initial_stop(self, entry_price, side, trail):
+    def _initial_stop(self, entry_price, side, atr):
+        # Calculate initial SL based on ATR * multiplier, with a minimum percentage
+        trail_distance = max(self.initial_sl_multiplier * atr / entry_price, self.min_sl_pct)
         if side == "long":
-            return format_price(self.client, self.symbol, entry_price * (1 - trail))
+            return format_price(self.client, self.symbol, entry_price * (1 - trail_distance))
         else:
-            return format_price(self.client, self.symbol, entry_price * (1 + trail))
+            return format_price(self.client, self.symbol, entry_price * (1 + trail_distance))
 
     def initialize(self, entry_price, position_type, quantity, atr, adx, trade_id):
         self.entry_price = float(entry_price)
@@ -140,25 +150,10 @@ class UltraAgressiveTrailingStop:
 
         if self.entry_price <= 0:
             logger.error(f"[{self.symbol}] ❌ Invalid entry_price: {self.entry_price}")
-            self.active = False
             return None
 
-        has_position, _ = self._check_position()
-        if not has_position:
-            logger.warning(f"[{self.symbol}] ⚠️ No active position found for trade_id {self.trade_id}. Skipping trailing stop.")
-            self.active = False
-            return None
-
-        ticker = self.client.ticker_price(symbol=self.symbol)
-        current_price = float(ticker['price'])
-        if current_price <= 0:
-            logger.error(f"[{self.symbol}] ❌ Invalid current_price: {current_price}")
-            self.active = False
-            return None
-
-        spread = get_spread(self.client, self.symbol)
-        trail = self._calculate_trail_distance(current_price, atr, spread, adx)
-        self.stop_loss_price = self._initial_stop(self.entry_price, self.position_type, trail)
+        # Calculate initial fixed SL based on ATR * multiplier with minimum percentage
+        self.stop_loss_price = self._initial_stop(self.entry_price, self.position_type, atr)
 
         for attempt in range(self.max_retries):
             try:
@@ -208,8 +203,10 @@ class UltraAgressiveTrailingStop:
         trail = self._calculate_trail_distance(current_price, atr, spread, adx)
         if self.position_type == "long":
             new_stop = max(self.stop_loss_price, current_price * (1 - trail))
+            new_stop = max(new_stop, self.entry_price * (1 + self.profit_lock_margin))  # Lock profit with margin
         else:
             new_stop = min(self.stop_loss_price, current_price * (1 + trail))
+            new_stop = min(new_stop, self.entry_price * (1 - self.profit_lock_margin))  # Lock profit with margin
 
         new_stop = format_price(self.client, self.symbol, new_stop)
         should_update = (
@@ -222,7 +219,7 @@ class UltraAgressiveTrailingStop:
                 self.client.cancel_order(symbol=self.symbol, orderId=self.trailing_stop_order_id)
                 order = self.client.new_order(
                     symbol=self.symbol,
-                    side='SELL' if self.position_type == "long" else 'BUY',
+                    side='SELL' if self.position_type == 'long' else 'BUY',
                     type='STOP_MARKET',
                     quantity=str(self.quantity),
                     stopPrice=str(new_stop),
