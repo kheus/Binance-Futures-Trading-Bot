@@ -259,10 +259,12 @@ def get_available_margin(api_key, api_secret):
 
 def check_signal(df, model, current_position, last_order_details, symbol, last_action_sent=None, config=None):
     """
-    Main function to generate trading signals.
-    Returns: (action, new_position, confidence, confidence_factors)
+    Optimized signal checker:
+    - Assouplit les conditions strictes
+    - Intègre ATR minimal, Kelly Criterion
+    - Rend le backtest indicatif au lieu de bloquant
     """
-    # ✅ Compatibilité : extraire le side si current_position est un dict
+
     if isinstance(current_position, dict):
         current_side = current_position.get("side")
     else:
@@ -272,151 +274,137 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
         logger.debug(f"[check_signal] Not enough data for {symbol}: {len(df)} rows")
         return "hold", current_position, 0.0, []
 
-    # === Extraction des indicateurs ===
+    # === Extraction indicateurs ===
     rsi = df['RSI'].iloc[-1]
     macd = df['MACD'].iloc[-1]
     signal_line = df['MACD_signal'].iloc[-1]
     adx = df['ADX'].iloc[-1]
     ema20 = df['EMA20'].iloc[-1]
     ema50 = df['EMA50'].iloc[-1]
-    atr = df['ATR'].iloc[-1]
+    atr = max(df['ATR'].iloc[-1], df['close'].iloc[-1] * 0.005)   # ✅ ATR minimum
     close = df['close'].iloc[-1]
     roc = talib.ROC(df['close'], timeperiod=5).iloc[-1] * 100
 
-    # === Sélection de stratégie ===
+    # === Sélection stratégie ===
     strategy_mode = StrategySelector.select_strategy_mode(adx, rsi, atr)
-    logger.info(f"[Strategy] Switched to {strategy_mode}, ADX: {adx:.2f}, RSI: {rsi:.2f}, ATR: {atr:.2f}, Roc: {roc:.2f} for {symbol}")
+    logger.info(f"[Strategy] {strategy_mode} mode for {symbol} (ADX={adx:.2f}, RSI={rsi:.2f}, ATR={atr:.4f})")
 
-    # === Prédiction LSTM ===
+    # === LSTM Prediction ===
     lstm_input = DataPreprocessor.prepare_lstm_input(df)
     try:
         prediction = model.predict(lstm_input, verbose=0)[0][0].item()
-        logger.debug(f"[check_signal] LSTM prediction for {symbol}: {prediction:.4f}")
+        logger.debug(f"[Prediction] LSTM={prediction:.4f} for {symbol}")
     except Exception as e:
         logger.error(f"[Prediction Error] {e} for {symbol}")
         return "hold", current_position, 0.0, []
 
-    # === Seuils dynamiques ===
+    # === Dynamic thresholds (plus souples) ===
     dynamic_up, dynamic_down = StrategySelector.calculate_dynamic_thresholds(adx, strategy_mode)
-    logger.info(f"[Thresholds] {symbol} → Prediction: {prediction:.4f}, Dynamic Down: {dynamic_down:.4f}, Dynamic Up: {dynamic_up:.4f}")
+    dynamic_up = max(dynamic_up, 0.52)
+    dynamic_down = min(dynamic_down, 0.48)
 
-    # === Conditions de marché ===
+    # === Conditions marché ===
     trend_up = ema20 > ema50
     trend_down = ema20 < ema50
     macd_bullish = macd > signal_line
-    rsi_strong = (trend_up and rsi > 50) or (trend_down and rsi < 45) or (abs(rsi - 50) > 15)
     rolling_high = df['high'].rolling(window=20).max()
     rolling_low = df['low'].rolling(window=20).min()
     breakout_up = close > (rolling_high.iloc[-1] - 0.1 * atr) if len(df) >= 20 else False
     breakout_down = close < (rolling_low.iloc[-1] + 0.1 * atr) if len(df) >= 20 else False
-    bullish_divergence = (df['close'].iloc[-1] < df['close'].iloc[-3] and df['RSI'].iloc[-1] > df['RSI'].iloc[-3])
-    bearish_divergence = (df['close'].iloc[-1] > df['close'].iloc[-3] and df['RSI'].iloc[-1] < df['RSI'].iloc[-3])
 
     # === Facteurs de confiance ===
     confidence_factors = []
-    if prediction > 0.55 or prediction < 0.45:
+    if prediction > 0.52 or prediction < 0.48:
         confidence_factors.append("LSTM strong")
     if (trend_up and macd > signal_line) or (trend_down and macd < signal_line):
         confidence_factors.append("MACD aligned")
-    if rsi > 50 or rsi < 50:
+    if rsi > 55 or rsi < 45:
         confidence_factors.append("RSI strong")
-    if (trend_up and ema20 > ema50) or (trend_down and ema20 < ema50):
-        confidence_factors.append("EMA trend")
-    if abs(roc) > 0.5:
-        confidence_factors.append("ROC momentum")
     if breakout_up or breakout_down:
         confidence_factors.append("Breakout detected")
 
     IndicatorAnalyzer.log_indicator_summary(symbol, rsi, macd, adx, ema20, ema50, atr, roc, confidence_factors)
 
-    # === Init action/position ===
+    # === Config API ===
+    if config is None:
+        logger.error("[check_signal] Missing config")
+        return "hold", current_position, 0.0, []
+
+    api_key = config["binance"]["api_key"]
+    api_secret = config["binance"]["api_secret"]
+    available_margin = get_available_margin(api_key, api_secret)
+    leverage = config["binance"].get("leverage", 30)
+
+    # Position sizing avec Kelly Criterion
+    max_capital = 0.95 * available_margin
+    raw_qty = (max_capital * leverage) / close if close > 0 else 0.0
+    kelly_fraction = RiskManager.kelly_fraction(win_prob=0.55, win_loss_ratio=2)
+    quantity = raw_qty * (kelly_fraction if kelly_fraction > 0 else 0.1)   # min 10%
+
+    # === Signal generation ===
     action = "hold"
     new_position = current_position
     signal_timestamp = int(df.index[-1].timestamp() * 1000)
 
-    # === Validation config ===
-    if config is None:
-        logger.error(f"[check_signal] Config is None for {symbol}")
+    # Risk/Reward check (assoupli)
+    expected_pnl = atr * 2
+    risk_reward_ratio = expected_pnl / atr
+    if len(confidence_factors) < 2 or risk_reward_ratio < 1.2:
         return "hold", current_position, 0.0, confidence_factors
 
-    # Récupération marge réelle Binance
-    api_key = config["binance"]["api_key"]
-    api_secret = config["binance"]["api_secret"]
-    available_margin = get_available_margin(api_key, api_secret)
-    leverage = config["binance"].get("leverage", 50.0)
-    max_capital = 0.95 * available_margin
-    quantity = (max_capital * leverage) / close if close > 0 else 0.0
-
-    expected_pnl = atr * 2 if atr > 1 else close * 0.01
-    risk_reward_ratio = expected_pnl / atr if atr > 0 else 0
-    if len(confidence_factors) < 3 or risk_reward_ratio < 1.5:
-        return "hold", current_position, 0.0, confidence_factors
-
-    # === Logique de signaux ===
-    # --- Signal logic (buy/sell/close) ---
-    if strategy_mode == "scalp" and rsi_strong:
+    # Logique par stratégie
+    if strategy_mode == "trend":
+        if trend_up and macd_bullish and prediction > dynamic_up:
+            action = "buy"
+            new_position = {"side": "long", "quantity": quantity, "price": close, "trade_id": str(signal_timestamp)}
+        elif trend_down and not macd_bullish and prediction < dynamic_down:
+            action = "sell"
+            new_position = {"side": "short", "quantity": quantity, "price": close, "trade_id": str(signal_timestamp)}
+    elif strategy_mode == "range":
+        if close <= (rolling_low.iloc[-1] + 0.1 * atr) and prediction > dynamic_up:
+            action = "buy"
+            new_position = {"side": "long", "quantity": quantity, "price": close, "trade_id": str(signal_timestamp)}
+        elif close >= (rolling_high.iloc[-1] - 0.1 * atr) and prediction < dynamic_down:
+            action = "sell"
+            new_position = {"side": "short", "quantity": quantity, "price": close, "trade_id": str(signal_timestamp)}
+    elif strategy_mode == "scalp":
         if prediction > dynamic_up and roc > 0.5:
             action = "sell"
             new_position = {"side": "short", "quantity": quantity, "price": close, "trade_id": str(signal_timestamp)}
         elif prediction < dynamic_down and roc < -0.5:
             action = "buy"
             new_position = {"side": "long", "quantity": quantity, "price": close, "trade_id": str(signal_timestamp)}
-    elif strategy_mode == "trend":
-        if trend_up and macd_bullish and prediction > dynamic_up and roc > 0.5:
-            action = "buy"
-            new_position = {"side": "long", "quantity": quantity, "price": close, "trade_id": str(signal_timestamp)}
-        elif trend_down and not macd_bullish and prediction < dynamic_down and roc < -0.5:
-            action = "sell"
-            new_position = {"side": "short", "quantity": quantity, "price": close, "trade_id": str(signal_timestamp)}
-    elif strategy_mode == "range":
-        range_high = rolling_high.iloc[-1]
-        range_low = rolling_low.iloc[-1]
-        if close <= (range_low + 0.1 * atr) and prediction > dynamic_up and roc > 0.3:
-            action = "buy"
-            new_position = {"side": "long", "quantity": quantity, "price": close, "trade_id": str(signal_timestamp)}
-        elif close >= (range_high - 0.1 * atr) and prediction < dynamic_down and roc < -0.3:
-            action = "sell"
-            new_position = {"side": "short", "quantity": quantity, "price": close, "trade_id": str(signal_timestamp)}
 
-    # Divergence signals
-    if bullish_divergence and prediction > 0.65 and roc > 0.5:
-        action = "buy"
-        new_position = {"side": "long", "quantity": quantity, "price": close, "trade_id": str(signal_timestamp)}
-    elif bearish_divergence and prediction < 0.35 and roc < -0.5:
-        action = "sell"
-        new_position = {"side": "short", "quantity": quantity, "price": close, "trade_id": str(signal_timestamp)}
-
-    # Position closure
-    if current_side == "long" and (trend_down or not macd_bullish or roc < -0.5):
+    # Fermeture de position
+    if current_side == "long" and (trend_down or roc < -1):
         action = "close_buy"
         new_position = None
-    elif current_side == "short" and (trend_up or macd_bullish or roc > 0.5):
+    elif current_side == "short" and (trend_up or roc > 1):
         action = "close_sell"
         new_position = None
 
-    # Backtest validation
-    if action in ["buy", "sell"] and not SignalValidator.backtest_signal(df, action, dynamic_up if action == 'buy' else dynamic_down):
-        logger.info(f"[Signal Rejected] {symbol} - Backtest failed for {action}")
+    # Backtest → indicatif
+    if action in ["buy", "sell"]:
+        if not SignalValidator.backtest_signal(df, action, dynamic_up if action == "buy" else dynamic_down):
+            logger.info(f"[Signal Adjusted] {symbol} - Backtest not confirmed → confiance réduite")
+            confidence_factors.append("Backtest weak")
+
+    # Anti-repeat
+    if last_action_sent and isinstance(last_action_sent, tuple) and action == last_action_sent[0]:
+        logger.info(f"[Anti-Repeat] Ignored {action} for {symbol}")
         return "hold", current_position, 0.0, confidence_factors
 
-    # Anti-repeat check
-    if last_action_sent is not None and isinstance(last_action_sent, tuple) and action == last_action_sent[0]:
-        logger.info(f"[Anti-Repeat] Signal {action} ignored for {symbol} as it was sent previously.")
-        return "hold", current_position, 0.0, confidence_factors
-
-    # Calculate confidence
+    # Calcul confiance pondérée
     weights = adaptive_weights(symbol)
-    confidence = sum(weights[f] for f in confidence_factors if f in weights)
+    confidence = sum(weights.get(f, 0.05) for f in confidence_factors)
 
-    # Log and store signal
+    # Stockage et alerte
     if action != "hold":
-        logger.info(f"[Signal] {symbol} - Action: {action}, Confidence: {len(confidence_factors)}/6, Prediction: {prediction:.4f}, Risk/Reward: {risk_reward_ratio:.2f}")
-        send_telegram_alert(f"[Signal] {symbol} - Action: {action}, Confidence: {len(confidence_factors)}/6, Prediction: {prediction:.4f}, Risk/Reward: {risk_reward_ratio:.2f}")
+        logger.info(f"[Signal] {symbol} → {action.upper()} | Conf: {confidence:.2f} | P={prediction:.4f} | R/R={risk_reward_ratio:.2f}")
+        send_telegram_alert(f"[Signal] {symbol} → {action.upper()} | Conf: {confidence:.2f} | P={prediction:.4f} | R/R={risk_reward_ratio:.2f}")
         try:
             insert_signal(symbol, signal_timestamp, action.lower(), close, confidence, strategy_mode)
-            logger.info(f"[Signal Stored] {action} at {close} for {symbol} with confidence {confidence:.4f}")
         except Exception as e:
-            logger.error(f"[Signal Storage Error] {e} for {symbol}")
+            logger.error(f"[DB Error] {e}")
 
-    # === Retour final garanti ===
     return action, new_position, confidence, confidence_factors

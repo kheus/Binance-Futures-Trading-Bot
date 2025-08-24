@@ -1,4 +1,4 @@
-﻿import eventlet
+import eventlet
 eventlet.monkey_patch()
 import asyncio
 import yaml
@@ -16,7 +16,7 @@ from src.trade_execution.order_manager import place_order, init_trailing_stop_ma
 from src.trade_execution.sync_orders import get_current_atr, get_current_adx, sync_binance_trades_with_postgres
 from src.database.db_handler import insert_trade, insert_signal, insert_metrics, create_tables, insert_price_data, clean_old_data, update_trade_on_close
 from src.processing_core.signal_generator import DataPreprocessor, StrategySelector, check_signal
-from src.trade_execution.ultra_aggressive_trailing import TrailingStopManager
+from src.trade_execution.ultra_aggressive_trailing import TrailingStopManager, get_spread
 from src.monitoring.metrics import record_trade_metric
 from src.monitoring.alerting import send_telegram_alert
 from src.performance.tracker import performance_tracker_loop
@@ -36,7 +36,7 @@ from rich.logging import RichHandler
 import psycopg2.pool
 import signal
 from pathlib import Path
-from src.database.db_handler import connection_pool
+from src.database.db_handler import connection_pool, execute_query
 
 # Initialize rich console for enhanced logging
 console = Console()
@@ -282,7 +282,7 @@ def handle_order_update(message):
 
                     else:
                         pnl = (entry_price - exit_price) * qty * leverage
-                    connection_pool.execute_query(
+                    execute_query(
                         "UPDATE trades SET status = 'CLOSED', exit_price = %s, realized_pnl = %s, close_timestamp = %s, leverage = %s WHERE trade_id = %s",
                         (exit_price, pnl, int(time.time()), leverage, trade_id)
                     )
@@ -339,9 +339,11 @@ async def trailing_stop_updater():
                 # Vérifier si la position existe sur Binance
                 positions = client.get_position_risk(symbol=symbol)
                 position = next((p for p in positions if p['symbol'] == symbol and float(p['positionAmt']) != 0), None)
-                if current_positions.get(symbol) and not position:
-                    # Position fermée sur Binance
+                trade_id = None
+                if current_positions.get(symbol):
                     trade_id = current_positions[symbol].get('trade_id')
+                # Position fermée sur Binance
+                if current_positions.get(symbol) and not position:
                     if trade_id:
                         ticker = client.get_symbol_ticker(symbol=symbol)
                         exit_price = float(ticker['price'])
@@ -353,7 +355,7 @@ async def trailing_stop_updater():
                             pnl = (exit_price - entry_price) * qty * leverage
                         else:
                             pnl = (entry_price - exit_price) * qty * leverage
-                        connection_pool.execute_query(
+                        execute_query(
                             "UPDATE trades SET status = 'CLOSED', exit_price = %s, realized_pnl = %s, close_timestamp = %s, leverage = %s WHERE trade_id = %s",
                             (exit_price, pnl, int(time.time()), leverage, trade_id)
                         )
@@ -361,33 +363,36 @@ async def trailing_stop_updater():
                         current_positions[symbol] = None
                         logger.info(f"[Trailing Stop] Position closed for {symbol}, trade_id={trade_id}, PNL={pnl}")
                     continue
-                
+
+                # Position ouverte sur Binance
                 if current_positions.get(symbol) and position:
-                    trade_id = current_positions[symbol].get('trade_id')
-                    if not trade_id and ts_manager.has_trailing_stop(symbol):
-                        trade_id = ts_manager.stops[symbol].trade_id
-                        logger.warning(f"[Trailing Stop] Missing trade_id in current_positions for {symbol}, using ts_manager trade_id={trade_id}")
                     if not trade_id:
-                        logger.warning(f"[Trailing Stop] No trade_id available for {symbol}, skipping update")
+                        logger.warning(f"[Trailing Stop] No trade_id in current_positions for {symbol}, skipping update")
                         continue
                     trade_id = str(trade_id).replace('trade_', '')  # Normalize trade_id
-                    current_price = order_manager.get_current_price(symbol)
-                    if current_price:
-                        ts_manager.update_trailing_stop(symbol, current_price, trade_id=trade_id)
-                        if ts_manager.has_trailing_stop(symbol):
-                            table = Table(title=f"Trailing Stop Update for {symbol}")
-                            table.add_column("Field", style="cyan")
-                            table.add_column("Value", style="magenta")
-                            table.add_row("Symbol", symbol)
-                            table.add_row("Current Price", f"{current_price:.4f}")
-                            table.add_row("Stop Price", f"{ts_manager.stops[symbol].current_stop_price:.4f}")
-                            table.add_row("Trade ID", trade_id)
-                            console.log(table)
-                            logger.info(f"[Trailing Stop] Updated trailing stop for {symbol} at price {current_price:.4f}, trade_id={trade_id} 🔄")
+                    if ts_manager.has_trailing_stop(symbol, trade_id):
+                        current_price = order_manager.get_current_price(symbol)
+                        if current_price:
+                            atr = get_current_atr(client, symbol)
+                            spread = get_spread(client, symbol)
+                            adx = get_current_adx(client, symbol)
+                            ts_manager.update_trailing_stop(symbol, current_price, atr, spread, adx, trade_id=trade_id)
+                            if ts_manager.has_trailing_stop(symbol, trade_id):
+                                table = Table(title=f"Trailing Stop Update for {symbol}")
+                                table.add_column("Field", style="cyan")
+                                table.add_column("Value", style="magenta")
+                                table.add_row("Symbol", symbol)
+                                table.add_row("Current Price", f"{current_price:.4f}")
+                                table.add_row("Stop Price", f"{ts_manager.stops[symbol].stop_loss_price:.4f}")
+                                table.add_row("Trade ID", trade_id)
+                                console.log(table)
+                                logger.info(f"[Trailing Stop] Updated trailing stop for {symbol} at price {current_price:.4f}, trade_id={trade_id} 🔄")
+                        else:
+                            logger.warning(f"[Trailing Stop] Failed to get current price for {symbol}")
                     else:
-                        logger.warning(f"[Trailing Stop] Failed to get current price for {symbol}")
-                elif ts_manager.has_trailing_stop(symbol):
-                    logger.warning(f"[Trailing Stop] Inconsistent state: trailing stop exists for {symbol} but no position in current_positions")
+                        logger.warning(f"[Trailing Stop] No active trailing stop for {symbol}, trade_id={trade_id}")
+                elif trade_id and ts_manager.has_trailing_stop(symbol, trade_id):
+                    logger.warning(f"[Trailing Stop] Inconsistent state: trailing stop exists for {symbol}, trade_id={trade_id} but no position in current_positions")
                     ts_manager.close_position(symbol)
             await asyncio.sleep(TRAILING_UPDATE_INTERVAL)
         except Exception as e:
@@ -641,7 +646,8 @@ async def main():
                             adx = get_current_adx(client, symbol)
                             atr = get_current_atr(client, symbol)
                             if atr <= 0:
-                                logger.error(f"❌ [Order] Invalid ATR for {symbol}: {atr}")
+                                atr = price * 0.005  # Fallback to 0.5% of price as min ATR
+                                logger.warning(f"⚠️ [Order] Using fallback ATR {atr} for {symbol}")
                                 continue
                             order_details[symbol] = order_manager.place_enhanced_order(action, symbol, CAPITAL, LEVERAGE, trade_id=str(timestamp))
                             if order_details[symbol]:
@@ -716,7 +722,7 @@ async def main():
                                     order_details[symbol]["pnl"] = pnl
                                     trade_id = last_order_details[symbol].get("trade_id")
                                     if trade_id:
-                                        connection_pool.execute_query(
+                                        execute_query(
                                             "UPDATE trades SET status = 'CLOSED', exit_price = %s, realized_pnl = %s, close_timestamp = %s, leverage = %s WHERE trade_id = %s",
                                             (close_price, pnl, int(time.time()), leverage, trade_id)
                                         )

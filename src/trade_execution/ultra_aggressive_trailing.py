@@ -129,7 +129,7 @@ class UltraAgressiveTrailingStop:
             (atr_smooth / current_price) * 1.5,
             spread / current_price + 0.5 * atr_smooth / current_price
         )
-        adx_factor = max(0.6, min(1.0, 1.2 - (adx / 100)))
+        adx_factor = max(0.5, min(1.0, 1.0 - (adx / 200)))
         trail = max(self.min_trail, min(base_trail * adx_factor, self.max_trail))
         return trail
 

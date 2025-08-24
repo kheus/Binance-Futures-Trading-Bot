@@ -134,7 +134,7 @@ Rules: {rules}
 """)
 
         # Place initial stop-loss order
-        stop_loss_price = price * (1 - 0.02) if signal == 'buy' else price * (1 + 0.02)  # 2% stop-loss
+        stop_loss_price = price * (1 - 0.05) if signal == 'buy' else price * (1 + 0.05)  # 5% stop-loss
         order = client.new_order(
             symbol=symbol,
             side=SIDE_SELL if signal == 'sell' else SIDE_BUY,
