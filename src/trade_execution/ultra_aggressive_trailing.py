@@ -59,24 +59,37 @@ def format_quantity(client, symbol, quantity):
 
 def get_spread(client, symbol):
     try:
-        book = client.get_order_book(symbol=symbol, limit=5)
-        bid = float(book['bids'][0][0])
-        ask = float(book['asks'][0][0])
-        return ask - bid
+        # Use depth endpoint for Binance Futures
+        book = client.depth(symbol=symbol, limit=5)
+        if not book or 'bids' not in book or 'asks' not in book or not book['bids'] or not book['asks']:
+            raise ValueError("Invalid order book response")
+            
+        bid = float(book['bids'][0][0])  # Best bid price
+        ask = float(book['asks'][0][0])  # Best ask price
+        spread = ask - bid
+        
+        # Calculate spread as a percentage of the mid price
+        mid_price = (bid + ask) / 2
+        spread_pct = (spread / mid_price) * 100 if mid_price > 0 else 0
+        
+        # Log the spread for monitoring
+        logger.debug(f"[{symbol}] Spread: {spread:.8f} ({spread_pct:.4f}%)")
+        return spread
+        
     except Exception as e:
-        logger.warning(f"[{symbol}] ⚠️ Could not fetch spread: {e}. Using default 0.0001")
+        logger.warning(f"[{symbol}] ⚠️ Could not fetch spread: {str(e)}. Using default 0.0001")
         return 0.0001
 
 # === CLASSE PRINCIPALE ===
 class UltraAgressiveTrailingStop:
-    def __init__(self, client, symbol, smoothing_alpha=0.3, min_profit_activate=0.05, initial_sl_multiplier=2.0, min_sl_pct=0.005):
+    def __init__(self, client, symbol, smoothing_alpha=0.3, min_profit_activate=0.10, initial_sl_multiplier=2.0, min_sl_pct=0.05):
         self.client = client
         self.symbol = symbol
         self.smoothing_alpha = smoothing_alpha
-        self.min_profit_activate = min_profit_activate  # 5% profit before trailing
+        self.min_profit_activate = min_profit_activate  # 10% profit before trailing
         self.initial_sl_multiplier = initial_sl_multiplier  # ATR multiplier for initial SL
-        self.min_sl_pct = min_sl_pct  # Minimum SL percentage (0.5%)
-        self.profit_lock_margin = 0.002  # 0.2% margin for profit lock
+        self.min_sl_pct = min_sl_pct  # Minimum SL percentage (5%)
+        self.profit_lock_margin = 0.05  # 5% margin for profit lock
         self.max_retries = 3
         self.trailing_stop_order_id = None
         self.entry_price = 0.0
@@ -92,10 +105,10 @@ class UltraAgressiveTrailingStop:
         self.price_tick = self.rules['price_tick']
         # Symbol-dependent min_trail and max_trail
         if symbol in ['BTCUSDT', 'ETHUSDT']:
-            self.min_trail = 0.003  # 0.3% for BTC/ETH
+            self.min_trail = 0.01  # 1% for BTC/ETH
             self.max_trail = 0.03   # 3% for BTC/ETH
         else:
-            self.min_trail = 0.007  # 0.7% for altcoins
+            self.min_trail = 0.07  # 7% for altcoins
             self.max_trail = 0.06   # 6% for altcoins
 
     def _generate_client_order_id(self):
