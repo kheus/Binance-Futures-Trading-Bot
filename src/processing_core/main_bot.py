@@ -19,7 +19,7 @@ from src.processing_core.signal_generator import DataPreprocessor, StrategySelec
 from src.trade_execution.ultra_aggressive_trailing import TrailingStopManager, get_spread
 from src.monitoring.metrics import record_trade_metric
 from src.monitoring.alerting import send_telegram_alert
-from src.performance.tracker import performance_tracker_loop
+from src.performance.tracker import performance_tracker_loop, evaluate_signals
 from src.processing_core.indicators import calculate_indicators
 import sys
 import os
@@ -539,6 +539,14 @@ async def main():
     try:
         # Start fallback price data fetcher
         asyncio.create_task(fetch_price_data_fallback())
+        logger.info("[MainBot] Backfilling historical price data for evaluation windows...")
+        for symbol in SYMBOLS:
+            historical_candles = client.klines(symbol, '1m', limit=100)  # ~1.6h d'historique
+            for candle in historical_candles:
+                candle_df = format_candle(candle, symbol)
+                if not candle_df.empty:
+                    insert_price_data(candle_df, symbol)
+        logger.info("[MainBot] Historical backfill completed.")
         while True:
             current_time = time.time()
             if current_time - last_sync_time >= sync_interval:
@@ -748,14 +756,19 @@ async def main():
             except Exception as e:
                 logger.error(f"❌ [Kafka] Exception while processing candle for {symbol}: {e}")
                 continue
-            await asyncio.sleep(0.1)
+
+            # === Evaluation des signaux déjà générés ===
+            try:
+                evaluate_signals(connection_pool)
+            except Exception as e:
+                logger.error(f"[Main] Signal evaluation error: {e}")
+
+            await asyncio.sleep(60)  # Évalue toutes les minutes
 
     except Exception as e:
-        logger.error(f"❌ [Main] Bot error: {e}")
-        send_telegram_alert(f"Bot error: {str(e)}")
-    finally:
-        logger.info("[Main] Closing Kafka consumer 🛑")
-        consumer.close()
+        logger.error(f"[Main] Loop error: {e}")
+        send_telegram_alert(f"Main loop error: {str(e)}")
+        await asyncio.sleep(5)
 
 def tracker_loop():
     last_cleanup_date = None

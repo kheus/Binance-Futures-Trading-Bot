@@ -114,3 +114,19 @@ CREATE TABLE IF NOT EXISTS training_data (
 );
 CREATE INDEX IF NOT EXISTS idx_training_data_symbol ON training_data(symbol);
 CREATE INDEX IF NOT EXISTS idx_training_data_timestamp ON training_data(timestamp);
+
+-- Ajouts pour aligner avec evaluate_signals
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS side VARCHAR(10);
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS entry_price DECIMAL;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS close_price DECIMAL;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS evaluated BOOLEAN DEFAULT FALSE;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS outcome VARCHAR(10);
+
+-- Mise à jour des données existantes (pour les signaux déjà insérés)
+UPDATE signals 
+SET entry_price = price,
+    side = UPPER(signal_type)
+WHERE entry_price IS NULL;
+
+-- Index supplémentaires si nécessaire
+CREATE INDEX IF NOT EXISTS idx_signals_evaluated ON signals(evaluated);

@@ -1,3 +1,4 @@
+# backtest/my_backtest.py
 import backtrader as bt
 import backtrader.indicators as btind
 import pandas as pd
@@ -11,11 +12,11 @@ import talib
 from scipy.stats import norm
 from tensorflow import keras
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import GRU, Dense, Bidirectional  # Changed to GRU for better performance
+from tensorflow.keras.layers import GRU, Dense, Bidirectional
 from sklearn.preprocessing import MinMaxScaler
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 from tensorflow.keras import Input
-from binance.client import Client  # Added for data download
+from binance.client import Client
 
 # === Create a logs folder if it doesn't exist ===
 log_dir = "logs"
@@ -49,15 +50,15 @@ with open(config_path, 'r', encoding='utf-8') as f:
 
 binance_config = config.get("binance", {})
 SYMBOLS = binance_config.get("symbols", ['BTCUSDT', 'ETHUSDT', 'XRPUSDT'])
-CAPITAL = binance_config.get("capital", 100.0)
-LEVERAGE = binance_config.get("leverage", 5.0)  # Reduced from 20.0 to mitigate risk
-TIMEFRAME = binance_config.get("timeframe", "5m")
+CAPITAL = binance_config.get("capital", 100.0)  # Force to 100 if needed
+LEVERAGE = binance_config.get("leverage", 20.0)
+TIMEFRAME = binance_config.get("timeframe", "1h")
 TRAILING_UPDATE_INTERVAL = binance_config.get("trailing_update_interval", 10)
-MAX_CONCURRENT_TRADES = binance_config.get("max_concurrent_trades", 10)
+MAX_CONCURRENT_TRADES = binance_config.get("max_concurrent_trades", 1)
 MAX_DRAWDOWN = 0.05 * CAPITAL
 
-# Added: Function to download historical data from Binance if CSV not present
-def download_binance_data(symbol, interval='5m', start_time=None, end_time=None, api_key='', api_secret=''):
+# Function to download historical data from Binance if CSV not present
+def download_binance_data(symbol, interval='1h', start_time=None, end_time=None, api_key='', api_secret=''):
     if not api_key or not api_secret:
         logger.error("Binance API key and secret required for download.")
         return None
@@ -82,400 +83,340 @@ def download_binance_data(symbol, interval='5m', start_time=None, end_time=None,
     df = pd.DataFrame(klines, columns=['datetime', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'num_trades', 'taker_buy_base', 'taker_buy_quote', 'ignore'])
     df['datetime'] = pd.to_datetime(df['datetime'], unit='ms')
     df = df[['datetime', 'open', 'high', 'low', 'close', 'volume']].astype(float, errors='ignore')
+    logger.info(f"Downloaded {len(df)} rows for {symbol} from {df['datetime'].min()} to {df['datetime'].max()}")
     return df
 
 class UltraAgressiveTrailingStop:
-    def __init__(self, symbol, smoothing_alpha=0.3, min_profit_activate=0.02, initial_sl_multiplier=2.0, min_sl_pct=0.005):  # Relaxed min_profit to 2%, min_sl to 0.5%
+    def __init__(self, symbol, fixed_sl_pct=0.05, take_profit_pct=0.08, trail_multiplier=1.5):
         self.symbol = symbol
-        self.smoothing_alpha = smoothing_alpha
-        self.min_profit_activate = min_profit_activate
-        self.initial_sl_multiplier = initial_sl_multiplier
-        self.min_sl_pct = min_sl_pct
-        self.profit_lock_margin = 0.05  # Reduced to 5% for better profit locking
+        self.fixed_sl_pct = fixed_sl_pct
+        self.take_profit_pct = take_profit_pct
+        self.trail_multiplier = trail_multiplier
+        self.min_profit_activate = 0.0
+        self.profit_lock_margin = 0.0
         self.entry_price = 0.0
-        self.current_stop_price = 0.0
+        self.stop_loss_price = 0.0
         self.position_type = None
         self.quantity = 0.0
         self.trade_id = None
         self.active = False
-        self.atr_smooth = None
-        self.price_precision = 4 if symbol not in ['BTCUSDT', 'ETHUSDT'] else 2
-        self.qty_precision = 2 if symbol not in ['BTCUSDT', 'ETHUSDT'] else 3
-        self.price_tick = 0.0001
-        if symbol in ['BTCUSDT', 'ETHUSDT']:
-            self.min_trail = 0.005  # 0.5%
-            self.max_trail = 0.05   # 5%
+
+    def _initial_stop(self, entry_price, side):
+        if side == "long":
+            return entry_price * (1 - self.fixed_sl_pct)
         else:
-            self.min_trail = 0.008
-            self.max_trail = 0.08
+            return entry_price * (1 + self.fixed_sl_pct)
 
-    def _update_smoothed_atr(self, new_atr):
-        if self.atr_smooth is None:
-            self.atr_smooth = new_atr
+    def _check_take_profit(self, current_price):
+        if self.position_type == "long":
+            return current_price >= self.entry_price * (1 + self.take_profit_pct)
         else:
-            self.atr_smooth = self.smoothing_alpha * new_atr + (1 - self.smoothing_alpha) * self.atr_smooth
-        return self.atr_smooth
+            return current_price <= self.entry_price * (1 - self.take_profit_pct)
 
-    def _compute_trailing_distance(self, atr, adx, current_price, spread):
-        if atr is None or atr <= 0 or current_price <= 0:
-            logger.warning(f"[{self.symbol}] ⚠️ Invalid ATR or price.")
-            return self.min_trail
-        
-        atr_smooth = self._update_smoothed_atr(atr)
-        base_trail = max((atr_smooth / current_price) * 1.5, spread / current_price + 0.5 * atr_smooth / current_price)
-        adx_factor = max(0.5, min(1.0, 1.0 - (adx / 200)))
-        trail = max(self.min_trail, min(base_trail * adx_factor, self.max_trail))
-        logger.debug(f"[{self.symbol}] ATR={atr:.5f}, Smooth={atr_smooth:.5f}, ADX={adx:.2f}, Trail={trail:.5f}")
-        return trail
-
-    def initialize_trailing_stop(self, entry_price, position_type, quantity, atr, adx, trade_id):
+    def initialize(self, entry_price, position_type, quantity, atr=None, adx=None, trade_id=None):
         self.entry_price = float(entry_price)
         self.position_type = position_type.lower()
         self.quantity = float(quantity)
         self.trade_id = str(trade_id)
         self.active = True
-
-        if self.entry_price <= 0:
-            logger.error(f"[{self.symbol}] Invalid entry_price.")
-            return None
-
-        trail_distance = max(self.initial_sl_multiplier * atr / self.entry_price, self.min_sl_pct)
-        if self.position_type == "long":
-            self.current_stop_price = self.entry_price * (1 - trail_distance)
-        else:
-            self.current_stop_price = self.entry_price * (1 + trail_distance)
-
-        self.current_stop_price = round(self.current_stop_price, self.price_precision)
-        logger.info(f"[{self.symbol}] Initial SL at {self.current_stop_price:.2f} (Qty: {self.quantity:.4f})")
+        self.stop_loss_price = self._initial_stop(self.entry_price, self.position_type)
         return self.trade_id
 
-    def update_trailing_stop(self, current_price, atr, adx, spread=0.001):  # Increased spread for realism
-        if not self.active or not self.entry_price:
+    def update(self, current_price, atr=None, spread=None, adx=None, trade_id=None):
+        if not self.active:
             return
 
-        current_price = float(current_price)
-        if current_price <= 0:
-            return
+        if self._check_take_profit(current_price):
+            logger.info(f"[{self.symbol}] Take-profit hit at {current_price}")
+            self.active = False
+            return "close"
 
-        profit_pct = ((current_price - self.entry_price) / self.entry_price if self.position_type == "long" else (self.entry_price - current_price) / self.entry_price)
+        profit_pct = (
+            (current_price - self.entry_price) / self.entry_price if self.position_type == "long"
+            else (self.entry_price - current_price) / self.entry_price
+        )
+
         if profit_pct < self.min_profit_activate:
             return
 
-        trailing_dist = self._compute_trailing_distance(atr, adx, current_price, spread)
-
-        if self.position_type == 'long':
-            new_stop = max(self.current_stop_price, current_price * (1 - trailing_dist))
-            new_stop = max(new_stop, self.entry_price * (1 + self.profit_lock_margin))
-            should_update = new_stop >= self.current_stop_price + self.price_tick
+        if atr:
+            base_trail = (atr / self.entry_price)
+            trend_adj = 1.0 if adx < 25 else 0.75 if adx > 40 else 0.9
+            spread_adj = 1.0 + (spread / self.entry_price * 5) if spread / self.entry_price > 0.001 else 1.0
+            trail_pct = max(0.001, self.trail_multiplier * base_trail * trend_adj * spread_adj)
         else:
-            new_stop = min(self.current_stop_price, current_price * (1 + trailing_dist))
-            new_stop = min(new_stop, self.entry_price * (1 - self.profit_lock_margin))
-            should_update = new_stop <= self.current_stop_price - self.price_tick
+            trail_pct = 0.05
 
-        if should_update:
-            self.current_stop_price = round(new_stop, self.price_precision)
-            logger.info(f"[{self.symbol}] Trailing updated to {self.current_stop_price:.2f}")
+        if self.position_type == "long":
+            new_stop = current_price * (1 - trail_pct)
+            if new_stop > self.stop_loss_price:
+                self.stop_loss_price = new_stop
+        else:
+            new_stop = current_price * (1 + trail_pct)
+            if new_stop < self.stop_loss_price:
+                self.stop_loss_price = new_stop
 
-    def verify_order_execution(self, current_price):
+    def check_stop(self, current_price):
         if not self.active:
             return False
-
-        current_price = float(current_price)
-        if self.position_type == 'long' and current_price <= self.current_stop_price:
-            exit_price = self.current_stop_price
-            pnl = (exit_price - self.entry_price) * self.quantity
-            logger.info(f"[{self.symbol}] Stop executed at {exit_price:.2f}, PNL: {pnl:.4f}")
-            self.close_position()
+        if self.position_type == "long" and current_price <= self.stop_loss_price:
             return True
-        elif self.position_type == 'short' and current_price >= self.current_stop_price:
-            exit_price = self.current_stop_price
-            pnl = (self.entry_price - exit_price) * self.quantity
-            logger.info(f"[{self.symbol}] Stop executed at {exit_price:.2f}, PNL: {pnl:.4f}")
-            self.close_position()
+        if self.position_type == "short" and current_price >= self.stop_loss_price:
             return True
         return False
 
     def close_position(self):
-        if self.active:
-            self.active = False
-            self.current_stop_price = 0.0
-            logger.info(f"[{self.symbol}] Position closed for {self.trade_id}")
+        self.active = False
 
-class TrailingStopManager:
-    def __init__(self):
-        self.stops = {}
+class DataPreprocessor:
+    @staticmethod
+    def normalize_lstm_input(arr):
+        mean = arr.mean(axis=1, keepdims=True)
+        std = arr.std(axis=1, keepdims=True) + 1e-9
+        return (arr - mean) / std
 
-    def has_trailing_stop(self, symbol):
-        return symbol in self.stops and self.stops[symbol].active
+    @staticmethod
+    def prepare_lstm_input(df, window=100):
+        required_cols = ['close', 'volume', 'RSI', 'MACD', 'ADX']
+        df = df.copy()
+        for col in required_cols:
+            if col not in df.columns:
+                df[col] = 0.0
+        data = df[required_cols].tail(window).values.astype(float)
+        if np.isnan(data).any():
+            data = pd.DataFrame(data, columns=required_cols).ffill().bfill().values
+        data = DataPreprocessor.normalize_lstm_input(data.T).T
+        return data.reshape(1, window, len(required_cols))
 
-    def initialize_trailing_stop(self, symbol, entry_price, position_type, quantity, atr, adx, trade_id):
-        if symbol not in self.stops:
-            self.stops[symbol] = UltraAgressiveTrailingStop(symbol)
-        return self.stops[symbol].initialize_trailing_stop(entry_price, position_type, quantity, atr, adx, trade_id)
+class StrategySelector:
+    @staticmethod
+    def select_strategy_mode(adx, rsi, atr):
+        if adx > 30:
+            return "trend"
+        elif adx < 15 and 40 < rsi < 60 and atr < 30:
+            return "range"
+        return "scalp"
 
-    def update_trailing_stop(self, symbol, current_price, atr, adx):
-        if symbol in self.stops and self.stops[symbol].active:
-            self.stops[symbol].update_trailing_stop(current_price, atr, adx)
-            if self.stops[symbol].verify_order_execution(current_price):
-                self.close_position(symbol)
+    @staticmethod
+    def calculate_dynamic_thresholds(adx, strategy="trend"):
+        base_up, base_down = {
+            "trend": (0.60, 0.40),
+            "scalp": (0.65, 0.35),
+            "range": (0.55, 0.45)
+        }.get(strategy, (0.55, 0.45))
+        adj = (adx / 1000)
+        up = max(base_up - adj, base_down + 0.05)
+        down = min(base_down + adj, up - 0.05)
+        return round(up, 3), round(down, 3)
 
-    def close_position(self, symbol):
-        if symbol in self.stops and self.stops[symbol].active:
-            self.stops[symbol].close_position()
-            del self.stops[symbol]
-            logger.info(f"[{symbol}] Manager closed position")
+class RiskManager:
+    @staticmethod
+    def historical_var(returns, alpha=0.05):
+        if len(returns) < 10:
+            return None
+        return np.percentile(returns.dropna(), 100 * alpha)
 
-    def get_current_stop_price(self, symbol, trade_id=None):
-        if symbol in self.stops and self.stops[symbol].active:
-            return self.stops[symbol].current_stop_price
-        return None
+    @staticmethod
+    def parametric_var(returns, alpha=0.05):
+        mu = returns.mean()
+        sigma = returns.std()
+        return mu + sigma * norm.ppf(alpha)
+
+    @staticmethod
+    def kelly_fraction(win_prob, win_loss_ratio):
+        if win_loss_ratio <= 0:
+            return 0.0
+        return max(0.0, (win_prob - (1 - win_prob) / win_loss_ratio))
 
 class MyTradingStrategy(bt.Strategy):
     params = (
-        ('capital', CAPITAL),
-        ('leverage', LEVERAGE),
-        ('max_concurrent_trades', MAX_CONCURRENT_TRADES),
         ('lstm_models', None),
         ('lstm_scalers', None),
+        ('window', 100),
+        ('rsi_period', 14),
+        ('macd_fast', 12),
+        ('macd_slow', 26),
+        ('macd_signal', 9),
+        ('adx_period', 14),
+        ('ema20_period', 20),
+        ('ema50_period', 50),
+        ('atr_period', 14),
+        ('roc_period', 5),
+        ('spread', 0.0001),
     )
 
     def __init__(self):
-        self.orders = {}
-        self.current_positions = {}
-        self.active_positions = None  # Consolidated
-        self.open_trades_count = 0
-        self.ts_manager = TrailingStopManager()
-        self.atr = {}
-        self.adx = {}
-        self.rsi = {}
-        self.macd = {}
-        self.ema20 = {}
-        self.ema50 = {}
-        self.roc = {}
-        self.last_signal_time = {}
+        self.symbols = {data._name: data for data in self.datas}
+        self.positions = {symbol: None for symbol in self.symbols}
+        self.trailing_stops = {symbol: UltraAgressiveTrailingStop(symbol) for symbol in self.symbols}
+        self.models = self.p.lstm_models
+        self.scalers = self.p.lstm_scalers
+        self.orders = {symbol: None for symbol in self.symbols}
+        self.current_positions_count = 0
 
-        for data in self.datas:
-            symbol = data._name
-            self.atr[symbol] = btind.ATR(data, period=14)
-            self.adx[symbol] = btind.ADX(data, period=14)
-            self.rsi[symbol] = btind.RSI(data, period=14)
-            self.macd[symbol] = btind.MACD(data)
-            self.ema20[symbol] = btind.EMA(data, period=20)
-            self.ema50[symbol] = btind.EMA(data, period=50)
-            self.roc[symbol] = btind.ROC(data, period=5)
-            self.last_signal_time[symbol] = None
-
-        logger.info("Strategy initialized for multi-asset backtest.")
-
-    def log(self, txt, symbol=None, dt=None):
-        dt = dt or self.datas[0].datetime.datetime(0)
-        logger.info(f"{dt.isoformat()} - {symbol} - {txt}" if symbol else f"{dt.isoformat()} - {txt}")
-
-    def prepare_lstm_input(self, symbol, data):
-        if len(data) < 60:  # Aligned to seq_len
-            return None
-        
-        df = pd.DataFrame({
-            'close': data.close.get(size=60),
-            'volume': data.volume.get(size=60),
-            'RSI': self.rsi[symbol].get(size=60),
-            'MACD': self.macd[symbol].macd.get(size=60),
-            'ADX': self.adx[symbol].get(size=60)
-        })
-        df = df.fillna(0)  # Better handling
-        scaler = self.p.lstm_scalers.get(symbol)
-        if scaler:
-            scaled = scaler.transform(df.values)
-            return scaled.reshape(1, 60, 5)
-        return None
-
-    def predict_with_lstm(self, symbol, data):
-        input_data = self.prepare_lstm_input(symbol, data)
-        if input_data is None:
-            return 0.5
-        
-        model = self.p.lstm_models.get(symbol)
-        if model:
-            return model.predict(input_data)[0][0]
-        return 0.5
-
-    def generate_trading_signal(self, symbol, data):
-        if len(data) < 100 or data.volume[0] < 5:
-            return 'hold'
-
-        current_price = data.close[0]
-        atr = max(self.atr[symbol][0], current_price * 0.005)  # Min ATR 0.5%
-        adx = self.adx[symbol][0]
-        rsi = self.rsi[symbol][0]
-        macd = self.macd[symbol][0]
-        macd_signal = self.macd[symbol].signal[0]
-        ema20 = self.ema20[symbol][0]
-        ema50 = self.ema50[symbol][0]
-        roc = self.roc[symbol][0]
-        lstm_pred = self.predict_with_lstm(symbol, data)
-
-        # Mode selection
-        if adx > 25:  # Lowered from 30 for more trend mode
-            mode = 'trend'
-        elif adx < 15 and 40 < rsi < 60 and atr < 30:
-            mode = 'range'
-        else:
-            mode = 'scalp'
-
-        logger.info(f"[{symbol}] Switched to {mode}, ADX: {adx:.2f}, RSI: {rsi:.2f}, ATR: {atr:.2f}, ROC: {roc:.2f}")
-
-        # Dynamic thresholds
-        adx_adjust = max(0.1, min(0.3, adx / 100))
-        if mode == 'trend':
-            upper_threshold = 0.6 - adx_adjust
-            lower_threshold = 0.4 + adx_adjust
-        elif mode == 'range':
-            upper_threshold = 0.55 - adx_adjust
-            lower_threshold = 0.45 + adx_adjust
-        else:
-            upper_threshold = 0.55 - adx_adjust
-            lower_threshold = 0.45 + adx_adjust
-
-        logger.info(f"[{symbol}] Thresholds → Prediction: {lstm_pred:.4f}, Down: {lower_threshold:.4f}, Up: {upper_threshold:.4f}")
-
-        # Confidence factors
-        confidence_factors = []
-        if lstm_pred > 0.6 or lstm_pred < 0.4:
-            confidence_factors.append('LSTM strong')
-        if (macd > macd_signal and macd > 0) or (macd < macd_signal and macd < 0):
-            confidence_factors.append('MACD aligned')
-        if rsi < 30 or rsi > 70:
-            confidence_factors.append('RSI extreme')
-        if current_price > max(data.high.get(size=20)) or current_price < min(data.low.get(size=20)):
-            confidence_factors.append('Breakout detected')
-
-        logger.info(f"[{symbol}] Indicator Summary: RSI: {rsi:.2f} ({'Oversold' if rsi < 30 else 'Overbought' if rsi > 70 else 'Neutral'}), MACD: {macd:.4f} ({'Bullish' if macd > 0 else 'Bearish'}), ADX: {adx:.2f} ({'Strong' if adx > 30 else 'Moderate' if adx > 20 else 'Weak'}), EMA20 vs EMA50: {ema20:.4f} {'>' if ema20 > ema50 else '<'} {ema50:.4f} ({'Bullish' if ema20 > ema50 else 'Bearish'}), ROC: {roc:.2f}% ({'Positive' if roc > 0 else 'Negative'}), Confidence: {', '.join(confidence_factors) or 'None'}")
-
-        # Risk/reward
-        expected_reward = 2 * atr
-        risk = atr
-        risk_reward_ratio = expected_reward / risk if risk > 0 else 0
-        logger.info(f"[{symbol}] Debug: expected_pnl={expected_reward:.4f}, atr={atr:.4f}, ratio={risk_reward_ratio:.4f}")
-
-        if len(confidence_factors) < 1 or risk_reward_ratio < 1.2:  # Relaxed to >=1 factor
-            logger.info(f"[{symbol}] Signal rejected: Confidence ({len(confidence_factors)}/4) or ratio ({risk_reward_ratio:.2f} < 1.2)")
-            return 'hold'
-
-        # Signals per mode
-        if mode == 'trend':
-            if lstm_pred > upper_threshold and ema20 > ema50 and macd > macd_signal:
-                return 'buy'
-            elif lstm_pred < lower_threshold and ema20 < ema50 and macd < macd_signal:
-                return 'sell'
-        elif mode == 'range':
-            rolling_min = min(data.low.get(size=20))
-            rolling_max = max(data.high.get(size=20))
-            if current_price < rolling_min + 0.1 * atr and lstm_pred > upper_threshold:
-                return 'buy'
-            elif current_price > rolling_max - 0.1 * atr and lstm_pred < lower_threshold:
-                return 'sell'
-        else:  # scalp, fixed to momentum (swapped from contrarian)
-            if lstm_pred > upper_threshold and roc > 0.005:
-                return 'buy'
-            elif lstm_pred < lower_threshold and roc < -0.005:
-                return 'sell'
-
-        # Close logic (fixed bug)
-        current_position = self.current_positions.get(symbol)
-        if current_position and current_position.get('side') == 'long':
-            if ema20 < ema50 or roc < -0.01:
-                return 'close_buy'
-        elif current_position and current_position.get('side') == 'short':
-            if ema20 > ema50 or roc > 0.01:
-                return 'close_sell'
-
-        return 'hold'
+        self.indicators = {}
+        for symbol, data in self.symbols.items():
+            self.indicators[symbol] = {
+                'rsi': btind.RSI(data.close, period=self.p.rsi_period),
+                'macd': btind.MACD(data.close, period_me1=self.p.macd_fast, period_me2=self.p.macd_slow, period_signal=self.p.macd_signal),
+                'adx': btind.ADX(data.high, data.low, data.close, period=self.p.adx_period),
+                'ema20': btind.EMA(data.close, period=self.p.ema20_period),
+                'ema50': btind.EMA(data.close, period=self.p.ema50_period),
+                'atr': btind.ATR(data.high, data.low, data.close, period=self.p.atr_period),
+                'roc': btind.ROC(data.close, period=self.p.roc_period),
+            }
 
     def next(self):
-        for data in self.datas:
-            symbol = data._name
-            position = self.getposition(data).size
+        for symbol, data in self.symbols.items():
+            if len(data) < self.p.window:
+                continue
+
+            df = pd.DataFrame({
+                'close': data.close.get(size=self.p.window),
+                'volume': data.volume.get(size=self.p.window),
+                'RSI': self.indicators[symbol]['rsi'].get(size=self.p.window),
+                'MACD': self.indicators[symbol]['macd'].macd.get(size=self.p.window),
+                'ADX': self.indicators[symbol]['adx'].get(size=self.p.window),
+            })
+
+            action, new_position, confidence, confidence_factors = self.check_signal(
+                symbol, df, self.positions[symbol], self.models.get(symbol), self.scalers.get(symbol)
+            )
+
             current_price = data.close[0]
+            atr = self.indicators[symbol]['atr'][0]
+            adx = self.indicators[symbol]['adx'][0]
 
-            self.log(f"Broker cash: {self.broker.getcash():.2f}, Portfolio value: {self.broker.getvalue():.2f}, Open trades: {self.open_trades_count}/{self.p.max_concurrent_trades}")
+            if self.trailing_stops[symbol].active:
+                self.trailing_stops[symbol].update(current_price, atr, self.p.spread, adx)
+                if self.trailing_stops[symbol].check_stop(current_price):
+                    self.close_position(symbol, current_price)
 
-            if self.last_signal_time.get(symbol) == data.datetime.datetime(0):
-                continue
+            if action == "buy" and self.current_positions_count < MAX_CONCURRENT_TRADES:
+                size = self.calculate_position_size(symbol, current_price, atr)
+                self.buy(data=data, size=size * LEVERAGE)
+                self.trailing_stops[symbol].initialize(current_price, 'long', size, atr, adx, self.broker.getvalue())
+                self.positions[symbol] = {'side': 'long', 'quantity': size, 'price': current_price}
+                self.current_positions_count += 1
+            elif action == "sell" and self.current_positions_count < MAX_CONCURRENT_TRADES:
+                size = self.calculate_position_size(symbol, current_price, atr)
+                self.sell(data=data, size=size * LEVERAGE)
+                self.trailing_stops[symbol].initialize(current_price, 'short', size, atr, adx, self.broker.getvalue())
+                self.positions[symbol] = {'side': 'short', 'quantity': size, 'price': current_price}
+                self.current_positions_count += 1
+            elif action in ["close_buy", "close_sell"]:
+                self.close_position(symbol, current_price)
 
-            action = self.generate_trading_signal(symbol, data)
-            self.last_signal_time[symbol] = data.datetime.datetime(0)
+    def check_signal(self, symbol, df, current_position, model, scaler):
+        if len(df) < 100:
+            return "hold", current_position, 0.0, []
 
-            if self.open_trades_count >= self.p.max_concurrent_trades:
-                continue
+        rsi = df['RSI'].iloc[-1]
+        macd = df['MACD'].iloc[-1]
+        adx = df['ADX'].iloc[-1]
+        ema20 = talib.EMA(df['close'], timeperiod=20).iloc[-1]
+        ema50 = talib.EMA(df['close'], timeperiod=50).iloc[-1]
+        atr = talib.ATR(df['high'], df['low'], df['close'], timeperiod=14).iloc[-1]
+        close = df['close'].iloc[-1]
+        roc = talib.ROC(df['close'], timeperiod=5).iloc[-1]
 
-            if self.ts_manager.has_trailing_stop(symbol):
-                self.ts_manager.update_trailing_stop(symbol, current_price, self.atr[symbol][0], self.adx[symbol][0])
-                continue
+        strategy_mode = StrategySelector.select_strategy_mode(adx, rsi, atr)
 
-            if action in ["buy", "sell"] and not position:
-                qty = (self.p.capital * self.p.leverage) / current_price
-                qty = max(qty, 0.001)
-                margin_required = qty * current_price / self.p.leverage
-                if self.broker.getcash() < margin_required:
-                    self.log(f"Insufficient margin for {symbol}", symbol=symbol)
-                    continue
+        lstm_input = DataPreprocessor.prepare_lstm_input(df)
+        prediction = model.predict(lstm_input, verbose=0)[0][0].item()
 
-                if action == "buy":
-                    order = self.buy(data=data, size=qty)
-                    side = 'long'
-                else:
-                    order = self.sell(data=data, size=qty)
-                    side = 'short'
-                self.orders[symbol] = order
-                self.open_trades_count += 1
-                self.current_positions[symbol] = {'side': side, 'quantity': qty}
-                self.log(f"Placed {action} order for {symbol}, Qty: {qty:.4f}, Price: {current_price:.2f}", symbol=symbol)
+        dynamic_up, dynamic_down = StrategySelector.calculate_dynamic_thresholds(adx, strategy_mode)
 
-                # Initialize trailing stop
-                trade_id = str(datetime.datetime.now())
-                self.ts_manager.initialize_trailing_stop(symbol, current_price, side, qty, self.atr[symbol][0], self.adx[symbol][0], trade_id)
+        trend_up = ema20 > ema50
+        trend_down = ema20 < ema50
+        macd_bullish = macd > 0  # Simplified for backtest
 
-            elif action in ["close_buy", "close_sell"] and position:
-                self.close(data=data)
-                self.ts_manager.close_position(symbol)
-                self.open_trades_count -= 1
-                if symbol in self.current_positions:
-                    del self.current_positions[symbol]
-                self.log(f"Closing position for {symbol}", symbol=symbol)
+        confidence_factors = []
+        if prediction > 0.52 or prediction < 0.48:
+            confidence_factors.append("LSTM strong")
+        if (trend_up and macd > 0) or (trend_down and macd < 0):
+            confidence_factors.append("MACD aligned")
+        if rsi > 55 or rsi < 45:
+            confidence_factors.append("RSI strong")
 
-            self.ts_manager.update_trailing_stop(symbol, current_price, self.atr[symbol][0], self.adx[symbol][0])
+        action = "hold"
+        new_position = current_position
 
-    def stop(self):
-        for data in self.datas:
-            symbol = data._name
-            if self.getposition(data).size:
-                self.close(data=data)
-                self.ts_manager.close_position(symbol)
-                self.log(f"Closed position for {symbol} at end", symbol=symbol)
-        self.log(f"Final cash: {self.broker.getcash():.2f}, Value: {self.broker.getvalue():.2f}")
+        if strategy_mode == "trend":
+            if trend_up and macd_bullish and prediction > dynamic_up:
+                action = "buy"
+            elif trend_down and not macd_bullish and prediction < dynamic_down:
+                action = "sell"
+        elif strategy_mode == "range":
+            rolling_low = df['low'].rolling(window=20).min().iloc[-1]
+            rolling_high = df['high'].rolling(window=20).max().iloc[-1]
+            if close <= (rolling_low + 0.1 * atr) and prediction > dynamic_up:
+                action = "buy"
+            elif close >= (rolling_high - 0.1 * atr) and prediction < dynamic_down:
+                action = "sell"
+        elif strategy_mode == "scalp":
+            if prediction > dynamic_up and roc > 0.5:
+                action = "sell"
+            elif prediction < dynamic_down and roc < -0.5:
+                action = "buy"
 
-def create_sequences(X, y, seq_len=60):
-    Xs, ys = [], []
-    for i in range(len(X) - seq_len):
-        Xs.append(X[i:i+seq_len])
-        ys.append(y[i+seq_len])
-    return np.array(Xs), np.array(ys)
+        if current_position and current_position['side'] == "long" and (trend_down or roc < -1):
+            action = "close_buy"
+            new_position = None
+        elif current_position and current_position['side'] == "short" and (trend_up or roc > 1):
+            action = "close_sell"
+            new_position = None
 
-def create_gru_model(input_shape):  # Changed to GRU for better performance in crypto prediction
-    model = Sequential()
-    model.add(Input(shape=input_shape))
-    model.add(GRU(100, return_sequences=True, dropout=0.2))
-    model.add(GRU(100, dropout=0.2))
-    model.add(Dense(1, activation='sigmoid'))  # Kept binary for up/down
-    model.compile(optimizer=keras.optimizers.Adam(learning_rate=0.0001), loss='binary_crossentropy')
+        confidence = len(confidence_factors) / 4.0  # Simple confidence score
+
+        return action, new_position, confidence, confidence_factors
+
+    def calculate_position_size(self, symbol, price, atr):
+        available_margin = self.broker.getcash()
+        raw_qty = (available_margin * 0.95 * LEVERAGE) / price
+        win_prob = 0.55  # Assumed from bot
+        win_loss_ratio = 2  # Assumed
+        kelly = RiskManager.kelly_fraction(win_prob, win_loss_ratio)
+        qty = raw_qty * max(kelly, 0.1)
+        return qty
+
+    def close_position(self, symbol, price):
+        if self.positions[symbol]:
+            self.close(data=self.symbols[symbol])
+            self.trailing_stops[symbol].close_position()
+            self.positions[symbol] = None
+            self.current_positions_count -= 1
+
+    def notify_order(self, order):
+        if order.status in [order.Completed]:
+            logger.info(f"Order completed for {order.data._name}: {order.getstatusname()}")
+
+def create_sequences(data, labels, seq_len=100):
+    X, y = [], []
+    for i in range(len(data) - seq_len):
+        X.append(data[i:i+seq_len])
+        y.append(labels[i+seq_len-1])
+    return np.array(X), np.array(y)
+
+def create_gru_model(input_shape):
+    model = Sequential([
+        Input(shape=input_shape),
+        Bidirectional(GRU(128, return_sequences=True, dropout=0.3)),  # Increased units
+        Bidirectional(GRU(64, dropout=0.3)),
+        Dense(32, activation='relu'),
+        Dense(1, activation='sigmoid')
+    ])
+    model.compile(optimizer=keras.optimizers.Adam(learning_rate=0.0005),  # Lower LR
+                  loss='binary_crossentropy',
+                  metrics=['accuracy'])
     return model
 
-def train_lstm_model(symbols_data, epochs=50, batch_size=32, seq_len=60):  # Increased epochs/batch for better training
+def train_lstm_model(symbols_data, seq_len=100, epochs=50, batch_size=32):
     models = {}
     scalers = {}
-
     for symbol, data_path in symbols_data.items():
-        logger.info(f"Training GRU for {symbol} using {data_path}")
+        if not os.path.exists(data_path):
+            continue
         df = pd.read_csv(data_path)
         df['datetime'] = pd.to_datetime(df['datetime'])
         df = df.sort_values('datetime')
@@ -534,10 +475,13 @@ def run_backtest(symbols_data, api_key='', api_secret=''):
     for symbol, path in symbols_data.items():
         if not os.path.exists(path):
             logger.info(f"Downloading data for {symbol}")
-            df = download_binance_data(symbol, interval='5m', api_key=api_key, api_secret=api_secret)
+            df = download_binance_data(symbol, interval=TIMEFRAME, api_key=api_key, api_secret=api_secret)
             if df is not None:
+                os.makedirs(os.path.dirname(path), exist_ok=True)  # Ensure dir exists
                 df.to_csv(path, index=False)
+                logger.info(f"Saved {len(df)} rows to {path}")
             else:
+                logger.warning(f"Skipping {symbol} due to download failure")
                 continue
 
     lstm_models, lstm_scalers = train_lstm_model(symbols_data)
@@ -545,23 +489,33 @@ def run_backtest(symbols_data, api_key='', api_secret=''):
     cerebro = bt.Cerebro()
     cerebro.addstrategy(MyTradingStrategy, lstm_models=lstm_models, lstm_scalers=lstm_scalers)
 
+    data_count = 0
     for symbol, data_path in symbols_data.items():
         try:
+            if not os.path.exists(data_path):
+                logger.warning(f"CSV missing for {symbol}, skipping")
+                continue
+
             df = pd.read_csv(data_path)
             required_columns = ['datetime', 'open', 'high', 'low', 'close', 'volume']
             if not all(col in df.columns for col in required_columns):
-                raise ValueError(f"Missing columns in {symbol} CSV")
+                raise ValueError(f"Missing columns in {symbol} CSV: {set(required_columns) - set(df.columns)}")
 
             df['datetime'] = pd.to_datetime(df['datetime'])
             df = df.sort_values('datetime').ffill().bfill()
 
-            one_month_ago = datetime.datetime.now() - pd.DateOffset(months=1)
-            df = df[df['datetime'] >= one_month_ago]
+            # CORRECTION: Supprimé le filtre 1 mois pour utiliser tout le dataset (~3 mois)
+            # Si vous voulez le garder: one_month_ago = datetime.datetime.now() - pd.DateOffset(months=1)
+            # df = df[df['datetime'] >= one_month_ago]
+            logger.info(f"Using {len(df)} rows for {symbol} from {df['datetime'].min()} to {df['datetime'].max()}")
+
             if df.empty:
+                logger.warning(f"Empty dataframe for {symbol} after processing, skipping")
                 continue
 
             df.to_csv(f'./backtest/data_cleaned_{symbol}.csv', index=False)
 
+            compression = 60 if TIMEFRAME == '5m' else 5  # Adjusted for timeframe
             data = bt.feeds.PandasData(
                 dataname=df,
                 datetime='datetime',
@@ -571,38 +525,42 @@ def run_backtest(symbols_data, api_key='', api_secret=''):
                 close='close',
                 volume='volume',
                 timeframe=bt.TimeFrame.Minutes,
-                compression=5,
+                compression=compression,
                 name=symbol
             )
             cerebro.adddata(data)
-            logger.info(f"Data loaded for {symbol}")
+            data_count += 1
+            logger.info(f"Data loaded for {symbol} ({len(df)} rows)")
         except Exception as e:
-            logger.error(f"Error for {symbol}: {e}")
+            logger.error(f"Error loading {symbol}: {e}")
             continue
+
+    if data_count == 0:
+        raise ValueError("No data sources added to Cerebro! Check CSV files and dates. Run with fresh download.")
 
     cerebro.broker.setcash(CAPITAL)
     cerebro.broker.setcommission(commission=0.0004)  # 0.04%
-    cerebro.broker.set_slippage_perc(perc=0.001)  # Increased to 0.1% for realism
-    logger.info(f"Broker cash: {cerebro.broker.getcash():.2f}")
+    cerebro.broker.set_slippage_perc(perc=0.001)  # 0.1%
+    logger.info(f"Broker cash: {cerebro.broker.getcash():.2f} | Datas added: {data_count}")
 
     cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe', timeframe=bt.TimeFrame.Days)
     cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
     cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='trades')
     cerebro.addanalyzer(bt.analyzers.SQN, _name='sqn')
 
-    cerebro.addindicator(btind.RSI, period=14)
-    cerebro.addindicator(btind.MACD)
-    cerebro.addindicator(btind.EMA, period=20)
-    cerebro.addindicator(btind.EMA, period=50)
-
     logger.info(f"Initial value: {cerebro.broker.getvalue():.2f}")
     results = cerebro.run()
+    
+    if not results:
+        raise RuntimeError("Cerebro.run() returned empty results! Likely no data or strategy execution.")
+
     strategy = results[0]
 
     final_value = cerebro.broker.getvalue()
     logger.info(f"Final value: {final_value:.2f}")
     logger.info(f"Profit: {final_value - CAPITAL:.2f}")
 
+    # [Reste des logs analyzers inchangé]
     if 'sharpe' in strategy.analyzers:
         sharpe = strategy.analyzers.sharpe.get_analysis().get('sharperatio', 'N/A')
         logger.info(f"Sharpe: {sharpe:.2f}")
@@ -633,7 +591,6 @@ def run_backtest(symbols_data, api_key='', api_secret=''):
         logger.error(f"Chart error: {e}")
 
 if __name__ == '__main__':
-    # Add your Binance API keys here
     API_KEY = 'tjmxSoMLy22RZEWO7sTbmMPa6t2wEHrYZElLAKep8VlAF1SbGlpVm9OIWGTIuJl6'
     API_SECRET = 'Z3hF9Tf83pP2E0KCx31n61hWxEdCTsMgNmVj35qzX68uaSyvXTo2wqmWBA8StR3N'
 
@@ -642,4 +599,4 @@ if __name__ == '__main__':
         'ETHUSDT': './backtest/ETHUSDT_month.csv',
         'XRPUSDT': './backtest/XRPUSDT_month.csv',
     }
-    run_backtest(symbols_data, api_key=API_KEY, api_secret=API_SECRET)
+    run_backtest(symbols_data)

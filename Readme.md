@@ -1,23 +1,43 @@
-﻿<<<<<<< HEAD
-﻿⚡ Adaptive Trend Rider - Binance Futures Trading Bot
-=======
-# 📈 Adaptive Trend Rider
->>>>>>> ef1b99465654f8aa034085d6346e1080a3412604
+<<<<<<< HEAD
+﻿# 📈 Adaptive Trend Rider - Binance Futures Trading Bot
 
-A powerful trading bot for Binance Futures, leveraging technical analysis (TA), LSTM models for signal generation, Kafka for real-time data ingestion, PostgreSQL for data storage, and Prometheus/Grafana/Telegram for monitoring and alerting. Designed for both simulated and live trading, this bot is built for performance and scalability.
+A high-performance trading bot for Binance Futures featuring:
+- Advanced technical analysis with TA-Lib
+- LSTM models for predictive signals
+- Real-time data streaming via WebSockets and Kafka
+- Robust database management with connection pooling
+- Circuit breaker pattern for resilient API calls
+- Comprehensive configuration management
+- Built-in retry mechanisms with exponential backoff
+- Monitoring and alerting integration
 
 ---
 
 ## ✨ Features
 
-* **Real-Time Data Ingestion**: Streams market data (candles) via Binance WebSocket and Kafka.
-* **Technical Analysis**: Uses TA indicators (RSI, MACD, ADX, EMA, ATR, ROC) via TA-Lib.
-* **LSTM-Powered Signals**: Generates buy/sell signals using deep learning models.
-* **Order Execution**: Manages trades with trailing stops and enhanced order logic.
-* **Data Storage**: Stores price data, trades, and signals in PostgreSQL.
-* **Monitoring & Alerts**: Integrates with Prometheus for metrics, Grafana for dashboards, and Telegram for real-time alerts.
-* **Configurable**: Fully customizable via YAML configuration files.
-* **Testnet Support**: Safe testing with Binance Futures Testnet.
+### Core Functionality
+* **Real-Time Data Streaming**: WebSocket integration with Binance Futures API
+* **Advanced Technical Analysis**: Comprehensive TA indicators via TA-Lib
+* **Machine Learning**: LSTM models for predictive signal generation
+* **Order Management**: Smart order execution with trailing stops
+
+### Reliability & Resilience
+* **Connection Pooling**: Efficient database connection management
+* **Circuit Breaker**: Prevents cascading failures during API outages
+* **Retry Mechanism**: Automatic retries with exponential backoff
+* **Graceful Error Handling**: Comprehensive exception handling
+
+### Monitoring & Operations
+* **Real-time Monitoring**: Integration with Prometheus and Grafana
+* **Alerting**: Telegram notifications for critical events
+* **Logging**: Structured logging with rotation
+* **Metrics**: Performance and trade metrics collection
+
+### Configuration & Extensibility
+* **Environment-Aware**: Supports development, testing, and production
+* **Modular Design**: Easy to extend with new strategies
+* **Testnet Support**: Safe testing with Binance Futures Testnet
+* **Template Configs**: Easy setup with template files
 
 ---
 
@@ -56,41 +76,50 @@ npm install
 
 ### 3. Configure the Bot
 
-Edit files inside the `config/` directory:
+1. Copy the template configuration files:
+   ```bash
+   cp config/config.yaml.template config/config.yaml
+   cp .env.template .env
+   ```
 
-```yaml
-# config/config.yaml
-binance:
-  api_key: "your_api_key"
-  api_secret: "your_api_secret"
-  base_url: "https://testnet.binancefuture.com"
-  symbols: ["BTCUSDT", "ETHUSDT"]
-  timeframe: "1h"
-  capital: 1000
-  leverage: 10
+2. Edit the configuration files:
+   - `config/config.yaml`: Main configuration
+   - `.env`: Sensitive credentials and environment-specific settings
 
-model:
-  sequence_length: 10
+3. For production, set these environment variables:
+   ```bash
+   # Database
+   export DB_PASSWORD=your_secure_password
+   
+   # Binance API
+   export BINANCE_API_KEY=your_api_key
+   export BINANCE_API_SECRET=your_api_secret
+   
+   # Trading parameters
+   export TRADING_LEVERAGE=10
+   export TRADING_MAX_RISK=0.02
+   ```
 
-# config/kafka_config.yaml
-kafka:
-  bootstrap_servers: "localhost:9092"
+4. Configure the database in `config/config.yaml`:
+   ```yaml
+   database:
+     host: "localhost"
+     port: 5432
+     database: "trading_bot"
+     user: "postgres"
+     min_connections: 5
+     max_connections: 20
+   ```
 
-# config/db_config.yaml
-database:
-  host: "localhost"
-  port: 5432
-  database: "trading_bot_db"
-  user: "postgres"
-  password: "your_password"
-
-# config/alerting_config.yaml
-telegram:
-  bot_token: "your_telegram_bot_token"
-  chat_id: "your_chat_id"
-prometheus:
-  url: "http://localhost:8000"
-```
+5. Set up trading parameters:
+   ```yaml
+   trading:
+     symbols: ["BTCUSDT", "ETHUSDT"]
+     timeframe: "1h"
+     capital: 1000.0
+     max_risk_per_trade: 0.02
+     trailing_stop: true
+   ```
 
 ### 4. Set Up Database
 

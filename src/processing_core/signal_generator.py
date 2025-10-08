@@ -19,6 +19,29 @@ from src.database.db_handler import insert_signal, insert_training_data, get_fut
 from src.monitoring.alerting import send_telegram_alert
 from binance.client import Client
 
+# === Ajout : Configuration dynamique des indicateurs selon le timeframe ===
+class TimeframeConfig:
+    """
+    Configure indicator parameters dynamically based on timeframe.
+    """
+    DEFAULTS = {
+        "1m":  {"rsi": 7, "macd": (5, 13, 4), "adx": 7, "ema": (5, 20), "atr": 7,  "roc": 4},
+        "5m":  {"rsi": 9, "macd": (8, 21, 5), "adx": 10, "ema": (9, 26), "atr": 10, "roc": 5},
+        "15m": {"rsi": 9, "macd": (8, 21, 5), "adx": 10, "ema": (9, 26), "atr": 10, "roc": 6},
+        "1h":  {"rsi": 14, "macd": (12, 26, 9), "adx": 14, "ema": (20, 50), "atr": 14, "roc": 10},
+        "4h":  {"rsi": 14, "macd": (12, 26, 9), "adx": 14, "ema": (20, 50), "atr": 14, "roc": 14},
+        "1d":  {"rsi": 14, "macd": (12, 26, 9), "adx": 14, "ema": (20, 50), "atr": 14, "roc": 14},
+    }
+
+    def __init__(self, timeframe="15m"):
+        self.timeframe = timeframe.lower()
+        self.params = self.DEFAULTS.get(self.timeframe, self.DEFAULTS["15m"])
+        logging.info(f"[TimeframeConfig] Loaded parameters for {self.timeframe}: {self.params}")
+
+    def get_params(self):
+        """Return indicator parameters."""
+        return self.params
+
 # Initialize logging and console
 logger = logging.getLogger(__name__)
 console = Console()
@@ -259,11 +282,11 @@ def get_available_margin(api_key, api_secret):
 
 def check_signal(df, model, current_position, last_order_details, symbol, last_action_sent=None, config=None):
     """
-    Optimized signal checker:
-    - Assouplit les conditions strictes
-    - Intègre ATR minimal, Kelly Criterion
-    - Rend le backtest indicatif au lieu de bloquant
+    Optimized signal checker with dynamic timeframe configuration.
     """
+    # === Timeframe dynamique ===
+    timeframe = config.get("timeframe", "15m") if config else "15m"
+    tf_params = TimeframeConfig(timeframe).get_params()
 
     if isinstance(current_position, dict):
         current_side = current_position.get("side")
@@ -274,22 +297,45 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
         logger.debug(f"[check_signal] Not enough data for {symbol}: {len(df)} rows")
         return "hold", current_position, 0.0, []
 
-    # === Extraction indicateurs ===
-    rsi = df['RSI'].iloc[-1]
-    macd = df['MACD'].iloc[-1]
-    signal_line = df['MACD_signal'].iloc[-1]
-    adx = df['ADX'].iloc[-1]
-    ema20 = df['EMA20'].iloc[-1]
-    ema50 = df['EMA50'].iloc[-1]
-    atr = max(df['ATR'].iloc[-1], df['close'].iloc[-1] * 0.005)   # ✅ ATR minimum
+    # === Extraction indicateurs dynamiques selon le timeframe ===
+    rsi = talib.RSI(df['close'], timeperiod=tf_params["rsi"]).iloc[-1]
+    macd_arr, signal_arr, _ = talib.MACD(
+        df['close'],
+        fastperiod=tf_params["macd"][0],
+        slowperiod=tf_params["macd"][1],
+        signalperiod=tf_params["macd"][2]
+    )
+    macd = macd_arr.iloc[-1]
+    signal_line = signal_arr.iloc[-1]
+    adx = talib.ADX(df['high'], df['low'], df['close'], timeperiod=tf_params["adx"]).iloc[-1]
+    ema_short = talib.EMA(df['close'], timeperiod=tf_params["ema"][0]).iloc[-1]
+    ema_long = talib.EMA(df['close'], timeperiod=tf_params["ema"][1]).iloc[-1]
+    atr = max(talib.ATR(df['high'], df['low'], df['close'], timeperiod=tf_params["atr"]).iloc[-1], df['close'].iloc[-1] * 0.005)
     close = df['close'].iloc[-1]
-    roc = talib.ROC(df['close'], timeperiod=5).iloc[-1] * 100
+    roc = talib.ROC(df['close'], timeperiod=tf_params["roc"]).iloc[-1] * 100
 
-    # === Sélection stratégie ===
-    strategy_mode = StrategySelector.select_strategy_mode(adx, rsi, atr)
-    logger.info(f"[Strategy] {strategy_mode} mode for {symbol} (ADX={adx:.2f}, RSI={rsi:.2f}, ATR={atr:.4f})")
+    # === Détection d'un renversement imminent ===
+    reversal_detected = False
+    reversal_strength = 0.0
 
-    # === LSTM Prediction ===
+    # Divergence RSI/price
+    rsi_prev = df['RSI'].iloc[-2]
+    price_prev = df['close'].iloc[-2]
+    if (close > price_prev and rsi < rsi_prev - 5) or (close < price_prev and rsi > rsi_prev + 5):
+        reversal_detected = True
+        reversal_strength += 0.4
+
+    # MACD affaibli malgré la tendance
+    if abs(macd) < abs(df['MACD'].iloc[-2]) and (macd * signal_line) < 0:
+        reversal_detected = True
+        reversal_strength += 0.3
+
+    # Volume en baisse pendant poursuite du mouvement
+    if df['volume'].iloc[-1] < df['volume'].rolling(10).mean().iloc[-1] * 0.8:
+        reversal_detected = True
+        reversal_strength += 0.2
+
+    # LSTM perd confiance dans la direction actuelle
     lstm_input = DataPreprocessor.prepare_lstm_input(df)
     try:
         prediction = model.predict(lstm_input, verbose=0)[0][0].item()
@@ -298,14 +344,25 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
         logger.error(f"[Prediction Error] {e} for {symbol}")
         return "hold", current_position, 0.0, []
 
+    if 0.45 < prediction < 0.55:
+        reversal_detected = True
+        reversal_strength += 0.3
+
+    if reversal_detected:
+        logger.info(f"[Reversal] ⚠️ Possible trend reversal on {symbol} | Strength={reversal_strength:.2f}")
+
+    # === Sélection stratégie ===
+    strategy_mode = StrategySelector.select_strategy_mode(adx, rsi, atr)
+    logger.info(f"[Strategy] {strategy_mode} mode for {symbol} (ADX={adx:.2f}, RSI={rsi:.2f}, ATR={atr:.4f})")
+
     # === Dynamic thresholds (plus souples) ===
     dynamic_up, dynamic_down = StrategySelector.calculate_dynamic_thresholds(adx, strategy_mode)
     dynamic_up = max(dynamic_up, 0.52)
     dynamic_down = min(dynamic_down, 0.48)
 
     # === Conditions marché ===
-    trend_up = ema20 > ema50
-    trend_down = ema20 < ema50
+    trend_up = ema_short > ema_long
+    trend_down = ema_short < ema_long
     macd_bullish = macd > signal_line
     rolling_high = df['high'].rolling(window=20).max()
     rolling_low = df['low'].rolling(window=20).min()
@@ -323,7 +380,7 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
     if breakout_up or breakout_down:
         confidence_factors.append("Breakout detected")
 
-    IndicatorAnalyzer.log_indicator_summary(symbol, rsi, macd, adx, ema20, ema50, atr, roc, confidence_factors)
+    IndicatorAnalyzer.log_indicator_summary(symbol, rsi, macd, adx, ema_short, ema_long, atr, roc, confidence_factors)
 
     # === Config API ===
     if config is None:
@@ -352,28 +409,51 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
     if len(confidence_factors) < 2 or risk_reward_ratio < 1.2:
         return "hold", current_position, 0.0, confidence_factors
 
-    # Logique par stratégie
-    if strategy_mode == "trend":
-        if trend_up and macd_bullish and prediction > dynamic_up:
-            action = "buy"
-            new_position = {"side": "long", "quantity": quantity, "price": close, "trade_id": str(signal_timestamp)}
-        elif trend_down and not macd_bullish and prediction < dynamic_down:
-            action = "sell"
-            new_position = {"side": "short", "quantity": quantity, "price": close, "trade_id": str(signal_timestamp)}
-    elif strategy_mode == "range":
-        if close <= (rolling_low.iloc[-1] + 0.1 * atr) and prediction > dynamic_up:
-            action = "buy"
-            new_position = {"side": "long", "quantity": quantity, "price": close, "trade_id": str(signal_timestamp)}
-        elif close >= (rolling_high.iloc[-1] - 0.1 * atr) and prediction < dynamic_down:
-            action = "sell"
-            new_position = {"side": "short", "quantity": quantity, "price": close, "trade_id": str(signal_timestamp)}
-    elif strategy_mode == "scalp":
-        if prediction > dynamic_up and roc > 0.5:
-            action = "sell"
-            new_position = {"side": "short", "quantity": quantity, "price": close, "trade_id": str(signal_timestamp)}
-        elif prediction < dynamic_down and roc < -0.5:
-            action = "buy"
-            new_position = {"side": "long", "quantity": quantity, "price": close, "trade_id": str(signal_timestamp)}
+    # === Gestion proactive du renversement ===
+    if reversal_detected and reversal_strength > 0.5:
+        if current_side == "long":
+            action = "close_buy"
+            logger.info(f"[Reversal] Closing LONG early on {symbol} (anticipating trend change)")
+            new_position = None
+        elif current_side == "short":
+            action = "close_sell"
+            logger.info(f"[Reversal] Closing SHORT early on {symbol} (anticipating trend change)")
+            new_position = None
+        else:
+            # Si aucune position ouverte, on peut anticiper un inversement
+            if trend_up and macd < 0 and rsi < 55:
+                action = "sell"
+                logger.info(f"[Reversal Entry] {symbol} potential SHORT (pre-reversal)")
+                new_position = {"side": "short", "quantity": quantity, "price": close, "trade_id": str(signal_timestamp)}
+            elif trend_down and macd > 0 and rsi > 45:
+                action = "buy"
+                logger.info(f"[Reversal Entry] {symbol} potential LONG (pre-reversal)")
+                new_position = {"side": "long", "quantity": quantity, "price": close, "trade_id": str(signal_timestamp)}
+
+    # Logique par stratégie (si pas de reversal)
+    if action == "hold":
+        if strategy_mode == "trend":
+            if trend_up and macd_bullish and prediction > dynamic_up:
+                action = "buy"
+                new_position = {"side": "long", "quantity": quantity, "price": close, "trade_id": str(signal_timestamp)}
+            elif trend_down and not macd_bullish and prediction < dynamic_down:
+                action = "sell"
+                new_position = {"side": "short", "quantity": quantity, "price": close, "trade_id": str(signal_timestamp)}
+        elif strategy_mode == "range":
+            if close <= (rolling_low.iloc[-1] + 0.1 * atr) and prediction > dynamic_up:
+                action = "buy"
+                new_position = {"side": "long", "quantity": quantity, "price": close, "trade_id": str(signal_timestamp)}
+            elif close >= (rolling_high.iloc[-1] - 0.1 * atr) and prediction < dynamic_down:
+                action = "sell"
+                new_position = {"side": "short", "quantity": quantity, "price": close, "trade_id": str(signal_timestamp)}
+        elif strategy_mode == "scalp":
+            if prediction > dynamic_up and roc > 0.5:
+                action = "buy"   
+                new_position = {"side": "long", "quantity": quantity, "price": close, "trade_id": str(signal_timestamp)}
+            elif prediction < dynamic_down and roc < -0.5:
+                action = "sell"  
+                new_position = {"side": "short", "quantity": quantity, "price": close, "trade_id": str(signal_timestamp)}
+
 
     # Fermeture de position
     if current_side == "long" and (trend_down or roc < -1):
@@ -398,10 +478,39 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
     weights = adaptive_weights(symbol)
     confidence = sum(weights.get(f, 0.05) for f in confidence_factors)
 
+    # Réduction de confiance si contradiction détectée
+    if (action == "buy" and trend_down) or (action == "sell" and trend_up):
+        confidence *= 0.6
+        logger.info(f"[Confidence Adjustment] Contradiction trend → confiance réduite ({confidence:.2f})")
+
+    # Sauvegarde dans training_data pour le tracker
+    try:
+        insert_training_data(
+            symbol=symbol,
+            timestamp=signal_timestamp,
+            indicators={
+                "rsi": rsi,
+                "macd": macd,
+                "adx": adx,
+                "ema_short": ema_short,
+                "ema_long": ema_long,
+                "atr": atr
+            },
+            market_context={
+                "strategy": strategy_mode,
+                "confidence_factors": confidence_factors
+            },
+            prediction=prediction,
+            action=action.lower(),
+            price=close
+        )
+    except Exception as e:
+        logger.error(f"[Training Insert Error] {e}")
+
     # Stockage et alerte
     if action != "hold":
-        logger.info(f"[Signal] {symbol} → {action.upper()} | Conf: {confidence:.2f} | P={prediction:.4f} | R/R={risk_reward_ratio:.2f}")
-        send_telegram_alert(f"[Signal] {symbol} → {action.upper()} | Conf: {confidence:.2f} | P={prediction:.4f} | R/R={risk_reward_ratio:.2f}")
+        logger.info(f"[Signal] {symbol} → {action.upper()} at {close:.4f} | Conf: {confidence:.2f} | P={prediction:.4f} | R/R={risk_reward_ratio:.2f}")
+        send_telegram_alert(f"[Signal] {symbol} → {action.upper()} at {close:.4f} | Conf: {confidence:.2f} | P={prediction:.4f} | R/R={risk_reward_ratio:.2f}")
         try:
             insert_signal(symbol, signal_timestamp, action.lower(), close, confidence, strategy_mode)
         except Exception as e:

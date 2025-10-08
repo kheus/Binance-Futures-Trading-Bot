@@ -215,23 +215,24 @@ def insert_trade(trade_data):
         if conn:
             release_db_connection(conn)
 
-def insert_signal(symbol, timestamp, signal_type, price, confidence_score=None, strategy=None):
+def insert_signal(symbol, timestamp, signal_type, price, confidence_score=None, strategy=None, status="accepted"):
     """
     Insert a signal into the signals table, skipping duplicates.
     """
     created_at = datetime.utcnow()
     query = """
-    INSERT INTO signals (symbol, timestamp, signal_type, price, created_at, confidence_score, strategy)
-    VALUES (%s, %s, %s, %s, %s, %s, %s)
+    INSERT INTO signals (symbol, timestamp, signal_type, side, price, entry_price, created_at, confidence_score, strategy, status, evaluated)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     ON CONFLICT (symbol, timestamp) DO NOTHING
     """
     try:
         timestamp_ms = int(float(timestamp))  # Validate timestamp
         if timestamp_ms < 946684800000 or timestamp_ms > 4102444800000:  # 2000 to 2100
             raise ValueError(f"Invalid timestamp for {symbol}: {timestamp_ms}")
+        side_upper = signal_type.upper()  # e.g., "BUY" pour aligner avec evaluate_signals
         execute_query(
             query,
-            (symbol, timestamp_ms, signal_type, float(price), created_at, confidence_score, strategy),
+            (symbol, timestamp_ms, signal_type, side_upper, float(price), float(price), created_at, confidence_score, strategy, status, False),
             fetch=False
         )
         logger.info(f"[insert_signal] Signal inserted or skipped (if duplicate) for {symbol} at {timestamp_ms}")
@@ -240,43 +241,66 @@ def insert_signal(symbol, timestamp, signal_type, price, confidence_score=None, 
         logger.error(f"[insert_signal] Error inserting signal: {str(e)}")
         raise
 
-def insert_training_data(symbol, timestamp, indicators, market_context, prediction=None, action=None, price=None):
+def insert_training_data(
+    symbol, timestamp, indicators, market_context, 
+    prediction=None, action=None, price=None, 
+    future_price=None, outcome=None, market_direction=None, 
+    price_change_pct=None
+):
     query = """
-    INSERT INTO training_data (symbol, timestamp, indicators, market_context, prediction, action, price, created_at)
-    VALUES (%s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s)
-    ON CONFLICT (symbol, timestamp) DO NOTHING
+    INSERT INTO training_data (
+        symbol, timestamp, indicators, market_context,
+        prediction, action, price,
+        market_direction, price_change_pct, prediction_correct
+    )
+    VALUES (%s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s, %s, %s)
+    ON CONFLICT (symbol, timestamp) DO UPDATE SET
+        prediction = EXCLUDED.prediction,
+        action = EXCLUDED.action,
+        price = EXCLUDED.price,
+        market_direction = EXCLUDED.market_direction,
+        price_change_pct = EXCLUDED.price_change_pct,
+        prediction_correct = EXCLUDED.prediction_correct,
+        updated_at = (EXTRACT(EPOCH FROM NOW()) * 1000)::BIGINT
     """
+
+
     conn = None
     try:
         timestamp_ms = int(float(timestamp))
         if timestamp_ms < 946684800000 or timestamp_ms > 4102444800000:
             raise ValueError(f"Invalid timestamp for {symbol}: {timestamp_ms}")
 
+        # Valider et convertir indicators et market_context en JSON string
+        if not isinstance(indicators, (dict, str)):
+            raise ValueError(f"indicators must be dict or JSON string, got {type(indicators)}")
         indicators_json = json.dumps(indicators) if isinstance(indicators, dict) else indicators
-        market_context_json = json.dumps(market_context) if isinstance(market_context, dict) else market_context
         
-        # Get current time in milliseconds for created_at
-        created_at_ms = int(datetime.utcnow().timestamp() * 1000)
+        if not isinstance(market_context, (dict, str)):
+            raise ValueError(f"market_context must be dict or JSON string, got {type(market_context)}")
+        market_context_json = json.dumps(market_context) if isinstance(market_context, dict) else market_context
 
-        conn = get_db_connection()
-        with conn.cursor() as cur:
-            cur.execute(query, (
-                symbol,
-                timestamp_ms,
-                indicators_json,
-                market_context_json,
-                float(prediction) if prediction is not None else None,
-                action,
-                float(price) if price is not None else None,
-                created_at_ms  # Use millisecond timestamp
-            ))
-            conn.commit()
-            logger.debug(f"[insert_training_data] Inserted training data for {symbol} at {timestamp_ms}")
+        # Calculer price_change_pct et market_direction si future_price fourni
+        if future_price is not None and price is not None:
+            price_change = (future_price - price) / price * 100 if price != 0 else 0
+            price_change_pct = price_change
+            market_direction = 1 if future_price > price else 0 if future_price < price else None
+        
+        # Calculer prediction_correct si outcome fourni
+        prediction_correct = None
+        if outcome:
+            prediction_correct = (outcome == 'win')  # Adaptez selon ta logique (True/False)
+        
+        # Params sans created_at (utilise DEFAULT)
+        execute_query(query, (
+            symbol, timestamp_ms, indicators_json, market_context_json, 
+            prediction, action, float(price) if price else None, 
+            market_direction, price_change_pct, prediction_correct
+        ))
+        logger.info(f"Training data inserted/updated for {symbol} at {timestamp_ms}")
         return True
     except Exception as e:
-        logger.error(f"[insert_training_data] Error inserting training data for {symbol} at {timestamp_ms}: {str(e)}")
-        if conn:
-            conn.rollback()
+        logger.error(f"[insert_training_data] Error for {symbol} at {timestamp}: {str(e)}")
         return False
     finally:
         if conn:

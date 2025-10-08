@@ -5,7 +5,7 @@ symbols:
   - "BTCUSDT"
   - "ETHUSDT"
 timeframe: "1m"
-capital: 1000
+capital: 10
 leverage: 10
 trailing_update_interval: 10
 price_fetch_interval: 60

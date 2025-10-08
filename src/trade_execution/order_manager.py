@@ -279,32 +279,54 @@ def update_trailing_stop(client, symbol, signal, current_price, atr, base_qty, e
         logger.error(f"[OrderManager] Error updating trailing stop for {symbol}: {e}")
         return None
 
-def place_scaled_take_profits(client, symbol, entry_price, quantity, position_type, atr, ts_manager, trade_id=None):
+def place_scaled_take_profits(client, symbol, entry_price, position_type, quantity, trade_id, levels):
+    """
+    Place plusieurs ordres de take profit échelonnés avec sécurité reduceOnly.
+    levels: list of dicts, each with keys 'pct' (float, e.g. 0.01 for +1%), 'fraction' (float, e.g. 0.5 for 50%)
+    """
+    from src.trade_execution.ultra_aggressive_trailing import format_quantity, format_price, get_exchange_precision
+
     try:
-        tp_levels = [
-            {"factor": 1.5, "percent": 0.4, "reduce_ts": True},
-            {"factor": 3.0, "percent": 0.4, "reduce_ts": True},
-            {"factor": 5.0, "percent": 0.2, "close_position": True}
-        ]
-        trade_id = str(trade_id or int(time.time())).replace('trade_', '')
-        for level in tp_levels:
-            tp_price = format_price(client, symbol, entry_price + (level["factor"] * atr) if position_type == "long" else entry_price - (level["factor"] * atr))
-            partial_qty = format_quantity(client, symbol, quantity * level["percent"])
-            client.create_order(
+        rules = get_exchange_precision(client, symbol)
+        qty_precision = rules["qty_precision"]
+
+        for level in levels:
+            tp_price = format_price(
+                client, symbol,
+                entry_price * (1 + level["pct"]) if position_type == "long" else entry_price * (1 - level["pct"])
+            )
+            partial_qty = float(quantity) * level["fraction"]
+            partial_qty = format_quantity(client, symbol, partial_qty)
+
+            # Sécurité : éviter d’envoyer plus que la position actuelle
+            positions = client.get_position_risk(symbol=symbol)
+            pos_qty = 0.0
+            for pos in positions:
+                if pos["symbol"] == symbol:
+                    pos_qty = abs(float(pos["positionAmt"]))
+                    break
+
+            if partial_qty > pos_qty:
+                partial_qty = pos_qty
+
+            if partial_qty <= 0:
+                continue
+
+            order = client.new_order(
                 symbol=symbol,
-                side=SIDE_SELL if position_type == "long" else SIDE_BUY,
+                side="SELL" if position_type == "long" else "BUY",
                 type="TAKE_PROFIT_MARKET",
                 stopPrice=str(tp_price),
-                quantity=partial_qty,
-                closePosition=level.get("close_position", False),
+                quantity=str(partial_qty),
                 priceProtect=True,
-                newClientOrderId=f"tp_{symbol}_{trade_id}"
+                reduceOnly=True,   # ✅ Sécurisation ici
+                newClientOrderId=f"tp_{symbol}_{trade_id}_{int(time.time())}"
             )
-            if level.get("reduce_ts"):
-                ts_manager.adjust_quantity(symbol, format_quantity(client, symbol, quantity * (1 - level["percent"])), trade_id=trade_id)
-        logger.info(f"[OrderManager] Placed scaled take-profits for {symbol}, trade_id={trade_id}")
+
+            logger.info(f"[{symbol}] ✅ Scaled TP placed at {tp_price} for {partial_qty}, trade_id: {trade_id}")
+
     except Exception as e:
-        logger.error(f"[OrderManager] Error placing take-profits for {symbol}: {e}")
+        logger.error(f"[{symbol}] ❌ Failed to place scaled take-profits: {e}")
 
 def log_order_as_table(signal, symbol, price, atr, qty, order_result=None):
     table_data = [
@@ -371,7 +393,7 @@ class EnhancedOrderManager:
     def check_margin(self, symbol, quantity, price, leverage):
         try:
             account_info = self.client.account()
-            balance = float(account_info['availableBalance'])
+            balance = float(next(a['availableBalance'] for a in account_info['assets'] if a['asset'] == 'USDT'))
             required_margin = (quantity * price) / leverage
             if balance < required_margin:
                 logger.error(f"[Margin Check] Insufficient margin for {symbol}: available={balance}, required={required_margin}")
@@ -516,7 +538,7 @@ def monitor_and_update_trailing_stop(client, symbol, order_id, ts_manager, trade
 def check_margin(client, symbol, capital, leverage):
     try:
         account_info = client.account()
-        balance = float(account_info['availableBalance'])
+        balance = float(next(a['availableBalance'] for a in account_info['assets'] if a['asset'] == 'USDT'))
         required_margin = float(capital)
         logger.info(f"[Margin Check] Available Balance: {balance} USDT, Required Margin: {required_margin} USDT")
         send_telegram_alert(f"Margin verification for {symbol} - Available Balance: {balance} USDT, Required Margin: {required_margin} USDT")

@@ -1,0 +1,36 @@
+# Database Configuration
+database:
+  host: "localhost"
+  port: 5432
+  database: "trading_bot"
+  user: "postgres"
+  password: ""  # Will be read from DB_PASSWORD environment variable
+  min_connections: 2
+  max_connections: 20
+  connect_timeout: 10
+
+# Binance API Configuration
+binance:
+  api_key: ""  # Will be read from BINANCE_API_KEY environment variable
+  api_secret: ""  # Will be read from BINANCE_API_SECRET environment variable
+  base_url: "https://fapi.binance.com"
+  testnet: false
+
+# Trading Configuration
+trading:
+  symbols:
+    - "BTCUSDT"
+    - "ETHUSDT"
+  timeframe: "1h"
+  capital: 1000.0
+  leverage: 10
+  max_risk_per_trade: 0.02
+  max_drawdown: 0.1
+  trailing_stop: true
+
+# Logging Configuration
+logging:
+  level: "INFO"
+  file: "trading_bot.log"
+  max_size: 10  # MB
+  backup_count: 5

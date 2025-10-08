@@ -1,0 +1,1009 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Signal Generator Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        .indicator-card {
+            transition: all 0.3s ease;
+        }
+        .indicator-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 10px 20px rgba(0,0,0,0.1);
+        }
+        .signal-buy {
+            animation: pulseBuy 2s infinite;
+        }
+        .signal-sell {
+            animation: pulseSell 2s infinite;
+        }
+        @keyframes pulseBuy {
+            0% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.4); }
+            70% { box-shadow: 0 0 0 10px rgba(16, 185, 129, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
+        }
+        @keyframes pulseSell {
+            0% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.4); }
+            70% { box-shadow: 0 0 0 10px rgba(239, 68, 68, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
+        }
+        .gauge {
+            width: 100%;
+            height: 10px;
+            border-radius: 5px;
+            background: #e5e7eb;
+            overflow: hidden;
+        }
+        .gauge-fill {
+            height: 100%;
+            transition: width 0.5s ease;
+        }
+        .chart-container {
+            height: 300px;
+            position: relative;
+        }
+        .tooltip {
+            position: absolute;
+            padding: 8px;
+            background: rgba(0, 0, 0, 0.7);
+            color: white;
+            border-radius: 4px;
+            pointer-events: none;
+            font-size: 12px;
+            z-index: 10;
+            opacity: 0;
+            transition: opacity 0.3s;
+        }
+    </style>
+</head>
+<body class="bg-gray-50 text-gray-800">
+    <div class="min-h-screen">
+        <!-- Header -->
+        <header class="bg-indigo-600 text-white shadow-lg">
+            <div class="container mx-auto px-4 py-6">
+                <div class="flex flex-col md:flex-row justify-between items-center">
+                    <div class="flex items-center mb-4 md:mb-0">
+                        <i class="fas fa-chart-line text-2xl mr-3"></i>
+                        <h1 class="text-2xl font-bold">Signal Generator Dashboard</h1>
+                    </div>
+                    <div class="flex items-center space-x-4">
+                        <div class="relative">
+                            <select id="symbol-select" class="bg-indigo-700 text-white px-4 py-2 rounded-lg appearance-none pr-8">
+                                <option value="BTCUSDT">BTC/USDT</option>
+                                <option value="ETHUSDT">ETH/USDT</option>
+                                <option value="SOLUSDT">SOL/USDT</option>
+                                <option value="ADAUSDT">ADA/USDT</option>
+                            </select>
+                            <div class="pointer-events-none absolute inset-y-0 right-0 flex items-center px-2 text-white">
+                                <i class="fas fa-chevron-down"></i>
+                            </div>
+                        </div>
+                        <button id="refresh-btn" class="bg-indigo-500 hover:bg-indigo-400 text-white px-4 py-2 rounded-lg flex items-center">
+                            <i class="fas fa-sync-alt mr-2"></i> Refresh
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </header>
+
+        <!-- Main Content -->
+        <main class="container mx-auto px-4 py-8">
+            <!-- Signal Status -->
+            <div class="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-8">
+                <!-- Current Signal -->
+                <div id="current-signal" class="bg-white rounded-xl shadow-md overflow-hidden">
+                    <div class="p-6">
+                        <div class="flex justify-between items-start mb-4">
+                            <h2 class="text-xl font-semibold">Current Signal</h2>
+                            <span id="signal-timestamp" class="text-sm text-gray-500">Loading...</span>
+                        </div>
+                        <div class="flex flex-col items-center py-4">
+                            <div id="signal-indicator" class="text-4xl font-bold mb-3 px-8 py-4 rounded-full">
+                                <span class="text-gray-400">HOLD</span>
+                            </div>
+                            <div class="text-center">
+                                <p id="signal-confidence" class="text-sm text-gray-600">Confidence: <span class="font-medium">0%</span></p>
+                                <p id="signal-strategy" class="text-sm text-gray-600">Strategy: <span class="font-medium">-</span></p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Price Information -->
+                <div class="bg-white rounded-xl shadow-md overflow-hidden">
+                    <div class="p-6">
+                        <h2 class="text-xl font-semibold mb-4">Price Information</h2>
+                        <div class="space-y-4">
+                            <div class="flex justify-between">
+                                <span class="text-gray-600">Current Price</span>
+                                <span id="current-price" class="font-medium">-</span>
+                            </div>
+                            <div class="flex justify-between">
+                                <span class="text-gray-600">24h Change</span>
+                                <span id="price-change" class="font-medium">-</span>
+                            </div>
+                            <div class="flex justify-between">
+                                <span class="text-gray-600">24h Volume</span>
+                                <span id="volume" class="font-medium">-</span>
+                            </div>
+                            <div class="flex justify-between">
+                                <span class="text-gray-600">ATR (14)</span>
+                                <span id="atr" class="font-medium">-</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Position Management -->
+                <div class="bg-white rounded-xl shadow-md overflow-hidden">
+                    <div class="p-6">
+                        <h2 class="text-xl font-semibold mb-4">Position Management</h2>
+                        <div class="space-y-4">
+                            <div class="flex justify-between">
+                                <span class="text-gray-600">Current Position</span>
+                                <span id="current-position" class="font-medium">None</span>
+                            </div>
+                            <div class="flex justify-between">
+                                <span class="text-gray-600">Entry Price</span>
+                                <span id="entry-price" class="font-medium">-</span>
+                            </div>
+                            <div class="flex justify-between">
+                                <span class="text-gray-600">Quantity</span>
+                                <span id="position-qty" class="font-medium">-</span>
+                            </div>
+                            <div class="flex justify-between">
+                                <span class="text-gray-600">P&L</span>
+                                <span id="position-pnl" class="font-medium">-</span>
+                            </div>
+                        </div>
+                        <div class="mt-6 grid grid-cols-2 gap-3">
+                            <button id="close-position-btn" class="bg-gray-200 hover:bg-gray-300 text-gray-800 py-2 px-4 rounded-lg disabled:opacity-50" disabled>
+                                Close Position
+                            </button>
+                            <button id="adjust-position-btn" class="bg-indigo-100 hover:bg-indigo-200 text-indigo-800 py-2 px-4 rounded-lg disabled:opacity-50" disabled>
+                                Adjust SL/TP
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Indicators Overview -->
+            <div class="bg-white rounded-xl shadow-md overflow-hidden mb-8">
+                <div class="p-6">
+                    <h2 class="text-xl font-semibold mb-4">Indicators Overview</h2>
+                    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                        <!-- RSI -->
+                        <div class="indicator-card bg-white border border-gray-200 rounded-lg p-4">
+                            <div class="flex justify-between items-center mb-2">
+                                <h3 class="font-medium">RSI (14)</h3>
+                                <span id="rsi-value" class="text-lg font-semibold">-</span>
+                            </div>
+                            <div class="gauge mb-2">
+                                <div id="rsi-gauge" class="gauge-fill bg-gradient-to-r from-red-500 via-yellow-500 to-green-500" style="width: 50%"></div>
+                            </div>
+                            <div class="flex justify-between text-xs text-gray-500">
+                                <span>0</span>
+                                <span>30</span>
+                                <span>50</span>
+                                <span>70</span>
+                                <span>100</span>
+                            </div>
+                            <p id="rsi-interpretation" class="text-sm mt-2 text-gray-600">-</p>
+                        </div>
+
+                        <!-- MACD -->
+                        <div class="indicator-card bg-white border border-gray-200 rounded-lg p-4">
+                            <div class="flex justify-between items-center mb-2">
+                                <h3 class="font-medium">MACD (12,26,9)</h3>
+                                <span id="macd-value" class="text-lg font-semibold">-</span>
+                            </div>
+                            <div class="h-10 flex items-center justify-center mb-2">
+                                <div id="macd-direction" class="text-2xl">
+                                    <i class="fas fa-equals text-gray-400"></i>
+                                </div>
+                            </div>
+                            <div class="flex justify-between text-sm">
+                                <span class="text-gray-600">Signal: <span id="macd-signal" class="font-medium">-</span></span>
+                                <span class="text-gray-600">Hist: <span id="macd-hist" class="font-medium">-</span></span>
+                            </div>
+                            <p id="macd-interpretation" class="text-sm mt-2 text-gray-600">-</p>
+                        </div>
+
+                        <!-- ADX -->
+                        <div class="indicator-card bg-white border border-gray-200 rounded-lg p-4">
+                            <div class="flex justify-between items-center mb-2">
+                                <h3 class="font-medium">ADX (14)</h3>
+                                <span id="adx-value" class="text-lg font-semibold">-</span>
+                            </div>
+                            <div class="gauge mb-2">
+                                <div id="adx-gauge" class="gauge-fill bg-gradient-to-r from-gray-300 via-purple-400 to-purple-600" style="width: 0%"></div>
+                            </div>
+                            <div class="flex justify-between text-xs text-gray-500">
+                                <span>0</span>
+                                <span>25</span>
+                                <span>50</span>
+                                <span>75</span>
+                                <span>100</span>
+                            </div>
+                            <p id="adx-interpretation" class="text-sm mt-2 text-gray-600">-</p>
+                        </div>
+
+                        <!-- EMA Crossover -->
+                        <div class="indicator-card bg-white border border-gray-200 rounded-lg p-4">
+                            <div class="flex justify-between items-center mb-2">
+                                <h3 class="font-medium">EMA Crossover</h3>
+                                <span id="ema-crossover-value" class="text-lg font-semibold">-</span>
+                            </div>
+                            <div class="h-10 flex items-center justify-center mb-2">
+                                <div id="ema-direction" class="text-2xl">
+                                    <i class="fas fa-exchange-alt text-gray-400"></i>
+                                </div>
+                            </div>
+                            <div class="flex justify-between text-sm">
+                                <span class="text-gray-600">EMA20: <span id="ema20-value" class="font-medium">-</span></span>
+                                <span class="text-gray-600">EMA50: <span id="ema50-value" class="font-medium">-</span></span>
+                            </div>
+                            <p id="ema-interpretation" class="text-sm mt-2 text-gray-600">-</p>
+                        </div>
+
+                        <!-- ROC -->
+                        <div class="indicator-card bg-white border border-gray-200 rounded-lg p-4">
+                            <div class="flex justify-between items-center mb-2">
+                                <h3 class="font-medium">ROC (5)</h3>
+                                <span id="roc-value" class="text-lg font-semibold">-</span>
+                            </div>
+                            <div class="h-10 flex items-center justify-center mb-2">
+                                <div id="roc-direction" class="text-2xl">
+                                    <i class="fas fa-arrows-alt-v text-gray-400"></i>
+                                </div>
+                            </div>
+                            <div class="gauge mb-2">
+                                <div id="roc-gauge" class="gauge-fill bg-gradient-to-r from-red-500 via-gray-300 to-green-500" style="width: 50%"></div>
+                            </div>
+                            <p id="roc-interpretation" class="text-sm mt-2 text-gray-600">-</p>
+                        </div>
+
+                        <!-- LSTM Prediction -->
+                        <div class="indicator-card bg-white border border-gray-200 rounded-lg p-4">
+                            <div class="flex justify-between items-center mb-2">
+                                <h3 class="font-medium">LSTM Prediction</h3>
+                                <span id="lstm-value" class="text-lg font-semibold">-</span>
+                            </div>
+                            <div class="gauge mb-2">
+                                <div id="lstm-gauge" class="gauge-fill bg-gradient-to-r from-red-500 via-gray-300 to-green-500" style="width: 50%"></div>
+                            </div>
+                            <div class="flex justify-between text-xs text-gray-500">
+                                <span>0 (Sell)</span>
+                                <span>0.5</span>
+                                <span>1 (Buy)</span>
+                            </div>
+                            <p id="lstm-interpretation" class="text-sm mt-2 text-gray-600">-</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Charts -->
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
+                <!-- Price Chart -->
+                <div class="bg-white rounded-xl shadow-md overflow-hidden">
+                    <div class="p-6">
+                        <div class="flex justify-between items-center mb-4">
+                            <h2 class="text-xl font-semibold">Price Chart</h2>
+                            <div class="flex space-x-2">
+                                <button class="bg-gray-200 hover:bg-gray-300 px-3 py-1 rounded text-sm">1H</button>
+                                <button class="bg-gray-200 hover:bg-gray-300 px-3 py-1 rounded text-sm">4H</button>
+                                <button class="bg-indigo-600 text-white px-3 py-1 rounded text-sm">1D</button>
+                                <button class="bg-gray-200 hover:bg-gray-300 px-3 py-1 rounded text-sm">1W</button>
+                            </div>
+                        </div>
+                        <div class="chart-container">
+                            <canvas id="price-chart"></canvas>
+                            <div class="tooltip"></div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Indicators Chart -->
+                <div class="bg-white rounded-xl shadow-md overflow-hidden">
+                    <div class="p-6">
+                        <div class="flex justify-between items-center mb-4">
+                            <h2 class="text-xl font-semibold">Indicators</h2>
+                            <div class="flex space-x-2">
+                                <button class="bg-gray-200 hover:bg-gray-300 px-3 py-1 rounded text-sm">RSI</button>
+                                <button class="bg-gray-200 hover:bg-gray-300 px-3 py-1 rounded text-sm">MACD</button>
+                                <button class="bg-indigo-600 text-white px-3 py-1 rounded text-sm">ADX</button>
+                                <button class="bg-gray-200 hover:bg-gray-300 px-3 py-1 rounded text-sm">EMA</button>
+                            </div>
+                        </div>
+                        <div class="chart-container">
+                            <canvas id="indicators-chart"></canvas>
+                            <div class="tooltip"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Signal History -->
+            <div class="bg-white rounded-xl shadow-md overflow-hidden">
+                <div class="p-6">
+                    <h2 class="text-xl font-semibold mb-4">Signal History</h2>
+                    <div class="overflow-x-auto">
+                        <table class="min-w-full divide-y divide-gray-200">
+                            <thead class="bg-gray-50">
+                                <tr>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Time</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Symbol</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Signal</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Price</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Confidence</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Strategy</th>
+                                    <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Result</th>
+                                </tr>
+                            </thead>
+                            <tbody id="signal-history" class="bg-white divide-y divide-gray-200">
+                                <tr>
+                                    <td colspan="7" class="px-6 py-4 text-center text-gray-500">Loading signal history...</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    <div class="mt-4 flex justify-between items-center">
+                        <div class="text-sm text-gray-500">Showing <span id="history-start">1</span> to <span id="history-end">10</span> of <span id="history-total">0</span> signals</div>
+                        <div class="flex space-x-2">
+                            <button id="history-prev" class="bg-gray-200 hover:bg-gray-300 px-3 py-1 rounded disabled:opacity-50" disabled>Previous</button>
+                            <button id="history-next" class="bg-gray-200 hover:bg-gray-300 px-3 py-1 rounded disabled:opacity-50" disabled>Next</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </main>
+
+        <!-- Footer -->
+        <footer class="bg-gray-800 text-white py-6">
+            <div class="container mx-auto px-4">
+                <div class="flex flex-col md:flex-row justify-between items-center">
+                    <div class="mb-4 md:mb-0">
+                        <p class="text-sm">Signal Generator Dashboard v1.0</p>
+                    </div>
+                    <div class="flex space-x-4">
+                        <a href="#" class="text-gray-400 hover:text-white"><i class="fab fa-github"></i></a>
+                        <a href="#" class="text-gray-400 hover:text-white"><i class="fab fa-twitter"></i></a>
+                        <a href="#" class="text-gray-400 hover:text-white"><i class="fab fa-telegram"></i></a>
+                    </div>
+                </div>
+            </div>
+        </footer>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script>
+        // Mock data for demonstration
+        const mockData = {
+            currentSignal: {
+                action: "buy",
+                confidence: 0.85,
+                strategy: "trend",
+                timestamp: new Date().toISOString()
+            },
+            priceInfo: {
+                current: 42356.78,
+                change: 2.34,
+                changePercent: 0.055,
+                volume: "24.5K BTC",
+                atr: 1250.34
+            },
+            position: {
+                type: "long",
+                entryPrice: 42000.00,
+                quantity: 0.5,
+                pnl: 356.78,
+                pnlPercent: 0.85
+            },
+            indicators: {
+                rsi: 62.34,
+                macd: 1.25,
+                macdSignal: 0.75,
+                macdHist: 0.50,
+                adx: 35.67,
+                ema20: 42100.50,
+                ema50: 41800.75,
+                roc: 0.85,
+                lstm: 0.72
+            },
+            chartData: {
+                labels: Array.from({length: 30}, (_, i) => `Day ${i+1}`),
+                prices: Array.from({length: 30}, () => Math.floor(Math.random() * 1000) + 40000),
+                volumes: Array.from({length: 30}, () => Math.floor(Math.random() * 100) + 10),
+                rsi: Array.from({length: 30}, () => Math.floor(Math.random() * 30) + 35),
+                macd: Array.from({length: 30}, () => (Math.random() * 2) - 1),
+                macdSignal: Array.from({length: 30}, () => (Math.random() * 2) - 1),
+                adx: Array.from({length: 30}, () => Math.floor(Math.random() * 40) + 10)
+            },
+            signalHistory: Array.from({length: 10}, (_, i) => ({
+                time: new Date(Date.now() - (i * 24 * 60 * 60 * 1000)).toISOString(),
+                symbol: "BTCUSDT",
+                signal: i % 3 === 0 ? "buy" : (i % 3 === 1 ? "sell" : "hold"),
+                price: (Math.random() * 1000) + 40000,
+                confidence: (Math.random() * 0.5) + 0.5,
+                strategy: ["trend", "scalp", "range"][i % 3],
+                result: ["win", "loss", "pending"][i % 3]
+            }))
+        };
+
+        // Initialize the dashboard with mock data
+        function initDashboard() {
+            // Current Signal
+            const signal = mockData.currentSignal;
+            const signalEl = document.getElementById('signal-indicator');
+            signalEl.className = 'text-4xl font-bold mb-3 px-8 py-4 rounded-full';
+            
+            if (signal.action === 'buy') {
+                signalEl.classList.add('bg-green-100', 'text-green-800', 'signal-buy');
+                signalEl.innerHTML = '<i class="fas fa-arrow-up mr-2"></i> BUY';
+            } else if (signal.action === 'sell') {
+                signalEl.classList.add('bg-red-100', 'text-red-800', 'signal-sell');
+                signalEl.innerHTML = '<i class="fas fa-arrow-down mr-2"></i> SELL';
+            } else {
+                signalEl.classList.add('bg-gray-100', 'text-gray-800');
+                signalEl.innerHTML = '<i class="fas fa-pause mr-2"></i> HOLD';
+            }
+            
+            document.getElementById('signal-confidence').innerHTML = `Confidence: <span class="font-medium">${Math.round(signal.confidence * 100)}%</span>`;
+            document.getElementById('signal-strategy').innerHTML = `Strategy: <span class="font-medium">${signal.strategy}</span>`;
+            document.getElementById('signal-timestamp').textContent = new Date(signal.timestamp).toLocaleString();
+            
+            // Price Information
+            const priceInfo = mockData.priceInfo;
+            document.getElementById('current-price').textContent = `$${priceInfo.current.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
+            
+            const changeEl = document.getElementById('price-change');
+            if (priceInfo.changePercent >= 0) {
+                changeEl.className = 'font-medium text-green-600';
+                changeEl.innerHTML = `+${priceInfo.changePercent.toFixed(2)}% <i class="fas fa-arrow-up"></i>`;
+            } else {
+                changeEl.className = 'font-medium text-red-600';
+                changeEl.innerHTML = `${priceInfo.changePercent.toFixed(2)}% <i class="fas fa-arrow-down"></i>`;
+            }
+            
+            document.getElementById('volume').textContent = priceInfo.volume;
+            document.getElementById('atr').textContent = priceInfo.atr.toFixed(2);
+            
+            // Position Management
+            const position = mockData.position;
+            const positionEl = document.getElementById('current-position');
+            positionEl.textContent = position.type.charAt(0).toUpperCase() + position.type.slice(1);
+            positionEl.className = position.type === 'long' ? 'font-medium text-green-600' : 'font-medium text-red-600';
+            
+            document.getElementById('entry-price').textContent = `$${position.entryPrice.toFixed(2)}`;
+            document.getElementById('position-qty').textContent = position.quantity;
+            
+            const pnlEl = document.getElementById('position-pnl');
+            pnlEl.textContent = `$${position.pnl.toFixed(2)} (${position.pnlPercent > 0 ? '+' : ''}${position.pnlPercent.toFixed(2)}%)`;
+            pnlEl.className = position.pnl >= 0 ? 'font-medium text-green-600' : 'font-medium text-red-600';
+            
+            document.getElementById('close-position-btn').disabled = false;
+            document.getElementById('adjust-position-btn').disabled = false;
+            
+            // Indicators
+            const indicators = mockData.indicators;
+            
+            // RSI
+            document.getElementById('rsi-value').textContent = indicators.rsi.toFixed(2);
+            document.getElementById('rsi-gauge').style.width = `${indicators.rsi}%`;
+            
+            let rsiInterpretation = '';
+            if (indicators.rsi > 70) {
+                rsiInterpretation = 'Overbought';
+                document.getElementById('rsi-interpretation').className = 'text-sm mt-2 text-red-600';
+            } else if (indicators.rsi < 30) {
+                rsiInterpretation = 'Oversold';
+                document.getElementById('rsi-interpretation').className = 'text-sm mt-2 text-green-600';
+            } else {
+                rsiInterpretation = 'Neutral';
+                document.getElementById('rsi-interpretation').className = 'text-sm mt-2 text-gray-600';
+            }
+            document.getElementById('rsi-interpretation').textContent = rsiInterpretation;
+            
+            // MACD
+            document.getElementById('macd-value').textContent = indicators.macd.toFixed(4);
+            document.getElementById('macd-signal').textContent = indicators.macdSignal.toFixed(4);
+            document.getElementById('macd-hist').textContent = indicators.macdHist.toFixed(4);
+            
+            const macdDirectionEl = document.getElementById('macd-direction');
+            macdDirectionEl.innerHTML = '';
+            if (indicators.macd > indicators.macdSignal) {
+                macdDirectionEl.innerHTML = '<i class="fas fa-arrow-up text-green-600"></i>';
+                document.getElementById('macd-interpretation').textContent = 'Bullish';
+                document.getElementById('macd-interpretation').className = 'text-sm mt-2 text-green-600';
+            } else if (indicators.macd < indicators.macdSignal) {
+                macdDirectionEl.innerHTML = '<i class="fas fa-arrow-down text-red-600"></i>';
+                document.getElementById('macd-interpretation').textContent = 'Bearish';
+                document.getElementById('macd-interpretation').className = 'text-sm mt-2 text-red-600';
+            } else {
+                macdDirectionEl.innerHTML = '<i class="fas fa-equals text-gray-400"></i>';
+                document.getElementById('macd-interpretation').textContent = 'Neutral';
+                document.getElementById('macd-interpretation').className = 'text-sm mt-2 text-gray-600';
+            }
+            
+            // ADX
+            document.getElementById('adx-value').textContent = indicators.adx.toFixed(2);
+            document.getElementById('adx-gauge').style.width = `${indicators.adx}%`;
+            
+            let adxInterpretation = '';
+            if (indicators.adx > 50) {
+                adxInterpretation = 'Very strong trend';
+                document.getElementById('adx-interpretation').className = 'text-sm mt-2 text-purple-600';
+            } else if (indicators.adx > 25) {
+                adxInterpretation = 'Strong trend';
+                document.getElementById('adx-interpretation').className = 'text-sm mt-2 text-purple-500';
+            } else {
+                adxInterpretation = 'Weak or no trend';
+                document.getElementById('adx-interpretation').className = 'text-sm mt-2 text-gray-600';
+            }
+            document.getElementById('adx-interpretation').textContent = adxInterpretation;
+            
+            // EMA Crossover
+            document.getElementById('ema20-value').textContent = indicators.ema20.toFixed(2);
+            document.getElementById('ema50-value').textContent = indicators.ema50.toFixed(2);
+            
+            const emaDirectionEl = document.getElementById('ema-direction');
+            emaDirectionEl.innerHTML = '';
+            if (indicators.ema20 > indicators.ema50) {
+                emaDirectionEl.innerHTML = '<i class="fas fa-arrow-up text-green-600"></i>';
+                document.getElementById('ema-crossover-value').textContent = 'Bullish';
+                document.getElementById('ema-crossover-value').className = 'text-lg font-semibold text-green-600';
+                document.getElementById('ema-interpretation').textContent = 'EMA20 above EMA50 - Bullish trend';
+                document.getElementById('ema-interpretation').className = 'text-sm mt-2 text-green-600';
+            } else {
+                emaDirectionEl.innerHTML = '<i class="fas fa-arrow-down text-red-600"></i>';
+                document.getElementById('ema-crossover-value').textContent = 'Bearish';
+                document.getElementById('ema-crossover-value').className = 'text-lg font-semibold text-red-600';
+                document.getElementById('ema-interpretation').textContent = 'EMA20 below EMA50 - Bearish trend';
+                document.getElementById('ema-interpretation').className = 'text-sm mt-2 text-red-600';
+            }
+            
+            // ROC
+            document.getElementById('roc-value').textContent = `${indicators.roc.toFixed(2)}%`;
+            document.getElementById('roc-gauge').style.width = `${(indicators.roc + 5) * 10}%`;
+            
+            const rocDirectionEl = document.getElementById('roc-direction');
+            rocDirectionEl.innerHTML = '';
+            if (indicators.roc > 0) {
+                rocDirectionEl.innerHTML = '<i class="fas fa-arrow-up text-green-600"></i>';
+                document.getElementById('roc-interpretation').textContent = 'Positive momentum';
+                document.getElementById('roc-interpretation').className = 'text-sm mt-2 text-green-600';
+            } else {
+                rocDirectionEl.innerHTML = '<i class="fas fa-arrow-down text-red-600"></i>';
+                document.getElementById('roc-interpretation').textContent = 'Negative momentum';
+                document.getElementById('roc-interpretation').className = 'text-sm mt-2 text-red-600';
+            }
+            
+            // LSTM Prediction
+            document.getElementById('lstm-value').textContent = indicators.lstm.toFixed(4);
+            document.getElementById('lstm-gauge').style.width = `${indicators.lstm * 100}%`;
+            
+            if (indicators.lstm > 0.6) {
+                document.getElementById('lstm-interpretation').textContent = 'Strong buy signal';
+                document.getElementById('lstm-interpretation').className = 'text-sm mt-2 text-green-600';
+            } else if (indicators.lstm < 0.4) {
+                document.getElementById('lstm-interpretation').textContent = 'Strong sell signal';
+                document.getElementById('lstm-interpretation').className = 'text-sm mt-2 text-red-600';
+            } else {
+                document.getElementById('lstm-interpretation').textContent = 'Neutral signal';
+                document.getElementById('lstm-interpretation').className = 'text-sm mt-2 text-gray-600';
+            }
+            
+            // Initialize charts
+            initCharts();
+            
+            // Populate signal history
+            populateSignalHistory();
+        }
+        
+        // Initialize charts
+        function initCharts() {
+            const chartData = mockData.chartData;
+            
+            // Price Chart
+            const priceCtx = document.getElementById('price-chart').getContext('2d');
+            const priceChart = new Chart(priceCtx, {
+                type: 'line',
+                data: {
+                    labels: chartData.labels,
+                    datasets: [{
+                        label: 'BTC/USDT Price',
+                        data: chartData.prices,
+                        borderColor: 'rgba(79, 70, 229, 1)',
+                        backgroundColor: 'rgba(79, 70, 229, 0.1)',
+                        borderWidth: 2,
+                        fill: true,
+                        tension: 0.1
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: {
+                            display: false
+                        },
+                        tooltip: {
+                            enabled: false,
+                            external: function(context) {
+                                const tooltip = document.querySelector('.tooltip');
+                                if (context.tooltip.opacity === 0) {
+                                    tooltip.style.opacity = 0;
+                                    return;
+                                }
+                                
+                                const dataIndex = context.tooltip.dataPoints[0].dataIndex;
+                                const price = chartData.prices[dataIndex];
+                                const volume = chartData.volumes[dataIndex];
+                                
+                                tooltip.innerHTML = `
+                                    <div class="font-semibold">Day ${dataIndex + 1}</div>
+                                    <div>Price: $${price.toFixed(2)}</div>
+                                    <div>Volume: ${volume} BTC</div>
+                                `;
+                                
+                                tooltip.style.opacity = 1;
+                                tooltip.style.left = context.tooltip.x + 'px';
+                                tooltip.style.top = context.tooltip.y + 'px';
+                            }
+                        }
+                    },
+                    scales: {
+                        x: {
+                            grid: {
+                                display: false
+                            }
+                        },
+                        y: {
+                            beginAtZero: false
+                        }
+                    }
+                }
+            });
+            
+            // Indicators Chart
+            const indicatorsCtx = document.getElementById('indicators-chart').getContext('2d');
+            const indicatorsChart = new Chart(indicatorsCtx, {
+                type: 'line',
+                data: {
+                    labels: chartData.labels,
+                    datasets: [
+                        {
+                            label: 'ADX',
+                            data: chartData.adx,
+                            borderColor: 'rgba(124, 58, 237, 1)',
+                            backgroundColor: 'rgba(124, 58, 237, 0.1)',
+                            borderWidth: 2,
+                            tension: 0.1,
+                            yAxisID: 'y'
+                        },
+                        {
+                            label: 'RSI',
+                            data: chartData.rsi,
+                            borderColor: 'rgba(16, 185, 129, 1)',
+                            backgroundColor: 'rgba(16, 185, 129, 0.1)',
+                            borderWidth: 2,
+                            tension: 0.1,
+                            yAxisID: 'y1',
+                            hidden: true
+                        },
+                        {
+                            label: 'MACD',
+                            data: chartData.macd,
+                            borderColor: 'rgba(239, 68, 68, 1)',
+                            backgroundColor: 'rgba(239, 68, 68, 0.1)',
+                            borderWidth: 2,
+                            tension: 0.1,
+                            yAxisID: 'y2',
+                            hidden: true
+                        },
+                        {
+                            label: 'MACD Signal',
+                            data: chartData.macdSignal,
+                            borderColor: 'rgba(59, 130, 246, 1)',
+                            backgroundColor: 'rgba(59, 130, 246, 0.1)',
+                            borderWidth: 2,
+                            tension: 0.1,
+                            yAxisID: 'y2',
+                            hidden: true
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: {
+                            position: 'top',
+                        },
+                        tooltip: {
+                            enabled: false,
+                            external: function(context) {
+                                const tooltip = document.querySelector('#indicators-chart + .tooltip');
+                                if (context.tooltip.opacity === 0) {
+                                    tooltip.style.opacity = 0;
+                                    return;
+                                }
+                                
+                                const dataIndex = context.tooltip.dataPoints[0].dataIndex;
+                                const adx = chartData.adx[dataIndex];
+                                const rsi = chartData.rsi[dataIndex];
+                                const macd = chartData.macd[dataIndex];
+                                const macdSignal = chartData.macdSignal[dataIndex];
+                                
+                                tooltip.innerHTML = `
+                                    <div class="font-semibold">Day ${dataIndex + 1}</div>
+                                    <div>ADX: ${adx.toFixed(2)}</div>
+                                    <div>RSI: ${rsi.toFixed(2)}</div>
+                                    <div>MACD: ${macd.toFixed(4)}</div>
+                                    <div>Signal: ${macdSignal.toFixed(4)}</div>
+                                `;
+                                
+                                tooltip.style.opacity = 1;
+                                tooltip.style.left = context.tooltip.x + 'px';
+                                tooltip.style.top = context.tooltip.y + 'px';
+                            }
+                        }
+                    },
+                    scales: {
+                        x: {
+                            grid: {
+                                display: false
+                            }
+                        },
+                        y: {
+                            type: 'linear',
+                            display: true,
+                            position: 'left',
+                            title: {
+                                display: true,
+                                text: 'ADX'
+                            }
+                        },
+                        y1: {
+                            type: 'linear',
+                            display: false,
+                            position: 'right',
+                            min: 0,
+                            max: 100,
+                            grid: {
+                                drawOnChartArea: false
+                            },
+                            title: {
+                                display: true,
+                                text: 'RSI'
+                            }
+                        },
+                        y2: {
+                            type: 'linear',
+                            display: false,
+                            position: 'right',
+                            grid: {
+                                drawOnChartArea: false
+                            },
+                            title: {
+                                display: true,
+                                text: 'MACD'
+                            }
+                        }
+                    }
+                }
+            });
+            
+            // Add event listeners to indicator chart buttons
+            document.querySelectorAll('#indicators-chart + div button').forEach(btn => {
+                btn.addEventListener('click', function() {
+                    // Remove active class from all buttons
+                    document.querySelectorAll('#indicators-chart + div button').forEach(b => {
+                        b.className = 'bg-gray-200 hover:bg-gray-300 px-3 py-1 rounded text-sm';
+                    });
+                    
+                    // Add active class to clicked button
+                    this.className = 'bg-indigo-600 text-white px-3 py-1 rounded text-sm';
+                    
+                    // Show/hide datasets based on button clicked
+                    const text = this.textContent.trim().toLowerCase();
+                    indicatorsChart.data.datasets.forEach(ds => {
+                        ds.hidden = (ds.label.toLowerCase() !== text);
+                    });
+                    
+                    // Update y-axis title
+                    indicatorsChart.options.scales.y.title.text = text.toUpperCase();
+                    
+                    indicatorsChart.update();
+                });
+            });
+        }
+        
+        // Populate signal history table
+        function populateSignalHistory() {
+            const history = mockData.signalHistory;
+            const tbody = document.getElementById('signal-history');
+            tbody.innerHTML = '';
+            
+            history.forEach(signal => {
+                const tr = document.createElement('tr');
+                
+                // Time
+                const timeTd = document.createElement('td');
+                timeTd.className = 'px-6 py-4 whitespace-nowrap text-sm text-gray-500';
+                timeTd.textContent = new Date(signal.time).toLocaleString();
+                tr.appendChild(timeTd);
+                
+                // Symbol
+                const symbolTd = document.createElement('td');
+                symbolTd.className = 'px-6 py-4 whitespace-nowrap text-sm text-gray-500';
+                symbolTd.textContent = signal.symbol;
+                tr.appendChild(symbolTd);
+                
+                // Signal
+                const signalTd = document.createElement('td');
+                signalTd.className = 'px-6 py-4 whitespace-nowrap text-sm font-medium';
+                if (signal.signal === 'buy') {
+                    signalTd.className += ' text-green-600';
+                    signalTd.innerHTML = '<i class="fas fa-arrow-up mr-1"></i> Buy';
+                } else if (signal.signal === 'sell') {
+                    signalTd.className += ' text-red-600';
+                    signalTd.innerHTML = '<i class="fas fa-arrow-down mr-1"></i> Sell';
+                } else {
+                    signalTd.className += ' text-gray-600';
+                    signalTd.innerHTML = '<i class="fas fa-pause mr-1"></i> Hold';
+                }
+                tr.appendChild(signalTd);
+                
+                // Price
+                const priceTd = document.createElement('td');
+                priceTd.className = 'px-6 py-4 whitespace-nowrap text-sm text-gray-500';
+                priceTd.textContent = `$${signal.price.toFixed(2)}`;
+                tr.appendChild(priceTd);
+                
+                // Confidence
+                const confTd = document.createElement('td');
+                confTd.className = 'px-6 py-4 whitespace-nowrap text-sm text-gray-500';
+                
+                const confDiv = document.createElement('div');
+                confDiv.className = 'flex items-center';
+                
+                const confBar = document.createElement('div');
+                confBar.className = 'w-16 h-2 bg-gray-200 rounded mr-2';
+                
+                const confFill = document.createElement('div');
+                confFill.className = 'h-2 rounded';
+                confFill.style.width = `${signal.confidence * 100}%`;
+                confFill.style.backgroundColor = signal.confidence > 0.7 ? '#10B981' : signal.confidence > 0.4 ? '#F59E0B' : '#EF4444';
+                
+                confBar.appendChild(confFill);
+                confDiv.appendChild(confBar);
+                confDiv.appendChild(document.createTextNode(`${Math.round(signal.confidence * 100)}%`));
+                
+                confTd.appendChild(confDiv);
+                tr.appendChild(confTd);
+                
+                // Strategy
+                const stratTd = document.createElement('td');
+                stratTd.className = 'px-6 py-4 whitespace-nowrap text-sm text-gray-500';
+                
+                const stratPill = document.createElement('span');
+                stratPill.className = 'px-2 py-1 text-xs rounded-full';
+                
+                if (signal.strategy === 'trend') {
+                    stratPill.className += ' bg-purple-100 text-purple-800';
+                } else if (signal.strategy === 'scalp') {
+                    stratPill.className += ' bg-blue-100 text-blue-800';
+                } else {
+                    stratPill.className += ' bg-yellow-100 text-yellow-800';
+                }
+                
+                stratPill.textContent = signal.strategy.charAt(0).toUpperCase() + signal.strategy.slice(1);
+                stratTd.appendChild(stratPill);
+                tr.appendChild(stratTd);
+                
+                // Result
+                const resultTd = document.createElement('td');
+                resultTd.className = 'px-6 py-4 whitespace-nowrap text-sm font-medium';
+                
+                if (signal.result === 'win') {
+                    resultTd.className += ' text-green-600';
+                    resultTd.innerHTML = '<i class="fas fa-check-circle mr-1"></i> Win';
+                } else if (signal.result === 'loss') {
+                    resultTd.className += ' text-red-600';
+                    resultTd.innerHTML = '<i class="fas fa-times-circle mr-1"></i> Loss';
+                } else {
+                    resultTd.className += ' text-gray-600';
+                    resultTd.innerHTML = '<i class="fas fa-clock mr-1"></i> Pending';
+                }
+                
+                tr.appendChild(resultTd);
+                
+                tbody.appendChild(tr);
+            });
+            
+            // Update pagination info
+            document.getElementById('history-start').textContent = '1';
+            document.getElementById('history-end').textContent = history.length;
+            document.getElementById('history-total').textContent = history.length;
+        }
+        
+        // Event listeners
+        document.getElementById('refresh-btn').addEventListener('click', function() {
+            this.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i> Refreshing...';
+            setTimeout(() => {
+                initDashboard();
+                this.innerHTML = '<i class="fas fa-sync-alt mr-2"></i> Refresh';
+                
+                // Show notification
+                const notification = document.createElement('div');
+                notification.className = 'fixed bottom-4 right-4 bg-green-500 text-white px-4 py-2 rounded-lg shadow-lg flex items-center';
+                notification.innerHTML = '<i class="fas fa-check-circle mr-2"></i> Data refreshed successfully';
+                document.body.appendChild(notification);
+                
+                setTimeout(() => {
+                    notification.remove();
+                }, 3000);
+            }, 1000);
+        });
+        
+        document.getElementById('symbol-select').addEventListener('change', function() {
+            initDashboard();
+        });
+        
+        document.getElementById('close-position-btn').addEventListener('click', function() {
+            // Show confirmation modal
+            const modal = document.createElement('div');
+            modal.className = 'fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50';
+            modal.innerHTML = `
+                <div class="bg-white rounded-lg p-6 max-w-md w-full">
+                    <h3 class="text-lg font-medium mb-4">Close Position</h3>
+                    <p class="text-gray-600 mb-6">Are you sure you want to close your current position?</p>
+                    <div class="flex justify-end space-x-3">
+                        <button id="cancel-close" class="bg-gray-200 hover:bg-gray-300 px-4 py-2 rounded">Cancel</button>
+                        <button id="confirm-close" class="bg-red-500 hover:bg-red-600 text-white px-4 py-2 rounded">Close Position</button>
+                    </div>
+                </div>
+            `;
+            
+            document.body.appendChild(modal);
+            
+            document.getElementById('cancel-close').addEventListener('click', () => {
+                modal.remove();
+            });
+            
+            document.getElementById('confirm-close').addEventListener('click', () => {
+                // Simulate closing position
+                mockData.position = {
+                    type: null,
+                    entryPrice: 0,
+                    quantity: 0,
+                    pnl: 0,
+                    pnlPercent: 0
+                };
+                
+                initDashboard();
+                modal.remove();
+                
+                // Show success notification
+                const notification = document.createElement('div');
+                notification.className = 'fixed bottom-4 right-4 bg-green-500 text-white px-4 py-2 rounded-lg shadow-lg flex items-center';
+                notification.innerHTML = '<i class="fas fa-check-circle mr-2"></i> Position closed successfully';
+                document.body.appendChild(notification);
+                
+                setTimeout(() => {
+                    notification.remove();
+                }, 3000);
+            });
+        });
+        
+        // Initialize the dashboard when the page loads
+        document.addEventListener('DOMContentLoaded', initDashboard);
+    </script>
+</body>
+</html>

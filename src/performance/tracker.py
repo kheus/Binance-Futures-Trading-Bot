@@ -3,7 +3,7 @@ import time
 import decimal
 import pandas as pd
 import numpy as np
-from src.database.db_handler import get_pending_training_data, update_training_outcome, clean_old_data, execute_query
+from src.database.db_handler import insert_training_data, update_training_outcome, clean_old_data, execute_query
 from tabulate import tabulate
 import psycopg2.pool
 import eventlet
@@ -25,7 +25,7 @@ def safe_float(val):
 def calculate_market_direction(symbol, signal_ts):
     """Calculate market direction with proper timestamp handling"""
     try:
-        future_ts = signal_ts + 5 * 60 * 1000  # 5 minutes after
+        future_ts = signal_ts + 10 * 60 * 1000  # 10 minutes after
         window_end_ts = signal_ts + 30 * 60 * 1000  # 30-minute window
         
         # Query with direct BIGINT comparison
@@ -207,7 +207,8 @@ def calculate_prediction_accuracy(action, market_direction):
         return None
     return (
         (action in ['buy', 'close_sell'] and market_direction == 1) or
-        (action in ['sell', 'close_buy'] and market_direction == 0)
+        (action in ['sell', 'close_buy'] and market_direction == -1) or
+        (action in ['hold', 'close_hold'] and market_direction == 0)
     )
 
 def log_processing_results(symbol, processed):
@@ -223,6 +224,125 @@ def log_processing_results(symbol, processed):
         accuracy = accuracy_result[0][0] if accuracy_result else 0.0
         logger.info(f"[Tracker] Processed {processed} {symbol} records | Accuracy: {accuracy:.2f}%")
 
-if __name__ == "__main__":
-    logger.info("Starting performance tracker")
-    performance_tracker_loop(None, ["BTCUSDT", "ETHUSDT"])  # Example symbols
+def evaluate_signals(connection_pool):
+    logger.info("[Tracker] Starting signal evaluation...")
+    try:
+        conn = connection_pool.getconn()
+        cur = conn.cursor()
+
+        cur.execute("""
+            SELECT id, symbol, side, entry_price, timestamp
+            FROM signals
+            WHERE evaluated = FALSE
+        """)
+        pending = cur.fetchall()
+        logger.info(f"[Tracker] Number of pending signals: {len(pending)}")  # Diagnostic
+
+        results = {}
+        total = {"win": 0, "loss": 0}
+        current_ts = int(time.time() * 1000)
+
+        for sid, symbol, side, entry, signal_ts in pending:
+            entry = safe_float(entry)
+            if entry is None:
+                logger.warning(f"[Tracker] Skipped signal {sid} ({symbol}) - missing price data")
+                continue
+
+            # 🕒 Vérifie si 30 minutes se sont écoulées
+            if current_ts - signal_ts < 30 * 60 * 1000:
+                remaining = (30 * 60 * 1000 - (current_ts - signal_ts)) / 60000
+                logger.info(f"[Tracker] Skipping {symbol} (signal {sid}) - {remaining:.1f} min remaining before evaluation")
+                continue
+
+            # Fenêtre d’analyse : entre +30 min et +60 min
+            future_ts = signal_ts + 30 * 60 * 1000
+            window_end_ts = signal_ts + 60 * 60 * 1000
+
+            query = """
+            SELECT close 
+            FROM price_data 
+            WHERE symbol = %s 
+            AND timestamp >= %s 
+            AND timestamp <= %s
+            ORDER BY timestamp ASC 
+            LIMIT 1
+            """
+            result = execute_query(query, (symbol, int(future_ts), int(window_end_ts)), fetch=True)
+            logger.debug(f"[Tracker] Fetched {len(result) if result else 0} future prices for {symbol} in window {future_ts}-{window_end_ts}")
+
+            future_price = None
+            if result:
+                future_price = safe_float(result[0][0])
+            else:
+                # Fallback au prix le plus récent dans la fenêtre
+                query = """
+                SELECT close 
+                FROM price_data 
+                WHERE symbol = %s 
+                AND timestamp <= %s
+                ORDER BY timestamp DESC 
+                LIMIT 1
+                """
+                recent_result = execute_query(query, (symbol, int(window_end_ts)), fetch=True)
+                logger.debug(f"[Tracker] Fetched {len(recent_result) if recent_result else 0} recent prices for {symbol} <= {window_end_ts}")
+                if recent_result:
+                    future_price = safe_float(recent_result[0][0])
+
+            if future_price is None:
+                logger.warning(f"[Tracker] Skipped signal {sid} ({symbol}) - no future price available")
+                continue
+
+            # 🧮 Évaluation du résultat
+            outcome = "loss"
+            if side == "BUY" and future_price > entry:
+                outcome = "win"
+            elif side == "SELL" and future_price < entry:
+                outcome = "win"
+
+            cur.execute(
+                "UPDATE signals SET evaluated = TRUE, outcome = %s, close_price = %s WHERE id = %s",
+                (outcome, future_price, sid)
+            )
+
+            # Détermine l'action à partir du côté du signal
+            action = "buy" if side == "BUY" else "sell" if side == "SELL" else "hold"
+
+            # Ajoute ici l'enregistrement dans training_data
+            insert_training_data(
+                symbol=symbol,
+                timestamp=signal_ts,
+                indicators={"adx": 33.1, "rsi": 56.4, "macd": 1.22},  # Ou récupère de vraies valeurs si disponibles
+                market_context={"strategy": "trend", "source": "tracker"},
+                action=action,
+                price=entry,
+                future_price=future_price,  # Maintenant accepté
+                outcome=outcome  # Maintenant accepté
+            )
+
+
+            if symbol not in results:
+                results[symbol] = {"win": 0, "loss": 0}
+            results[symbol][outcome] += 1
+            total[outcome] += 1
+
+        conn.commit()
+        cur.close()
+        connection_pool.putconn(conn)
+
+        # Logs par symbole
+        for sym, counts in results.items():
+            total_trades = counts["win"] + counts["loss"]
+            winrate = (counts["win"] / total_trades) * 100 if total_trades > 0 else 0
+            logger.info(f"[Tracker] {sym} → {counts['win']}W/{counts['loss']}L | Winrate={winrate:.2f}%")
+
+        # Log global
+        all_trades = total["win"] + total["loss"]
+        global_wr = (total["win"] / all_trades) * 100 if all_trades > 0 else 0
+        logger.info(f"[Tracker] 🌍 GLOBAL → {total['win']}W/{total['loss']}L | Winrate={global_wr:.2f}%")
+
+    except Exception as e:
+        try:
+            conn.rollback()
+        except:
+            pass
+        logger.error(f"[Tracker] Error during signal evaluation: {str(e)}", exc_info=True)

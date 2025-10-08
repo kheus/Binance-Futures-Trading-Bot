@@ -15,6 +15,10 @@ from datetime import datetime
 import time
 from src.processing_core.indicators import calculate_indicators
 from src.database.db_handler import execute_query  # Import to fetch metrics
+from rich.table import Table
+from rich.console import Console
+
+console = Console()
 
 # Charger la configuration YAML
 CONFIG_PATH = Path(__file__).parent.parent.parent / "config" / "config.yaml"
@@ -201,6 +205,16 @@ def train_or_load_model(df, symbol):
         if X is None or len(X) < 10:  # Minimum sequences for training
             logger.error(f"[Model] Insufficient valid data for training {symbol}")
             return None, None
+
+        # === Ajout : résumé du modèle et des données ===
+        table = Table(title=f"LSTM Model for {symbol}")
+        table.add_column("Metric")
+        table.add_column("Value")
+        table.add_row("Data Shape", str(df.shape))
+        table.add_row("Sequences", str(X.shape if X is not None else "N/A"))
+        table.add_row("Labels", str(y.shape if y is not None else "N/A"))
+        console.print(table)
+
         X, y = augment_data(X, y)
         model = build_lstm_model()
         logger.info(f"[Model] Training with X shape {X.shape}, y shape {y.shape}")
