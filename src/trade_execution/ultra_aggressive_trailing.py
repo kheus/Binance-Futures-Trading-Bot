@@ -299,7 +299,17 @@ class UltraAgressiveTrailingStop:
         logger.info(f"[{self.symbol}] ✅ Trailing stop removed for trade_id: {self.trade_id}")
         if self.trade_id:
             try:
-                update_trade_on_close(self.trade_id, self.symbol, connection_pool, self.quantity, self.position_type)
+                update_trade_on_close(
+                    symbol=self.symbol,
+                    trade_id=self.trade_id,
+                    close_price=float(self.stop_loss_price),
+                    reason="trailing_stop_closed",
+                    entry_price=self.entry_price,
+                    quantity=self.quantity,
+                    leverage=getattr(self, "leverage", 1),  # Ajoute self.leverage si tu l’as dans la classe
+                    side=self.position_type
+                )
+
             except Exception as e:
                 logger.exception(f"[{self.symbol}] Error updating DB on close: {e}")
 

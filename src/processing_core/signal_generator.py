@@ -18,6 +18,12 @@ from rich.table import Table
 from src.database.db_handler import insert_signal, insert_training_data, get_future_prices, get_training_data_count
 from src.monitoring.alerting import send_telegram_alert
 from binance.client import Client
+import pandas as pd
+from src.database.db_handler import get_price_history
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # === Ajout : Configuration dynamique des indicateurs selon le timeframe ===
 class TimeframeConfig:
@@ -280,6 +286,72 @@ def get_available_margin(api_key, api_secret):
         logger.error(f"[Binance API] Erreur récupération marge : {e}")
         return 0.0
 
+# =========================================================
+# 📘 MODULE SUPPORT / RESISTANCE
+# =========================================================
+
+def detect_support_resistance(df, window=20, tolerance=0.002):
+    """
+    Détecte les supports et résistances à partir des derniers prix.
+    Retourne un dict avec les niveaux clés.
+    """
+    if df is None or len(df) < window:
+        return None
+
+    highs = df['high'].rolling(window=window, center=True).max()
+    lows = df['low'].rolling(window=window, center=True).min()
+
+    resistance = highs.iloc[-1]
+    support = lows.iloc[-1]
+
+    upper_zone = resistance * (1 - tolerance)
+    lower_zone = support * (1 + tolerance)
+
+    return {
+        "support": round(support, 4),
+        "resistance": round(resistance, 4),
+        "support_zone": [round(support, 4), round(lower_zone, 4)],
+        "resistance_zone": [round(upper_zone, 4), round(resistance, 4)]
+    }
+
+def check_breakout(df, levels):
+    """
+    Détecte si le prix a cassé le support ou la résistance.
+    """
+    if df is None or len(df) < 2 or not levels:
+        return "none"
+
+    last_close = df['close'].iloc[-1]
+    prev_close = df['close'].iloc[-2]
+    support, resistance = levels['support'], levels['resistance']
+
+    if last_close > resistance and prev_close <= resistance:
+        return "breakout_up"
+    elif last_close < support and prev_close >= support:
+        return "breakout_down"
+    return "none"
+
+def analyze_with_sr(symbol, timeframe='15m'):
+    """
+    Combine détection et cassure sur les dernières bougies.
+    """
+    try:
+        df = get_price_history(symbol, timeframe=timeframe)
+        if df is None or len(df) < 30:
+            return None
+
+        df = pd.DataFrame(df)
+        levels = detect_support_resistance(df)
+        breakout = check_breakout(df, levels)
+
+        return {
+            "support": levels["support"],
+            "resistance": levels["resistance"],
+            "breakout": breakout
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
 def check_signal(df, model, current_position, last_order_details, symbol, last_action_sent=None, config=None):
     """
     Optimized signal checker with dynamic timeframe configuration.
@@ -401,7 +473,7 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
     # === Signal generation ===
     action = "hold"
     new_position = current_position
-    signal_timestamp = int(df.index[-1].timestamp() * 1000)
+    signal_timestamp = int((df.index[-1] + timedelta(minutes=15)).timestamp() * 1000)
 
     # Risk/Reward check (assoupli)
     expected_pnl = atr * 2
@@ -483,17 +555,46 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
         confidence *= 0.6
         logger.info(f"[Confidence Adjustment] Contradiction trend → confiance réduite ({confidence:.2f})")
 
+    # =========================================================
+    # 🧠 Analyse complète du marché : support/résistance + volume
+    # =========================================================
+    try:
+        sr_analysis = analyze_market_structure(df, symbol)
+        vwms_analysis = compute_vwms(df, symbol)
+
+        # Prend le breakout le plus pertinent (volume profile prioritaire)
+        breakout = vwms_analysis["breakout"] or sr_analysis["breakout"]
+        support = vwms_analysis["support"]
+        resistance = vwms_analysis["resistance"]
+
+        if breakout == "breakout_up" and action == "buy":
+            confidence *= 1.20
+            logger.info(f"[{symbol}] 🚀 Cassure haussière confirmée par volume → Confiance renforcée ({confidence:.2f})")
+        elif breakout == "breakout_down" and action == "sell":
+            confidence *= 1.20
+            logger.info(f"[{symbol}] ⚡ Cassure baissière confirmée par volume → Confiance renforcée ({confidence:.2f})")
+        elif breakout == "breakout_up" and action == "sell":
+            confidence *= 0.6
+            logger.warning(f"[{symbol}] ❗ Cassure UP contre SELL → Confiance réduite ({confidence:.2f})")
+        elif breakout == "breakout_down" and action == "buy":
+            confidence *= 0.6
+            logger.warning(f"[{symbol}] ❗ Cassure DOWN contre BUY → Confiance réduite ({confidence:.2f})")
+
+        logger.info(f"[{symbol}] 🔍 VWMS → S={support:.4f} | R={resistance:.4f} | Breakout={breakout}")
+    except Exception as e:
+        logger.error(f"[{symbol}] Erreur analyse marché combinée: {e}")
+
     # Sauvegarde dans training_data pour le tracker
     try:
         insert_training_data(
             symbol=symbol,
-            timestamp=signal_timestamp,
+            timestamp=signal_timestamp,  # candle closing time
             indicators={
                 "rsi": rsi,
                 "macd": macd,
                 "adx": adx,
-                "ema_short": ema_short,
-                "ema_long": ema_long,
+                "ema20": ema_short,
+                "ema50": ema_long,
                 "atr": atr
             },
             market_context={
@@ -502,7 +603,8 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
             },
             prediction=prediction,
             action=action.lower(),
-            price=close
+            price=close,
+            created_at_real=datetime.utcnow()  # ✅ real timestamp
         )
     except Exception as e:
         logger.error(f"[Training Insert Error] {e}")
@@ -517,3 +619,141 @@ def check_signal(df, model, current_position, last_order_details, symbol, last_a
             logger.error(f"[DB Error] {e}")
 
     return action, new_position, confidence, confidence_factors
+
+
+logger = logging.getLogger(__name__)
+
+def get_volume_weighted_sr(df: pd.DataFrame, window: int = 50, price_rounding: int = -2):
+    """
+    Calcule les supports et résistances pondérés par le volume sur une fenêtre donnée.
+    Arguments :
+        df : DataFrame contenant les colonnes 'close' et 'volume'
+        window : nombre de bougies récentes à utiliser
+        price_rounding : arrondi des prix (ex: -2 => tranches de 100 USDT)
+    Retour :
+        (support, resistance)
+    """
+    try:
+        recent = df.tail(window)
+        prices = recent['close'].values
+        volumes = recent['volume'].values
+
+        # Associer volume à prix
+        price_volume = pd.Series(volumes, index=prices)
+
+        # Regrouper les prix proches (ex: par tranche de 100 USDT)
+        price_clusters = price_volume.groupby(price_volume.index.round(price_rounding)).sum()
+
+        # Prendre les niveaux avec le plus de volume
+        key_levels = price_clusters.sort_values(ascending=False).head(5).index.tolist()
+
+        support = min(key_levels)
+        resistance = max(key_levels)
+
+        return float(support), float(resistance)
+
+    except Exception as e:
+        logger.error(f"[SupportResistance] Erreur calcul SR: {e}")
+        return np.nan, np.nan
+
+
+def detect_volume_breakout(df: pd.DataFrame, support: float, resistance: float):
+    """
+    Détecte les cassures confirmées par le volume.
+    Retourne 'breakout_up', 'breakout_down' ou 'none'
+    """
+    try:
+        current_price = df['close'].iloc[-1]
+        current_volume = df['volume'].iloc[-1]
+        avg_volume = df['volume'].tail(20).mean()
+
+        # Conditions de cassure confirmée (volume > 1.5x moyenne)
+        if current_price > resistance * 1.001 and current_volume > avg_volume * 1.5:
+            return "breakout_up"
+        elif current_price < support * 0.999 and current_volume > avg_volume * 1.5:
+            return "breakout_down"
+        else:
+            return "none"
+    except Exception as e:
+        logger.error(f"[BreakoutDetection] Erreur cassure volume: {e}")
+        return "none"
+
+
+def analyze_market_structure(df: pd.DataFrame, symbol: str):
+    """
+    Analyse complète du marché : support, résistance, cassure avec volume
+    Journalise les résultats pour intégration au training_data.
+    """
+    support, resistance = get_volume_weighted_sr(df, window=50)
+    breakout = detect_volume_breakout(df, support, resistance)
+
+    logger.info(f"[{symbol}] S={support:.2f} | R={resistance:.2f} | Breakout={breakout}")
+    return {
+        "support": support,
+        "resistance": resistance,
+        "breakout": breakout
+    }
+
+# ============================================================
+#     📈 Advanced Volume Weighted Market Structure (VWMS)
+# ============================================================
+
+def compute_vwms(df: pd.DataFrame, symbol: str, lookback: int = 100):
+    """
+    Analyse de structure de marché pondérée par le volume.
+    Combine les mèches, le volume et le profil de marché local.
+    """
+    try:
+        df = df.tail(lookback).copy()
+        df["hlc3"] = (df["high"] + df["low"] + df["close"]) / 3
+        df["price_bin"] = (df["hlc3"] / df["hlc3"].mean()).round(3)  # normalisation relative
+
+        # Profil de volume : somme des volumes par tranche de prix
+        volume_profile = df.groupby("price_bin")["volume"].sum()
+        volume_profile = volume_profile / volume_profile.sum()  # normalisé
+
+        # Points clés
+        poc_bin = volume_profile.idxmax()  # Point of Control (max volume)
+        hvn_bins = volume_profile[volume_profile > volume_profile.mean() * 1.2].index.tolist()
+        lvn_bins = volume_profile[volume_profile < volume_profile.mean() * 0.8].index.tolist()
+
+        poc_price = df[df["price_bin"] == poc_bin]["hlc3"].mean()
+        hvn_prices = [df[df["price_bin"] == b]["hlc3"].mean() for b in hvn_bins]
+        lvn_prices = [df[df["price_bin"] == b]["hlc3"].mean() for b in lvn_bins]
+
+        support = min(hvn_prices) if hvn_prices else df["low"].min()
+        resistance = max(hvn_prices) if hvn_prices else df["high"].max()
+
+        # Volume breakout detection
+        current_close = df["close"].iloc[-1]
+        avg_volume = df["volume"].mean()
+        last_volume = df["volume"].iloc[-1]
+
+        if current_close > resistance * 1.002 and last_volume > avg_volume * 1.8:
+            breakout = "breakout_up"
+        elif current_close < support * 0.998 and last_volume > avg_volume * 1.8:
+            breakout = "breakout_down"
+        else:
+            breakout = "none"
+
+        logger.info(
+            f"[{symbol}] VWMS → S={support:.2f} | R={resistance:.2f} | POC={poc_price:.2f} | Breakout={breakout}"
+        )
+
+        return {
+            "support": support,
+            "resistance": resistance,
+            "poc": poc_price,
+            "breakout": breakout,
+            "volume_profile": volume_profile.to_dict()
+        }
+
+    except Exception as e:
+        logger.error(f"[VWMS] Erreur analyse {symbol}: {e}", exc_info=True)
+        return {
+            "support": np.nan,
+            "resistance": np.nan,
+            "poc": np.nan,
+            "breakout": "none",
+            "volume_profile": {}
+        }

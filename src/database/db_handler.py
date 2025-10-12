@@ -9,6 +9,7 @@ import time
 import os
 import decimal
 from datetime import datetime, timedelta
+from sqlalchemy import create_engine
 
 logger = logging.getLogger(__name__)
 
@@ -242,18 +243,22 @@ def insert_signal(symbol, timestamp, signal_type, price, confidence_score=None, 
         raise
 
 def insert_training_data(
-    symbol, timestamp, indicators, market_context, 
-    prediction=None, action=None, price=None, 
-    future_price=None, outcome=None, market_direction=None, 
-    price_change_pct=None
+    symbol, timestamp, indicators, market_context,
+    prediction=None, action=None, price=None,
+    future_price=None, outcome=None, market_direction=None,
+    price_change_pct=None, created_at_real=None
 ):
     query = """
     INSERT INTO training_data (
         symbol, timestamp, indicators, market_context,
         prediction, action, price,
-        market_direction, price_change_pct, prediction_correct
+        market_direction, price_change_pct, prediction_correct,
+        created_at_real
     )
-    VALUES (%s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s, %s, %s)
+    VALUES (%s, %s, %s::jsonb, %s::jsonb,
+            %s, %s, %s,
+            %s, %s, %s,
+            %s)
     ON CONFLICT (symbol, timestamp) DO UPDATE SET
         prediction = EXCLUDED.prediction,
         action = EXCLUDED.action,
@@ -271,71 +276,37 @@ def insert_training_data(
         if timestamp_ms < 946684800000 or timestamp_ms > 4102444800000:
             raise ValueError(f"Invalid timestamp for {symbol}: {timestamp_ms}")
 
-        # Valider et convertir indicators et market_context en JSON string
+        # 🔹 Normalisation JSON
         if not isinstance(indicators, (dict, str)):
             raise ValueError(f"indicators must be dict or JSON string, got {type(indicators)}")
         indicators_json = json.dumps(indicators) if isinstance(indicators, dict) else indicators
-        
+
         if not isinstance(market_context, (dict, str)):
             raise ValueError(f"market_context must be dict or JSON string, got {type(market_context)}")
         market_context_json = json.dumps(market_context) if isinstance(market_context, dict) else market_context
 
-        # Calculer price_change_pct et market_direction si future_price fourni
+        # 🔹 Calcul direction/future
         if future_price is not None and price is not None:
             price_change = (future_price - price) / price * 100 if price != 0 else 0
             price_change_pct = price_change
             market_direction = 1 if future_price > price else 0 if future_price < price else None
-        
-        # Calculer prediction_correct si outcome fourni
+
+        # 🔹 Résultat
         prediction_correct = None
         if outcome:
             prediction_correct = (outcome == 'win')  # Adaptez selon ta logique (True/False)
         
         # Params sans created_at (utilise DEFAULT)
         execute_query(query, (
-            symbol, timestamp_ms, indicators_json, market_context_json, 
-            prediction, action, float(price) if price else None, 
-            market_direction, price_change_pct, prediction_correct
+            symbol, timestamp_ms, indicators_json, market_context_json,
+            prediction, action, float(price) if price else None,
+            market_direction, price_change_pct, prediction_correct,
+            created_at_real
         ))
         logger.info(f"Training data inserted/updated for {symbol} at {timestamp_ms}")
         return True
     except Exception as e:
-        logger.error(f"[insert_training_data] Error for {symbol} at {timestamp}: {str(e)}")
-        return False
-    finally:
-        if conn:
-            release_db_connection(conn)
-
-def update_trade_on_close(symbol, order_id, exit_price, quantity, side, leverage=50):
-    query = """
-    UPDATE trades
-    SET exit_price = %s,
-        pnl = %s,
-        status = 'CLOSED'
-    WHERE symbol = %s AND order_id = %s::varchar
-    """
-    conn = None
-    try:
-        conn = get_db_connection()
-        with conn.cursor() as cur:
-            cur.execute("SELECT price FROM trades WHERE symbol = %s AND order_id = %s::varchar", (symbol, str(order_id)))
-            result = cur.fetchone()
-            if not result:
-                logger.error(f"[update_trade_on_close] No trade found for {symbol}, order_id: {order_id}")
-                return False
-            entry_price = float(result[0])
-            if side.upper() == 'BUY':
-                pnl = (exit_price - entry_price) * quantity * leverage
-            else:  # SELL
-                pnl = (entry_price - exit_price) * quantity * leverage
-            cur.execute(query, (float(exit_price), float(pnl), symbol, str(order_id)))
-            conn.commit()
-            logger.info(f"[update_trade_on_close] Updated trade for {symbol}, order_id: {order_id}, exit_price: {exit_price}, pnl: {pnl}")
-        return True
-    except Exception as e:
-        logger.error(f"[update_trade_on_close] Error updating trade for {symbol}, order_id: {order_id}: {str(e)}")
-        if conn:
-            conn.rollback()
+        logger.error(f"[insert_training_data] Error for {symbol} at {timestamp}: {str(e)}", exc_info=True)
         return False
     finally:
         if conn:
@@ -507,36 +478,56 @@ def get_metrics():
         logger.error(f"Failed to fetch metrics: {e}")
         raise
 
+from sqlalchemy import create_engine
+
 def get_price_history(symbol, timeframe='1h', start_timestamp=None):
     """
     Fetch historical price data for a given symbol and timeframe.
-    The 'timestamp' column is stored as BIGINT (milliseconds).
+    Returns a clean pandas DataFrame sorted by timestamp.
+    Compatible with SQLAlchemy and PostgreSQL.
     """
     timeframe_to_limit = {
         '5m': 288, '15m': 96, '1h': 168, '4h': 84, '1d': 30
     }
     limit = timeframe_to_limit.get(timeframe, 100)
+
+    # ✅ Construction de la requête SQL
     query = """
     SELECT timestamp, open, high, low, close, volume
     FROM price_data
     WHERE symbol = %s
     """
-    params = [str(symbol)]
+    params = (str(symbol),)
+
     if start_timestamp is not None:
-        query += " AND timestamp >= %s"  # Direct BIGINT comparison
-        params.append(int(start_timestamp))
+        query += " AND timestamp >= %s"
+        params += (int(start_timestamp),)
+
     query += " ORDER BY timestamp DESC LIMIT %s"
-    params.append(int(limit))
+    params += (int(limit),)
+
     try:
-        with get_db_connection() as conn:
-            df = pd.read_sql_query(query, conn, params=params)
-            # Convert ms timestamp to datetime for returned data
-            if not df.empty:
-                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-            return df.sort_values('timestamp').to_dict(orient='records')
+        # ✅ Connexion via SQLAlchemy
+        engine_url = f"postgresql+psycopg2://{USER}:{PASSWORD}@{HOST}:{PORT}/{DBNAME}"
+        engine = create_engine(engine_url)
+
+        # ✅ Lecture SQL + pandas
+        df = pd.read_sql_query(query, engine, params=params)
+
+        if df.empty:
+            logger.warning(f"[get_price_history] Empty data for {symbol}")
+            return pd.DataFrame(columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+
+        # ✅ Conversion du timestamp en datetime
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df = df.sort_values('timestamp').reset_index(drop=True)
+
+        return df
+
     except Exception as e:
-        logger.error(f"Failed to fetch price history for {symbol}: {e}")
-        raise
+        logger.error(f"[get_price_history] Error fetching price history for {symbol}: {e}", exc_info=True)
+        return pd.DataFrame(columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+
 
 def clean_old_data(retention_days=7, trades_retention_days=None):
     """
@@ -664,3 +655,45 @@ def _validate_timestamp(ts):
         return ts
     except (TypeError, ValueError) as e:
         logger.error(f"Timestamp invalide: {ts} - {str(e)}")
+
+def update_trade_on_close(symbol, trade_id, close_price, pnl=None, reason=None, entry_price=None, quantity=None, leverage=1, side=None):
+    """
+    Met à jour un trade après sa fermeture (via trailing stop, take profit ou manuel).
+    Calcule automatiquement le PnL réel si non fourni.
+    """
+    try:
+        if pnl is None and all(v is not None for v in [entry_price, close_price, quantity, leverage, side]):
+            pnl = calculate_real_pnl(entry_price, close_price, quantity, leverage, side)
+
+        query = """
+        UPDATE trades
+        SET 
+            status = 'closed',
+            close_price = %s,
+            pnl = %s,
+            close_reason = %s,
+            closed_at = (EXTRACT(EPOCH FROM NOW()) * 1000)::BIGINT
+        WHERE symbol = %s AND trade_id = %s
+        RETURNING trade_id
+        """
+        execute_query(query, (close_price, pnl, reason, symbol, trade_id))
+        logger.info(f"[update_trade_on_close] ✅ Trade closed for {symbol} (id={trade_id}) | PnL={pnl}")
+        return True
+    except Exception as e:
+        logger.error(f"[update_trade_on_close] ❌ Error updating trade {trade_id} for {symbol}: {e}")
+        return False
+
+def calculate_real_pnl(entry_price, close_price, quantity, leverage, side):
+    """
+    Calcule le profit ou la perte réelle en fonction du levier.
+    """
+    try:
+        if side.lower() == "long":
+            gross_pnl = (close_price - entry_price) * quantity
+        else:
+            gross_pnl = (entry_price - close_price) * quantity
+        real_pnl = gross_pnl / max(leverage, 1)
+        return round(real_pnl, 4)
+    except Exception as e:
+        logger.error(f"[calculate_real_pnl] Error: {e}")
+        return 0.0

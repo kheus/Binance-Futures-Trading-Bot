@@ -109,6 +109,7 @@ CREATE TABLE IF NOT EXISTS training_data (
     price_change_pct FLOAT,
     prediction_correct BOOLEAN,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    created_at_real TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(symbol, timestamp)
 );

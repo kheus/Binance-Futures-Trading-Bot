@@ -9,4 +9,4 @@
   sqlite:
     path: "trading_bot.db"
 trading:
-  symbols: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
+  symbols: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT"]
