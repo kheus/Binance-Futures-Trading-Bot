@@ -99,6 +99,7 @@ class UltraAgressiveTrailingStop:
         self.trade_id = None
         self.active = False
         self.max_retries = 3
+        self.leverage = 1
 
     def _generate_client_order_id(self):
         millis = int(time.time() * 1000)
@@ -129,7 +130,7 @@ class UltraAgressiveTrailingStop:
         else:
             return current_price <= self.entry_price * (1 - self.take_profit_pct)
 
-    def initialize(self, entry_price, position_type, quantity, atr=None, adx=None, trade_id=None):
+    def initialize(self, entry_price, position_type, quantity, atr=None, adx=None, trade_id=None, leverage=None):
         """
         Place initial stop-loss (STOP_MARKET reduceOnly) immediately after trade execution.
         Returns orderId or None.
@@ -139,6 +140,8 @@ class UltraAgressiveTrailingStop:
         self.quantity = format_quantity(self.client, self.symbol, quantity)
         self.trade_id = str(trade_id).replace('trade_', '') if trade_id else None
         self.active = True
+        if leverage:
+            self.leverage = leverage
 
         # Stop loss fixe dès l’entrée
         self.stop_loss_price = self._initial_stop(self.entry_price, self.position_type)
@@ -306,7 +309,7 @@ class UltraAgressiveTrailingStop:
                     reason="trailing_stop_closed",
                     entry_price=self.entry_price,
                     quantity=self.quantity,
-                    leverage=getattr(self, "leverage", 1),  # Ajoute self.leverage si tu l’as dans la classe
+                    leverage=self.leverage,
                     side=self.position_type
                 )
 
@@ -329,10 +332,10 @@ class TrailingStopManager:
             return True
         return stop.trade_id == str(trade_id).replace('trade_', '')
 
-    def initialize_trailing_stop(self, symbol, entry_price, position_type, quantity, atr=None, adx=None, trade_id=None):
+    def initialize_trailing_stop(self, symbol, entry_price, position_type, quantity, atr=None, adx=None, trade_id=None, leverage=None):
         if symbol not in self.stops or not self.stops[symbol].active:
             self.stops[symbol] = UltraAgressiveTrailingStop(self.client, symbol)
-        return self.stops[symbol].initialize(entry_price, position_type, quantity, atr=atr, adx=adx, trade_id=trade_id)
+        return self.stops[symbol].initialize(entry_price, position_type, quantity, atr=atr, adx=adx, trade_id=trade_id, leverage=leverage)
 
     def update_trailing_stop(self, symbol, current_price, atr=None, spread=None, adx=None, trade_id=None):
         if symbol in self.stops and self.stops[symbol].active:

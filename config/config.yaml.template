@@ -9,24 +9,23 @@ database:
   max_connections: 20
   connect_timeout: 10
 
-# Binance API Configuration
+# Binance API + trading configuration.
+# main_bot.py reads symbols/timeframe/capital/leverage/etc. from this SAME "binance" key -
+# putting them under a separate "trading" key (as an earlier version of this template did)
+# makes the bot fail at startup with "Missing or invalid 'symbols' under 'binance'".
 binance:
   api_key: ""  # Will be read from BINANCE_API_KEY environment variable
   api_secret: ""  # Will be read from BINANCE_API_SECRET environment variable
-  base_url: "https://fapi.binance.com"
-  testnet: false
-
-# Trading Configuration
-trading:
+  base_url: "https://testnet.binancefuture.com"  # switch to https://fapi.binance.com only once you've validated on testnet
   symbols:
     - "BTCUSDT"
     - "ETHUSDT"
   timeframe: "1h"
   capital: 1000.0
   leverage: 10
-  max_risk_per_trade: 0.02
-  max_drawdown: 0.1
-  trailing_stop: true
+  risk_per_trade: 0.01        # fraction of capital risked per trade at the stop
+  max_concurrent_trades: 1
+  max_drawdown_pct: 0.05      # halt new entries after losing this fraction of capital
 
 # Logging Configuration
 logging:

@@ -1,31 +1,38 @@
-import numpy as np
-import talib
-def get_tick_info(client, symbol):
-    """
-    Fetches the tick size for a given symbol using the Binance client.
-    Returns a tuple (tick_size, step_size).
-    """
-    info = client.get_symbol_info(symbol)
-    for f in info['filters']:
-        if f['filterType'] == 'PRICE_FILTER':
-            tick_size = float(f['tickSize'])
-        if f['filterType'] == 'LOT_SIZE':
-            step_size = float(f['stepSize'])
-    return tick_size, step_size
+import logging
 
-def dynamic_position_sizing(client, symbol, capital, risk_per_trade=0.01):
-    klines = client.get_historical_klines(symbol, "15m", "24h UTC")
-    highs = [float(entry[2]) for entry in klines]
-    lows = [float(entry[3]) for entry in klines]
-    closes = [float(entry[4]) for entry in klines]
-    atr = talib.ATR(np.array(highs), np.array(lows), np.array(closes), timeperiod=14)[-1]
-    tick_size = get_tick_info(client, symbol)[0]
-    risk_amount = capital * risk_per_trade
-    position_size = risk_amount / (atr * 2)
-    return round_to_tick(position_size, tick_size)
-    
-def round_to_tick(value, tick_size):
-        """
-        Rounds the value to the nearest multiple of tick_size.
-        """
-        return round(round(value / tick_size) * tick_size, len(str(tick_size).split('.')[-1]))
+logger = logging.getLogger(__name__)
+
+
+def calculate_risk_based_quantity(capital, price, stop_distance, risk_per_trade, leverage,
+                                   qty_precision=2, min_qty=0.0):
+    """
+    Size a position so that a stop hit `stop_distance` (in price units) away from entry loses
+    approximately `capital * risk_per_trade`, instead of always deploying the full account
+    balance at max leverage on every single trade.
+
+    The result is also capped at the notional a max-leverage allocation of the full capital
+    would allow, so a very tight stop can't size the position up to something the account
+    can't actually support.
+    """
+    try:
+        if price is None or price <= 0 or stop_distance is None or stop_distance <= 0 or capital is None or capital <= 0:
+            logger.warning("[PositionSizing] Invalid inputs: price=%s, stop_distance=%s, capital=%s", price, stop_distance, capital)
+            return 0.0
+
+        risk_amount = capital * risk_per_trade
+        raw_qty = risk_amount / stop_distance
+        max_qty_by_leverage = (capital * leverage) / price
+        quantity = min(raw_qty, max_qty_by_leverage)
+        quantity = round(quantity, qty_precision)
+
+        if quantity < min_qty:
+            logger.info(
+                "[PositionSizing] Risk-sized quantity %.8f below exchange min_qty %.8f (risk_amount=%.4f, stop_distance=%.6f) - rejecting trade",
+                quantity, min_qty, risk_amount, stop_distance
+            )
+            return 0.0
+
+        return quantity
+    except Exception as e:
+        logger.error(f"[PositionSizing] Error computing risk-based quantity: {e}")
+        return 0.0
