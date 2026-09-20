@@ -12,6 +12,8 @@ __pycache__/
 # sensible files
 config/config.yaml
 config/kafka_config_local.yaml
+config/db_config.yaml
+.env
 
 # temporary files
 *.log

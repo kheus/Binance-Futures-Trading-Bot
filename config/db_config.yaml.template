@@ -1,11 +1,11 @@
-﻿database:
+database:
   type: "postgres"
   postgresql:
     host: "localhost"
     port: 5432
     database: "trading_bot_db"
     user: "postgres"
-    password: "Cheikh12"
+    password: ""  # fill in locally - this file is gitignored, config/db_config.yaml is not
   sqlite:
     path: "trading_bot.db"
 trading:
