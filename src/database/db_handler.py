@@ -665,18 +665,18 @@ def update_trade_on_close(symbol, trade_id, close_price, pnl=None, reason=None, 
         if pnl is None and all(v is not None for v in [entry_price, close_price, quantity, leverage, side]):
             pnl = calculate_real_pnl(entry_price, close_price, quantity, leverage, side)
 
+        # schema.sql's trades table has exit_price/pnl/status - not close_price/close_reason/
+        # closed_at, which don't exist as columns. Using them made every close silently fail.
         query = """
         UPDATE trades
-        SET 
-            status = 'closed',
-            close_price = %s,
-            pnl = %s,
-            close_reason = %s,
-            closed_at = (EXTRACT(EPOCH FROM NOW()) * 1000)::BIGINT
+        SET
+            status = 'CLOSED',
+            exit_price = %s,
+            pnl = %s
         WHERE symbol = %s AND trade_id = %s
         RETURNING trade_id
         """
-        execute_query(query, (close_price, pnl, reason, symbol, trade_id))
+        execute_query(query, (close_price, pnl, symbol, trade_id))
         logger.info(f"[update_trade_on_close] ✅ Trade closed for {symbol} (id={trade_id}) | PnL={pnl}")
         return True
     except Exception as e:
@@ -685,15 +685,20 @@ def update_trade_on_close(symbol, trade_id, close_price, pnl=None, reason=None, 
 
 def calculate_real_pnl(entry_price, close_price, quantity, leverage, side):
     """
-    Calcule le profit ou la perte réelle en fonction du levier.
+    Calcule le PnL reel d'une position futures.
+
+    `quantity` est deja la quantite de contrats reellement envoyee a Binance, qui est
+    elle-meme dimensionnee comme (capital * leverage) / prix - le levier est donc deja
+    "integre" dans quantity. Le PnL brut (close-entry)*quantity EST le PnL final: il ne
+    faut ni multiplier ni diviser par le levier une deuxieme fois (le levier ne change que
+    la marge requise, jamais le PnL en USDT d'une position donnee).
     """
     try:
         if side.lower() == "long":
-            gross_pnl = (close_price - entry_price) * quantity
+            pnl = (close_price - entry_price) * quantity
         else:
-            gross_pnl = (entry_price - close_price) * quantity
-        real_pnl = gross_pnl / max(leverage, 1)
-        return round(real_pnl, 4)
+            pnl = (entry_price - close_price) * quantity
+        return round(pnl, 4)
     except Exception as e:
         logger.error(f"[calculate_real_pnl] Error: {e}")
         return 0.0

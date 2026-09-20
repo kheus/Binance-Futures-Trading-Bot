@@ -59,8 +59,8 @@ def sync_binance_trades_with_postgres(client: UMFutures, symbols, ts_manager: Tr
                     else:
                         pnl = (float(entry_price) - exit_price) * qty
                     execute_query(
-                        "UPDATE trades SET status = 'CLOSED', exit_price = %s, realized_pnl = %s, close_timestamp = %s WHERE trade_id = %s",
-                        params=(exit_price, pnl, int(time.time()), trade_id)
+                        "UPDATE trades SET status = 'CLOSED', exit_price = %s, pnl = %s WHERE trade_id = %s",
+                        params=(exit_price, pnl, trade_id)
                     )
                     # Supprimer le trailing stop s'il existe
                     if ts_manager.has_trailing_stop(trade_symbol):

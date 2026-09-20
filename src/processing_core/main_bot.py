@@ -12,7 +12,7 @@ from confluent_kafka import Consumer
 from src.data_ingestion.data_formatter import format_candle
 from src.processing_core.lstm_model import train_or_load_model
 ## from src.processing_core.signal_generator import DataPreprocessor, check_signal,
-from src.trade_execution.order_manager import place_order, init_trailing_stop_manager, EnhancedOrderManager
+from src.trade_execution.order_manager import init_trailing_stop_manager, EnhancedOrderManager, crash_protector
 from src.trade_execution.sync_orders import get_current_atr, get_current_adx, sync_binance_trades_with_postgres
 from src.database.db_handler import insert_trade, insert_signal, insert_metrics, create_tables, insert_price_data, clean_old_data, update_trade_on_close
 from src.processing_core.signal_generator import DataPreprocessor, StrategySelector, check_signal
@@ -117,8 +117,20 @@ MODEL_UPDATE_INTERVAL = 600  # 10 minutes pour réentraînement plus fréquent
 METRICS_UPDATE_INTERVAL = 300  # 5 minutes
 TRAILING_UPDATE_INTERVAL = binance_config.get("trailing_update_interval", 10)  # Default to 10 seconds
 PRICE_FETCH_INTERVAL = 60  # Fetch 1-minute candles every 60 seconds
-MAX_CONCURRENT_TRADES = 1  # Limite de trades simultanés
-MAX_DRAWDOWN = 0.05 * CAPITAL  # 5% drawdown max
+MAX_CONCURRENT_TRADES = binance_config.get("max_concurrent_trades", 1)  # Limite de trades simultanés
+MAX_DRAWDOWN = binance_config.get("max_drawdown_pct", 0.05) * CAPITAL  # halt new entries past this loss
+RISK_PER_TRADE = binance_config.get("risk_per_trade", 0.01)  # fraction of capital risked per trade
+
+# Shared risk state, updated whenever a position closes (see _record_realized_pnl below).
+# Once cumulative realized losses exceed MAX_DRAWDOWN, new entries are blocked until restart.
+risk_state = {"cumulative_pnl": 0.0, "trading_halted": False}
+
+def _record_realized_pnl(pnl):
+    risk_state["cumulative_pnl"] += pnl
+    if not risk_state["trading_halted"] and risk_state["cumulative_pnl"] <= -MAX_DRAWDOWN:
+        risk_state["trading_halted"] = True
+        logger.critical(f"[RiskGuard] Max drawdown breached (cumulative PNL={risk_state['cumulative_pnl']:.2f} <= -{MAX_DRAWDOWN:.2f}). Halting new entries.")
+        send_telegram_alert(f"🚨 Max drawdown breached (cumulative PNL={risk_state['cumulative_pnl']:.2f}). New entries halted - restart the bot to resume.")
 
 # Initialize Binance client
 try:
@@ -187,15 +199,18 @@ def handle_order_update(message):
                         qty = ts_manager.stops[symbol].quantity
                         entry_price = ts_manager.stops[symbol].entry_price
                         position_type = ts_manager.stops[symbol].position_type
-                        leverage = ts_manager.stops[symbol].leverage
+                        # quantity is already the leveraged contract size (capital*leverage/price
+                        # at entry), so the raw (exit-entry)*qty diff IS the final PnL - no
+                        # leverage factor here, unlike a couple of the other close paths below.
                         if position_type == 'long':
-                            pnl = (exit_price - entry_price) * qty * leverage
+                            pnl = (exit_price - entry_price) * qty
                         else:
-                            pnl = (entry_price - exit_price) * qty * leverage
-                        connection_pool.execute_query(
-                            "UPDATE trades SET status = 'CLOSED', exit_price = %s, realized_pnl = %s, close_timestamp = %s, leverage = %s WHERE trade_id = %s",
-                            (exit_price, pnl, int(time.time()), leverage, trade_id)
+                            pnl = (entry_price - exit_price) * qty
+                        execute_query(
+                            "UPDATE trades SET status = 'CLOSED', exit_price = %s, pnl = %s WHERE trade_id = %s",
+                            (exit_price, pnl, trade_id)
                         )
+                        _record_realized_pnl(pnl)
                         ts_manager.close_position(symbol)
                         current_positions[symbol] = None
                         logger.info(f"[WebSocket] Trailing stop executed for {symbol}, trade_id={trade_id}, PNL={pnl}")
@@ -223,29 +238,32 @@ def handle_order_update(message):
                         'price': order_data['price'],
                         'trade_id': order_data['trade_id']
                     }
-                    atr = get_current_atr(client, order_data['symbol'])
-                    if atr > 0:
-                        ts_manager.initialize_trailing_stop(
+                    # Orders placed by place_enhanced_order already get their protective stop
+                    # attached atomically at placement time - only step in here for an order
+                    # this bot doesn't already have a trailing stop tracked for (e.g. one
+                    # placed/filled outside the normal signal path). Calling
+                    # initialize_trailing_stop twice for the same trade would place a second,
+                    # untracked STOP_MARKET order on the exchange instead of updating the first.
+                    if not ts_manager.has_trailing_stop(order_data['symbol']):
+                        atr = get_current_atr(client, order_data['symbol'])
+                        adx = get_current_adx(client, order_data['symbol'])
+                        stop_id = ts_manager.initialize_trailing_stop(
                             symbol=order_data['symbol'],
                             entry_price=order_data['price'],
                             position_type='long' if order_data['side'] == 'buy' else 'short',
                             quantity=order_data['quantity'],
                             atr=atr,
-                            trade_id=order_data['trade_id']
+                            adx=adx,
+                            trade_id=order_data['trade_id'],
+                            leverage=LEVERAGE
                         )
-                    adx = get_current_adx(client, order_data['symbol'])
-                    if adx > 0:
-                        ts_manager.initialize_trailing_stop(
-                            symbol=order_data['symbol'],
-                            entry_price=order_data['price'],
-                            position_type='long' if order_data['side'] == 'buy' else 'short',
-                            quantity=order_data['quantity'],
-                            atr=atr,
-                            trade_id=order_data['trade_id']
-                        )
-                        trade_data['is_trailing'] = True
-                        insert_trade(trade_data)
-                        logger.info(f"[WebSocket] Initialized trailing stop for {order_data['symbol']}, trade_id={order_data['trade_id']}")
+                        if stop_id:
+                            trade_data['is_trailing'] = True
+                            insert_trade(trade_data)
+                            logger.info(f"[WebSocket] Initialized trailing stop for {order_data['symbol']}, trade_id={order_data['trade_id']}")
+                        else:
+                            logger.error(f"❌ [WebSocket] Failed to attach protective stop for {order_data['symbol']}, trade_id={order_data['trade_id']}")
+                            send_telegram_alert(f"Failed to attach protective stop for {order_data['symbol']} - check position manually")
                 
                 # Create a table for the trade
                 table = Table(title=f"Trade Executed for {order_data['symbol']}")
@@ -275,17 +293,16 @@ def handle_order_update(message):
                     exit_price = float(ticker['price'])
                     qty = float(current_positions[order_data['symbol']]['quantity'])
                     entry_price = float(current_positions[order_data['symbol']]['price'])
-                    leverage = current_positions[order_data['symbol']].get('leverage', LEVERAGE)
                     side = current_positions[order_data['symbol']]['side']
                     if side == 'long':
-                        pnl = (exit_price - entry_price) * qty * leverage
-
+                        pnl = (exit_price - entry_price) * qty
                     else:
-                        pnl = (entry_price - exit_price) * qty * leverage
+                        pnl = (entry_price - exit_price) * qty
                     execute_query(
-                        "UPDATE trades SET status = 'CLOSED', exit_price = %s, realized_pnl = %s, close_timestamp = %s, leverage = %s WHERE trade_id = %s",
-                        (exit_price, pnl, int(time.time()), leverage, trade_id)
+                        "UPDATE trades SET status = 'CLOSED', exit_price = %s, pnl = %s WHERE trade_id = %s",
+                        (exit_price, pnl, trade_id)
                     )
+                    _record_realized_pnl(pnl)
                     ts_manager.close_position(order_data['symbol'])
                     current_positions[order_data['symbol']] = None
                     logger.info(f"[WebSocket] Position closed for {order_data['symbol']}, trade_id={trade_id}, PNL={pnl}")
@@ -349,16 +366,16 @@ async def trailing_stop_updater():
                         exit_price = float(ticker['price'])
                         qty = float(current_positions[symbol]['quantity'])
                         entry_price = float(current_positions[symbol]['price'])
-                        leverage = current_positions[symbol].get('leverage', LEVERAGE)
                         side = current_positions[symbol]['side']
                         if side == 'long':
-                            pnl = (exit_price - entry_price) * qty * leverage
+                            pnl = (exit_price - entry_price) * qty
                         else:
-                            pnl = (entry_price - exit_price) * qty * leverage
+                            pnl = (entry_price - exit_price) * qty
                         execute_query(
-                            "UPDATE trades SET status = 'CLOSED', exit_price = %s, realized_pnl = %s, close_timestamp = %s, leverage = %s WHERE trade_id = %s",
-                            (exit_price, pnl, int(time.time()), leverage, trade_id)
+                            "UPDATE trades SET status = 'CLOSED', exit_price = %s, pnl = %s WHERE trade_id = %s",
+                            (exit_price, pnl, trade_id)
                         )
+                        _record_realized_pnl(pnl)
                         ts_manager.close_position(symbol)
                         current_positions[symbol] = None
                         logger.info(f"[Trailing Stop] Position closed for {symbol}, trade_id={trade_id}, PNL={pnl}")
@@ -422,6 +439,29 @@ async def fetch_price_data_fallback():
                         logger.debug(f"[Price Fetch] Inserted 1m price data for {symbol} at {int(candle_df.index[-1].timestamp() * 1000)}")
                     else:
                         logger.error(f"[Price Fetch] Failed to insert 1m price data for {symbol}")
+
+                    last_close = float(candle_df["close"].iloc[-1])
+                    if crash_protector.check_market_crash(symbol, last_close):
+                        logger.critical(f"[CrashProtector] Fast adverse move detected for {symbol} at {last_close}")
+                        send_telegram_alert(f"⚠️ CRASH DETECTED for {symbol} at {last_close} - flattening any open position and pausing new entries")
+                        open_position = current_positions.get(symbol)
+                        if open_position:
+                            closed = order_manager.close_open_position(symbol)
+                            ts_manager.close_position(symbol)
+                            if closed and open_position.get("price"):
+                                open_price = float(open_position["price"])
+                                close_price = float(closed["price"])
+                                qty = float(open_position["quantity"])
+                                side = open_position["side"]
+                                pnl = (close_price - open_price) * qty if side in ("buy", "long") else (open_price - close_price) * qty
+                                trade_id = open_position.get("trade_id")
+                                if trade_id:
+                                    execute_query(
+                                        "UPDATE trades SET status = 'CLOSED', exit_price = %s, pnl = %s WHERE trade_id = %s",
+                                        (close_price, pnl, trade_id)
+                                    )
+                                    _record_realized_pnl(pnl)
+                            current_positions[symbol] = None
                 except Exception as e:
                     logger.error(f"[Price Fetch] Error fetching 1m klines for {symbol}: {e}")
             await asyncio.sleep(PRICE_FETCH_INTERVAL)
@@ -435,7 +475,6 @@ async def main():
     last_order_details = {symbol: None for symbol in SYMBOLS}
     last_model_updates = {symbol: time.time() for symbol in SYMBOLS}
     last_action_sent = {symbol: (None, 0) for symbol in SYMBOLS}
-    last_sl_order_ids = {symbol: None for symbol in SYMBOLS}
     models = {symbol: None for symbol in SYMBOLS}
     scalers = {symbol: None for symbol in SYMBOLS}
     last_sync_time = time.time()
@@ -651,13 +690,20 @@ async def main():
                     if action in ["buy", "sell"]:
                         try:
                             price = float(candle_df["close"].iloc[-1])
-                            adx = get_current_adx(client, symbol)
-                            atr = get_current_atr(client, symbol)
-                            if atr <= 0:
-                                atr = price * 0.005  # Fallback to 0.5% of price as min ATR
-                                logger.warning(f"⚠️ [Order] Using fallback ATR {atr} for {symbol}")
+                            if risk_state["trading_halted"]:
+                                logger.warning(f"[RiskGuard] Trading halted (max drawdown breached), skipping {action} signal for {symbol}")
                                 continue
-                            order_details[symbol] = order_manager.place_enhanced_order(action, symbol, CAPITAL, LEVERAGE, trade_id=str(timestamp))
+                            open_trade_count = sum(1 for p in current_positions.values() if p)
+                            if current_positions.get(symbol) is None and open_trade_count >= MAX_CONCURRENT_TRADES:
+                                logger.info(f"[RiskGuard] Max concurrent trades ({MAX_CONCURRENT_TRADES}) reached, skipping {action} signal for {symbol}")
+                                continue
+                            # place_enhanced_order sizes the trade from risk_per_trade and
+                            # atomically attaches a protective stop (or flattens on failure) -
+                            # there is no separate trailing-stop step needed here.
+                            order_details[symbol] = order_manager.place_enhanced_order(
+                                action, symbol, CAPITAL, LEVERAGE, trade_id=str(timestamp),
+                                risk_per_trade=RISK_PER_TRADE
+                            )
                             if order_details[symbol]:
                                 logger.debug(f"[main_bot] New position from signal: {new_position}")
                                 logger.debug(f"[main_bot] Order details: {order_details[symbol]}")
@@ -676,67 +722,43 @@ async def main():
                                     send_telegram_alert(f"Failed to insert trade for {symbol}: {str(e)}")
                                 last_order_details[symbol] = order_details[symbol]
                                 record_trade_metric(order_details[symbol])
-                                send_telegram_alert(f"Trade executed: {action.upper()} {symbol} at {price} 💰")
-                                try:
-                                    last_sl_order_ids[symbol] = ts_manager.initialize_trailing_stop(
-                                        symbol=symbol,
-                                        entry_price=order_details[symbol]['price'],
-                                        position_type='long' if action == 'buy' else 'short',
-                                        quantity=order_details[symbol]['quantity'],
-                                        atr=atr,
-                                        adx=adx,
-                                        trade_id=order_details[symbol]['trade_id']
-                                    )
-                                    if last_sl_order_ids[symbol]:
-                                        order_details[symbol]['is_trailing'] = True
-                                        try:
-                                            insert_trade(order_details[symbol])
-                                            logger.info(f"[Main] Trade updated with trailing stop for {symbol}: {order_details[symbol]['order_id']}")
-                                        except Exception as e:
-                                            logger.error(f"❌ [Main] Failed to update trade with trailing stop for {symbol}: {e}")
-                                            send_telegram_alert(f"Failed to update trade with trailing stop for {symbol}: {str(e)}")
-                                        logger.info(f"[Main] Trailing stop initialized for {symbol}, trade_id: {order_details[symbol]['trade_id']}")
-                                    else:
-                                        logger.error(f"❌ [Main] Failed to initialize trailing stop for {symbol}")
-                                        send_telegram_alert(f"Failed to initialize trailing stop for {symbol}")
-                                except Exception as e:
-                                    logger.error(f"❌ [Main] Error initializing trailing stop for {symbol}: {e}")
-                                    send_telegram_alert(f"Error initializing trailing stop for {symbol}: {str(e)}")
+                                send_telegram_alert(
+                                    f"Trade executed: {action.upper()} {symbol} at {order_details[symbol]['price']}, "
+                                    f"qty {order_details[symbol]['quantity']}, stop {order_details[symbol]['stop_loss']} 💰"
+                                )
                             else:
                                 logger.error(f"❌ [Order] Failed to place {action} order for {symbol}")
                         except (TypeError, ValueError, IndexError, psycopg2.pool.PoolError) as e:
                             logger.error(f"❌ [Order] Error placing {action} order for {symbol}: {e}")
                             send_telegram_alert(f"Error placing {action} order for {symbol}: {str(e)}")
                     elif action in ["close_buy", "close_sell"]:
+                        close_side = "sell" if action == "close_buy" else "buy"
                         try:
-                            close_side = "sell" if action == "close_buy" else "buy"
                             price = float(candle_df["close"].iloc[-1])
-                            atr = float(dataframes[symbol]["ATR"].iloc[-1]) if 'ATR' in dataframes[symbol].columns and not np.isnan(dataframes[symbol]["ATR"].iloc[-1]) else 0
-                            if atr <= 0:
-                                logger.error(f"❌ [Order] Invalid ATR for {symbol}: {atr}")
-                                continue
-                            order_details[symbol] = order_manager.place_enhanced_order(close_side, symbol, CAPITAL, LEVERAGE, trade_id=str(timestamp))
+                            # A close uses the actual open position size (reduce-only), not a
+                            # freshly risk-sized order - place_enhanced_order is for entries only.
+                            order_details[symbol] = order_manager.close_open_position(symbol)
                             if order_details[symbol]:
+                                ts_manager.close_position(symbol)
                                 if last_order_details[symbol] and last_order_details[symbol].get("price"):
                                     open_price = float(last_order_details[symbol]["price"])
                                     close_price = float(order_details[symbol]["price"])
                                     side = last_order_details[symbol]["side"]
                                     qty = float(last_order_details[symbol]["quantity"])
-                                    leverage = current_positions[symbol].get('leverage', LEVERAGE)
                                     if side == "buy":
-                                        pnl = (close_price - open_price) * qty * leverage
+                                        pnl = (close_price - open_price) * qty
                                     else:
-                                        pnl = (open_price - close_price) * qty * leverage
+                                        pnl = (open_price - close_price) * qty
                                     order_details[symbol]["pnl"] = pnl
                                     trade_id = last_order_details[symbol].get("trade_id")
                                     if trade_id:
                                         execute_query(
-                                            "UPDATE trades SET status = 'CLOSED', exit_price = %s, realized_pnl = %s, close_timestamp = %s, leverage = %s WHERE trade_id = %s",
-                                            (close_price, pnl, int(time.time()), leverage, trade_id)
+                                            "UPDATE trades SET status = 'CLOSED', exit_price = %s, pnl = %s WHERE trade_id = %s",
+                                            (close_price, pnl, trade_id)
                                         )
-                                        ts_manager.close_position(symbol)
-                                        current_positions[symbol] = None
-                                        logger.info(f"[Main] Position closed for {symbol}, trade_id={trade_id}, PNL={pnl}")
+                                        _record_realized_pnl(pnl)
+                                current_positions[symbol] = None
+                                logger.info(f"[Main] Position closed for {symbol}, trade_id={order_details[symbol].get('order_id')}, PNL={order_details[symbol].get('pnl', 0.0)}")
                                 table = Table(title=f"Trade Closed for {symbol}")
                                 table.add_column("Field", style="cyan")
                                 table.add_column("Value", style="magenta")
